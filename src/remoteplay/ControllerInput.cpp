@@ -9,9 +9,52 @@
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_audio.h>
 #include <cstring>
+// Waitable timers for the forwarding cadence; SDL's headers bring Windows.h.
+#include <windows.h>
+#include <chrono>
+#include <format>
 #include "veyra/Log.h"
 namespace veyra::remoteplay {
+namespace {
+struct PadSource { const char* name; SDL_GamepadButton button; };
+// Names shared with the 按键映射 dialog.
+constexpr PadSource kPadSources[]={
+    {"south",SDL_GAMEPAD_BUTTON_SOUTH},{"east",SDL_GAMEPAD_BUTTON_EAST},
+    {"west",SDL_GAMEPAD_BUTTON_WEST},{"north",SDL_GAMEPAD_BUTTON_NORTH},
+    {"dpad_left",SDL_GAMEPAD_BUTTON_DPAD_LEFT},{"dpad_right",SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+    {"dpad_up",SDL_GAMEPAD_BUTTON_DPAD_UP},{"dpad_down",SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+    {"leftshoulder",SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},{"rightshoulder",SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+    {"leftstick",SDL_GAMEPAD_BUTTON_LEFT_STICK},{"rightstick",SDL_GAMEPAD_BUTTON_RIGHT_STICK},
+    {"start",SDL_GAMEPAD_BUTTON_START},{"back",SDL_GAMEPAD_BUTTON_BACK},
+    {"guide",SDL_GAMEPAD_BUTTON_GUIDE},{"touchpad",SDL_GAMEPAD_BUTTON_TOUCHPAD},
+    // Back paddles (Xbox Elite, DualSense Edge, handhelds that expose them over HID).
+    {"left_paddle1",SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},{"left_paddle2",SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
+    {"right_paddle1",SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},{"right_paddle2",SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2}};
+}
+ControllerInput::ControllerInput(){buttonMap_=defaultButtonMap();}
+std::array<std::int8_t,16> ControllerInput::defaultButtonMap(){
+    // Index = ControllerState::Button bit: 0 Cross … 12 Options, 13 Share,
+    // 14 Touchpad, 15 PS. This is the classic Xbox layout users already know.
+    return {SDL_GAMEPAD_BUTTON_SOUTH,SDL_GAMEPAD_BUTTON_EAST,SDL_GAMEPAD_BUTTON_WEST,SDL_GAMEPAD_BUTTON_NORTH,
+            SDL_GAMEPAD_BUTTON_DPAD_LEFT,SDL_GAMEPAD_BUTTON_DPAD_RIGHT,SDL_GAMEPAD_BUTTON_DPAD_UP,SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+            SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,SDL_GAMEPAD_BUTTON_LEFT_STICK,SDL_GAMEPAD_BUTTON_RIGHT_STICK,
+            SDL_GAMEPAD_BUTTON_START,SDL_GAMEPAD_BUTTON_BACK,SDL_GAMEPAD_BUTTON_TOUCHPAD,SDL_GAMEPAD_BUTTON_GUIDE};
+}
+int ControllerInput::buttonSourceFromName(std::string_view name){
+    for(const auto& s:kPadSources)if(name==s.name)return int(s.button);
+    return -1;
+}
+const char* ControllerInput::buttonSourceName(int source){
+    for(const auto& s:kPadSources)if(int(s.button)==source)return s.name;
+    return "";
+}
+void ControllerInput::setButtonMap(const std::array<std::int8_t,16>& sources){
+    std::lock_guard lock(mapMutex_);
+    buttonMap_=sources;
+}
 bool ControllerInput::start(uint32_t preferredDevice){
+    // Another owner takes SDL back first; never from the forwarding thread itself.
+    if(forwardThread_.get_id()!=std::this_thread::get_id())stopForwarding();
     preferredDevice_=preferredDevice;
     if(initialized_)return true;
     // No SDL window is created. Our explicit foreground gate is authoritative.
@@ -19,8 +62,9 @@ bool ControllerInput::start(uint32_t preferredDevice){
     initialized_=SDL_InitSubSystem(SDL_INIT_GAMEPAD);return initialized_;
 }
 void ControllerInput::stop(){
+    if(forwardThread_.get_id()!=std::this_thread::get_id())stopForwarding();
     for(auto* pad:others_)SDL_CloseGamepad(pad);
-    others_.clear();follow_=false;
+    others_.clear();follow_.store(false);
     releaseEffects();if(hapticStream_){SDL_DestroyAudioStream(hapticStream_);hapticStream_=nullptr;}
     if(audioInitialized_){SDL_QuitSubSystem(SDL_INIT_AUDIO);audioInitialized_=false;}hapticAttempted_=false;
     touchQueue_.clear();touchState_={};haveGyro_=haveAccel_=false;calibrating_=false;gyroBias_={};enumerateAt_=0;
@@ -29,8 +73,8 @@ void ControllerInput::stop(){
 }
 void ControllerInput::setFollowLastPressed(bool on){
     if(!on){for(auto* pad:others_)SDL_CloseGamepad(pad);others_.clear();}
-    if(on!=follow_)enumerateAt_=0;
-    follow_=on;
+    if(on!=follow_.load())enumerateAt_=0;
+    follow_.store(on);
 }
 bool ControllerInput::opened(uint32_t id)const{
     if(gamepad_&&SDL_GetGamepadID(gamepad_)==id)return true;
@@ -119,17 +163,10 @@ ControllerState ControllerInput::poll(bool focused){
     }
     if(!focused||!gamepad_){touchQueue_.clear();touchState_={};touchIds_={-1,-1};haveGyro_=haveAccel_=false;triggerFilter_.reset();releaseEffects();return state;}
     state.inputActive=true;
-    struct Button{SDL_GamepadButton input;ControllerState::Button output;};
-    constexpr Button buttons[]={
-        {SDL_GAMEPAD_BUTTON_SOUTH,ControllerState::Cross},{SDL_GAMEPAD_BUTTON_EAST,ControllerState::Circle},
-        {SDL_GAMEPAD_BUTTON_WEST,ControllerState::Square},{SDL_GAMEPAD_BUTTON_NORTH,ControllerState::Triangle},
-        {SDL_GAMEPAD_BUTTON_DPAD_LEFT,ControllerState::Left},{SDL_GAMEPAD_BUTTON_DPAD_RIGHT,ControllerState::Right},
-        {SDL_GAMEPAD_BUTTON_DPAD_UP,ControllerState::Up},{SDL_GAMEPAD_BUTTON_DPAD_DOWN,ControllerState::Down},
-        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,ControllerState::L1},{SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,ControllerState::R1},
-        {SDL_GAMEPAD_BUTTON_LEFT_STICK,ControllerState::L3},{SDL_GAMEPAD_BUTTON_RIGHT_STICK,ControllerState::R3},
-        {SDL_GAMEPAD_BUTTON_START,ControllerState::Options},{SDL_GAMEPAD_BUTTON_BACK,ControllerState::Share},
-        {SDL_GAMEPAD_BUTTON_GUIDE,ControllerState::PS},{SDL_GAMEPAD_BUTTON_TOUCHPAD,ControllerState::Touchpad}};
-    for(auto b:buttons)if(SDL_GetGamepadButton(gamepad_,b.input))state.buttons|=b.output;
+    std::array<std::int8_t,16> map;
+    {std::lock_guard lock(mapMutex_);map=buttonMap_;}
+    for(int i=0;i<16;++i)
+        if(map[i]>=0&&SDL_GetGamepadButton(gamepad_,SDL_GamepadButton(map[i])))state.buttons|=std::uint32_t(1u<<i);
     state.leftX=SDL_GetGamepadAxis(gamepad_,SDL_GAMEPAD_AXIS_LEFTX);state.leftY=SDL_GetGamepadAxis(gamepad_,SDL_GAMEPAD_AXIS_LEFTY);
     state.rightX=SDL_GetGamepadAxis(gamepad_,SDL_GAMEPAD_AXIS_RIGHTX);state.rightY=SDL_GetGamepadAxis(gamepad_,SDL_GAMEPAD_AXIS_RIGHTY);
     state.l2=uint8_t(std::max(0,int(SDL_GetGamepadAxis(gamepad_,SDL_GAMEPAD_AXIS_LEFT_TRIGGER)))*255/32767);
@@ -216,11 +253,103 @@ bool ControllerInput::calibrate(){
     if(!gamepad_||!gyro_||!accel_)return false;
     biasSum_={};calibrationSamples_=0;calibrationStart_=0;calibrating_=true;return true;
 }
-ControllerInput::Capabilities ControllerInput::capabilities()const{
+ControllerInput::Capabilities ControllerInput::currentCapabilities()const{
     if(!gamepad_)return {};
     const char* name=SDL_GetGamepadName(gamepad_);
     return {true,gyro_,accel_,SDL_GetNumGamepadTouchpads(gamepad_)>0,
         SDL_GetGamepadType(gamepad_)==SDL_GAMEPAD_TYPE_PS5,hapticStream_!=nullptr,calibrating_,name?name:""};
+}
+ControllerInput::Capabilities ControllerInput::capabilities()const{
+    // While forwarding, only that thread may touch SDL: serve its last published figure.
+    if(forwarding_.load()){std::lock_guard lock(publishMutex_);return published_;}
+    return currentCapabilities();
+}
+bool ControllerInput::activeHasTouchpad()const{
+    return gamepad_&&SDL_GetNumGamepadTouchpads(gamepad_)>0;
+}
+bool ControllerInput::startForwarding(Forwarding forwarding){
+    if(!forwarding.sink||forwardThread_.joinable())return false;
+    forwardedHz_.store(0);forwardedGapMs_.store(0);
+    forwarding_.store(true);
+    forwardThread_=std::jthread([this,f=std::move(forwarding)](std::stop_token stop)mutable{forwardLoop(stop,std::move(f));});
+    return true;
+}
+void ControllerInput::stopForwarding(){
+    if(forwardThread_.get_id()==std::this_thread::get_id())return;
+    if(forwardThread_.joinable()){forwardThread_.request_stop();forwardThread_.join();}
+    forwarding_.store(false);
+}
+void ControllerInput::setForwardRateHz(int hz){
+    const int clamped=std::clamp(hz,125,1000);
+    forwardPeriodUs_.store(1000000/clamped);
+}
+// The pad is read on this thread's own cadence (4 ms by default) and each state
+// goes straight to the sink. Nothing here waits on the interface thread.
+void ControllerInput::forwardLoop(std::stop_token stop,Forwarding forwarding){
+    if(!start()){
+        veyra::log::warn("remoteplay-input","SDL gamepad initialization failed on the forwarding thread");
+        forwarding_.store(false);return;
+    }
+    // Sleep(1) without a raised timer resolution can take 15.6 ms, far longer
+    // than the cadence, so wait on a high-resolution timer.
+    const auto timer=std::unique_ptr<void,decltype(&CloseHandle)>(CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS),&CloseHandle);
+    auto next=std::chrono::steady_clock::now();
+    HostTime last=0,windowStart=0,publishAt=0,logAt=0,logStart=0;
+    unsigned active=0;
+    // Distinct input states per log window: the real information rate from the pad.
+    // Polling above this repeats the same state and cannot lower input latency.
+    ControllerState previousState{};
+    bool havePreviousState=false;
+    unsigned changes=0;
+    while(!stop.stop_requested()){
+        const bool focused=forwarding.focused?forwarding.focused():true;
+        auto state=poll(focused);
+        if(!havePreviousState||state.buttons!=previousState.buttons||state.l2!=previousState.l2||state.r2!=previousState.r2||
+           state.leftX!=previousState.leftX||state.leftY!=previousState.leftY||
+           state.rightX!=previousState.rightX||state.rightY!=previousState.rightY||
+           state.touches[0].id!=previousState.touches[0].id||state.touches[0].x!=previousState.touches[0].x||
+           state.touches[0].y!=previousState.touches[0].y){
+            ++changes;previousState=state;havePreviousState=true;
+        }
+        if(forwarding.prepare)forwarding.prepare(state,focused);
+        forwarding.sink(state);
+        if(forwarding.feedback)feedback(forwarding.feedback(),focused);
+        const auto now=monotonic100ns();
+        if(last){const auto gap=long long((now-last)/10000);if(gap>forwardedGapMs_.load())forwardedGapMs_.store(gap);}
+        last=now;
+        if(!windowStart)windowStart=now;
+        if(state.inputActive)++active;
+        if(now-windowStart>=10000000){
+            forwardedHz_.store(double(active)*10000000.0/double(now-windowStart));
+            active=0;windowStart=now;
+        }
+        if(now>=publishAt){
+            publishAt=now+2500000;
+            std::lock_guard lock(publishMutex_);published_=currentCapabilities();
+        }
+        if(now>=logAt){
+            const auto c=currentCapabilities();
+            const double seconds=logStart?double(now-logStart)/10000000.0:5.0;
+            veyra::log::info("remoteplay-input",std::format("control input hz={:.0f} changeHz={:.0f} pad={} focused={} touch={} pollGapMaxMs={}",
+                forwardedHz_.load(),seconds>0.0001?double(changes)/seconds:0.0,c.connected?c.name:"none",focused,c.touch?"real":"none",forwardedGapMs_.load()));
+            changes=0;logStart=now;
+            logAt=now+50000000;
+        }
+        // A poll that ran late is not caught up with a burst.
+        next+=std::chrono::microseconds(forwardPeriodUs_.load());
+        const auto nowSteady=std::chrono::steady_clock::now();
+        if(next<nowSteady)next=nowSteady;
+        if(timer){
+            LARGE_INTEGER due;due.QuadPart=-std::chrono::duration_cast<std::chrono::nanoseconds>(next-nowSteady).count()/100;
+            if(SetWaitableTimer(timer.get(),&due,0,nullptr,nullptr,FALSE))WaitForSingleObject(timer.get(),20);
+            else std::this_thread::sleep_until(next);
+        }else std::this_thread::sleep_until(next);
+    }
+    releaseEffects();
+    // SDL ends on the thread that started it (not stop(), which the token shadows).
+    ControllerInput::stop();
+    {std::lock_guard lock(publishMutex_);published_={};}
+    forwardedHz_.store(0);forwarding_.store(false);
 }
 
 }

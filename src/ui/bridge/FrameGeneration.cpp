@@ -277,6 +277,35 @@ void QmlPlayerBridge::setPacingRepair(bool value) {
     if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "frame pacing repair not saved");
     emit settingsChanged();
 }
+bool QmlPlayerBridge::fgLowLatencyPresent() const { return settings().fgLowLatencyPresent; }
+void QmlPlayerBridge::setFgLowLatencyPresent(bool value) {
+    auto s = settings();
+    if (s.fgLowLatencyPresent == value) return;
+    s.fgLowLatencyPresent = value;
+    if (!impl_->commit(std::move(s))) { emit notice(tr("引擎未接受低延迟上屏，原设置保留"), true); return; }
+    impl_->prefs[QStringLiteral("fgLowLatencyPresent")] = value;
+    if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "low latency present not saved");
+    emit settingsChanged();
+}
+bool QmlPlayerBridge::fgSkipRepeats() const { return settings().fgSkipRepeats; }
+void QmlPlayerBridge::setFgSkipRepeats(bool value) {
+    auto s = settings();
+    if (s.fgSkipRepeats == value) return;
+    s.fgSkipRepeats = value;
+    if (!impl_->commit(std::move(s))) { emit notice(tr("引擎未接受重复帧不插帧，原设置保留"), true); return; }
+    impl_->prefs[QStringLiteral("fgSkipRepeats")] = value;
+    if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "fg skip repeats not saved");
+    emit settingsChanged();
+}
+bool QmlPlayerBridge::directPresent() const { return impl_->prefs.value(QStringLiteral("directPresent"), false).toBool(); }
+void QmlPlayerBridge::setDirectPresent(bool value) {
+    // Window placement, not an engine parameter: only the app's native video
+    // window reads it, so nothing is committed to the graph here.
+    if (impl_->prefs.value(QStringLiteral("directPresent"), false).toBool() == value) return;
+    impl_->prefs[QStringLiteral("directPresent")] = value;
+    if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "direct present not saved");
+    emit settingsChanged();
+}
 bool QmlPlayerBridge::hudLock() const { return settings().hudLock; }
 void QmlPlayerBridge::setHudLock(bool value) {
     auto s = settings();

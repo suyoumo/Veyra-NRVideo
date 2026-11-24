@@ -11,10 +11,23 @@ class LivePairLatency {
     struct Sample { int64_t time, delay; };
     std::deque<Sample> samples_;
     int64_t selected_=0;
+    bool lowLatency_=false;
+    int64_t lowLatencyLead_=0;
 public:
     // Beyond the 95th percentile of readiness; LiveArrivalSmoother::kLead100ns
     // takes part of it back on callback-anchored capture.
     static constexpr int64_t kMargin100ns=5000;
+    // 低延迟上屏: the phase follows the median readiness instead of the 95th
+    // percentile, minus `lead`. A generated frame that is then late expires and
+    // the next real frame takes its place, so the output frame rate is kept by
+    // the real frames; the picture loses only that one interpolation.
+    static constexpr int kLowLatencyPercentile=50;
+    static constexpr int64_t kLowLatencyMaxLead100ns=8000;
+    void setLowLatency(bool on,int64_t lead100ns){
+        lowLatency_=on;
+        lowLatencyLead_=std::clamp(lead100ns,int64_t(0),kLowLatencyMaxLead100ns);
+    }
+    bool lowLatency()const{return lowLatency_;}
     void reset(){samples_.clear();selected_=0;}
     void observe(int64_t now,int64_t requiredDelay){
         if(requiredDelay<=0||requiredDelay>20000000)return;
@@ -30,22 +43,24 @@ public:
     int64_t select(int64_t now,int64_t legacyDelay,int64_t interval,unsigned multiplier,int64_t samplingAllowance=0){
         std::vector<int64_t> current;
         for(const auto& sample:samples_)if(sample.time>=now-10000000)current.push_back(sample.delay);
-        if(interval<=0||multiplier<2){selected_=0;return legacyDelay;}
+        if(interval<=0||multiplier<2){selected_=legacyDelay;return selected_;}
         const auto limit=legacyDelay+samplingAllowance;
         // A gap in readiness observations is expected when pairs are skipped.
-        // Retain the last phase until enough new samples arrive.
+        // Retain the last phase until enough new samples arrive, capped by the
+        // legacy delay and the allowance, instead of dropping back to the
+        // legacy delay (which sat ~3 ms above the FG phase on 4K capture).
         if(current.size()<8){
             selected_=std::min(selected_?selected_:legacyDelay,limit);
             return selected_;
         }
-        const auto index=(current.size()*95+99)/100-1;
+        const auto index=lowLatency_?(current.size()*kLowLatencyPercentile+99)/100-1:(current.size()*95+99)/100-1;
         std::nth_element(current.begin(),current.begin()+index,current.end());
         // 0.5 ms covers wake-up jitter with MMCSS. The allowance lets readiness
         // move the phase past the legacy delay: deduplicated capture, where a
         // later sample can move readiness past a deadline on the continuous
         // content clock, and FG whose own interpolation does not fit in the
         // legacy delay (FgRecoveryBudget::phaseAllowance).
-        const auto target=std::min(limit,current[index]+kMargin100ns);
+        const auto target=std::min(limit,current[index]+kMargin100ns-lowLatencyLead_);
         const auto step=std::min<int64_t>(5000,interval/multiplier/8);
         selected_=std::clamp(selected_?selected_-step:legacyDelay,target,limit);
         return selected_;

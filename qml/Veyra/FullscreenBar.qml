@@ -63,9 +63,10 @@ Window {
 
     // Room for the pill plus the preset menu above it (VMenu is at most 420 tall).
     readonly property int menuRoom: 440
-    // At least 760: the transport needs the middle column. A portrait film's narrow
-    // window lets the pill reach past the picture's sides.
-    readonly property int barWidth: Math.min(860, Math.max(760, owner.width - 48))
+    // At least 800: the transport needs the middle column (the right column grew
+    // by the FPS/HUD button). A portrait film's narrow window lets the pill reach
+    // past the picture's sides.
+    readonly property int barWidth: Math.min(900, Math.max(800, owner.width - 48))
     width: barWidth
     height: 92 + menuRoom
     // Centred; fullscreen: 24px above the screen's bottom edge (the design's 24px

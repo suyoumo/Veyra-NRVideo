@@ -373,11 +373,11 @@ if(VEYRA_ENABLE_EXPERIMENTAL_DLSSNR)
   target_link_libraries(veyra_fg_harness PRIVATE veyra_gfx veyra_ngx ole32 mmdevapi avrt)
 endif()
 
-# YUV→RGB shader is shared between the media pipeline and the harness.
+# YUV鈫扲GB shader is shared between the media pipeline and the harness.
 veyra_add_compute_shader(veyra_shader_yuv_to_rgb YuvToLinearRgb)
 veyra_add_compute_shader(veyra_shader_rgb_to_linear RgbToLinear)
 veyra_add_compute_shader(veyra_shader_color_grade ColorGradePass)
-# 纹理 / 清晰度 / 去朦胧: block statistics, blur, apply (ColorDetailPass).
+# 绾圭悊 / 娓呮櫚搴?/ 鍘绘湨鑳? block statistics, blur, apply (ColorDetailPass).
 veyra_add_compute_shader(veyra_shader_color_detail_reduce ColorDetailReduce)
 veyra_add_compute_shader(veyra_shader_color_detail_blur ColorDetailBlur)
 veyra_add_compute_shader(veyra_shader_color_detail_apply ColorDetailApply)
@@ -407,6 +407,9 @@ veyra_add_compute_shader(veyra_shader_nv12_upload Nv12Upload)
 # PresentBlit: fullscreen-triangle pixel blit onto flip-model back buffers.
 veyra_add_graphics_shader_pair(veyra_shader_present_blit PresentBlit)
 veyra_add_graphics_shader_pair(veyra_shader_fullscreen_frame_stats FullscreenFrameStats)
+# The same blit with the video overlay (the frame-rate HUD drawn into the swap
+# chain so the video window can stay a whole rectangle and be scanned out directly).
+veyra_add_graphics_shader_pair(veyra_shader_present_blit_overlay PresentBlitOverlay)
 veyra_add_compute_shader(veyra_shader_present_motion PresentMotion)
 veyra_add_compute_shader(veyra_shader_hdr_coverage HdrCurveCoverage)
 # NvofDensify: SHORT2 S10.5 raw flow -> workingExtent float2 + confidence.
@@ -1357,7 +1360,7 @@ endif()
 # separate small library rather than into veyra_engine: the product build must
 # never depend on Qt being installed.
 if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
-  # The 日落 palette's startup music (StartupMusic.h): Media Foundation's media engine.
+  # The 鏃ヨ惤 palette's startup music (StartupMusic.h): Media Foundation's media engine.
   add_library(veyra_startup_music STATIC src/ui/StartupMusic.cpp include/veyra/ui/StartupMusic.h)
   set_target_properties(veyra_startup_music PROPERTIES AUTOMOC ON)
   target_compile_features(veyra_startup_music PUBLIC cxx_std_20)
@@ -1410,7 +1413,7 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_compile_options(veyra_update_checker PRIVATE /utf-8)
   target_include_directories(veyra_update_checker PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(veyra_update_checker PUBLIC Qt6::Core Qt6::Gui Qt6::Network veyra_portable_manifest)
-  add_library(veyra_qml_bridge STATIC src/ui/QmlExportQueueModel.cpp include/veyra/ui/QmlExportQueueModel.h src/ui/QmlPlayerBridge.cpp src/ui/ThumbnailProvider.cpp
+  add_library(veyra_qml_bridge STATIC src/ui/QmlExportQueueModel.cpp include/veyra/ui/QmlExportQueueModel.h src/ui/QmlPlayerBridge.cpp src/ui/ThumbnailProvider.cpp src/ui/AudioProbe.cpp src/ui/AudioProbe.h
     src/ui/PlaylistModel.cpp include/veyra/ui/PlaylistModel.h
     src/ui/LiveTranslation.cpp src/ui/LiveTranslation.h
     src/ui/LiveSentences.cpp src/ui/LiveSentences.h
@@ -1471,6 +1474,10 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_compile_options(veyra_ui_i18n_tests PRIVATE /utf-8)
   target_link_libraries(veyra_ui_i18n_tests PRIVATE veyra_ui_i18n)
   qt_add_resources(veyra_ui_i18n_tests "veyra_i18n_tests" PREFIX "/i18n" BASE "${CMAKE_CURRENT_SOURCE_DIR}/i18n" FILES i18n/catalog.json)
+  # 鼠标瞄准 (PS5 手柄控制): raw mouse capture for the Remote Play control tunnel.
+  target_sources(veyra_qml_bridge PRIVATE src/ui/Ps5MouseCapture.cpp include/veyra/ui/Ps5MouseCapture.h)
+  # 键鼠映射: keyboard + mouse to controller state (GTA6 preset, modes, curves).
+  target_sources(veyra_qml_bridge PRIVATE src/ui/KeyMouseMapper.cpp include/veyra/ui/KeyMouseMapper.h)
   if(VEYRA_ENABLE_MOONLIGHT)
     target_sources(veyra_qml_bridge PRIVATE src/ui/MoonlightInputCapture.cpp include/veyra/ui/MoonlightInputCapture.h)
     # The PC streaming model (hosts, pairing, apps, settings) is its own small library so it can be
@@ -1581,14 +1588,14 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
     add_dependencies(veyra_qml_ui veyra_libdovi_runtime)
   endif()
   # The QML copy is its own always-run step rather than a POST_BUILD of the link:
-  # its two long E:/项目 paths on the link statement pushed that command past
+  # its two long E:/椤圭洰 paths on the link statement pushed that command past
   # CMake's response-file threshold, and link.exe reads response files in the
   # ANSI code page (the UTF-8 Qt library paths then fail to open).
   add_custom_target(veyra_qml_files ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/qml ${CMAKE_CURRENT_BINARY_DIR}/qml
     COMMENT "Copying QML")
   add_dependencies(veyra_qml_ui veyra_qml_files)
-  # Interface translations (设置 → 界面语言): one catalog, compiled in so a package
+  # Interface translations (璁剧疆 鈫?鐣岄潰璇█): one catalog, compiled in so a package
   # cannot ship without it. scripts/i18n/ builds it from the source strings.
   qt_add_resources(veyra_qml_ui "veyra_i18n" PREFIX "/i18n" BASE "${CMAKE_CURRENT_SOURCE_DIR}/i18n" FILES i18n/catalog.json)
   set(VEYRA_VB_CABLE_PACKAGE "" CACHE FILEPATH "Original VB-Audio Pack46 ZIP to include for optional offline installation")
@@ -1805,7 +1812,7 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
   target_link_libraries(veyra_repair_fg_tests PRIVATE veyra_pipeline veyra_sinks veyra_nvof)
 
   # Headless quality-core runner (Playbook R3.3): the phase5 gate's quality
-  add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/PreviewGpuSession.cpp src/engine/CaptureGraphPreparation.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
+  add_library(veyra_engine STATIC src/engine/EngineController.cpp src/engine/EngineWatchdog.cpp src/engine/PreviewGpuSession.cpp src/engine/CaptureGraphPreparation.cpp src/engine/EngineControllerImage.cpp src/engine/PosterFrame.cpp src/engine/EffectChain.cpp src/engine/PresetLibrary.cpp src/ui/PlayerUiFacade.cpp src/engine/TiledImageProcessor.cpp src/engine/PresetStore.cpp src/engine/VideoPresenter.cpp src/engine/DisplayStateService.cpp src/engine/VideoExportJob.cpp src/engine/ExportStreams.cpp src/engine/ExportQueue.cpp src/engine/ExportJobManager.cpp src/engine/Subtitles.cpp src/engine/FgCompatibilityProbe.cpp src/engine/LiveRecorder.cpp src/engine/WindowCaptureFeeder.cpp src/engine/SystemAudioLoopback.cpp src/engine/ReplayBuffer.cpp src/engine/MicrophoneCapture.cpp)
   target_sources(veyra_pipeline PRIVATE src/guidance/AmdOpticalFlow.cpp
     src/guidance/GpuDisOpticalFlow.cpp third_party/gpu-dis/src/gpu/native_strict_dis_provider.cpp)
   target_include_directories(veyra_pipeline PRIVATE third_party/gpu-dis/src/gpu)
@@ -1831,6 +1838,8 @@ add_executable(veyra_sr_reconstruction_tests tests/integration/SrReconstructionT
   target_compile_options(veyra_engine PRIVATE /utf-8)
   target_compile_definitions(veyra_engine PUBLIC VEYRA_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}" VEYRA_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
   target_link_libraries(veyra_engine PUBLIC veyra_pipeline veyra_sources veyra_sinks veyra_ngx veyra_nvof)
+  # 褰曞埗鐣岄潰 (WindowCaptureFeeder.cpp): Windows Graphics Capture + D3D11/D3D12 interop.
+  target_link_libraries(veyra_engine PRIVATE d3d11 d3d12 dxgi windowsapp)
   add_executable(veyra_vfg_export_probe tests/integration/VfgExportProbe.cpp)
   target_compile_features(veyra_vfg_export_probe PRIVATE cxx_std_20)
   target_compile_options(veyra_vfg_export_probe PRIVATE /utf-8)
@@ -1966,7 +1975,7 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
   target_compile_options(veyra_popup_selector_tests PRIVATE /utf-8)
   target_compile_definitions(veyra_popup_selector_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
   target_link_libraries(veyra_popup_selector_tests PRIVATE veyra_base comctl32)
-  add_dependencies(veyra_engine veyra_shader_hdr_video_sr veyra_shader_present_motion veyra_shader_present_blit veyra_shader_hdr_coverage veyra_shader_fullscreen_frame_stats)
+  add_dependencies(veyra_engine veyra_shader_hdr_video_sr veyra_shader_present_motion veyra_shader_present_blit veyra_shader_present_blit_overlay veyra_shader_hdr_coverage veyra_shader_fullscreen_frame_stats)
   add_executable(veyra_hdr_color_tests tests/integration/HdrColorTests.cpp)
   add_executable(veyra_hdr_output_tuning_gpu_tests tests/integration/HdrOutputTuningGpuTests.cpp)
   target_compile_features(veyra_hdr_output_tuning_gpu_tests PRIVATE cxx_std_20)
@@ -2024,7 +2033,7 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
     # Only the SDL library file and headers: SDL3::SDL3's own system-library list
     # pushed the veyra_qml_ui link line over CMake's response-file threshold, and
     # link.exe reads response files in the ANSI code page, which breaks the UTF-8
-    # Qt paths under E:/项目. Those system libraries come from #pragma comment in
+    # Qt paths under E:/椤圭洰. Those system libraries come from #pragma comment in
     # the private QmlPlayerBridge_p.h instead.
     if(TARGET veyra_qml_bridge)
       target_sources(veyra_qml_bridge PRIVATE src/remoteplay/ControllerInput.cpp)
@@ -2155,3 +2164,5 @@ if(TARGET veyra_qml_ui)
   configure_file(apps/veyra/veyra.manifest ${CMAKE_CURRENT_BINARY_DIR}/veyra-qml.manifest COPYONLY)
   target_link_options(veyra_qml_ui PRIVATE "/MANIFESTINPUT:veyra-qml.manifest")
 endif()
+
+

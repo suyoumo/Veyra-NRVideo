@@ -1,5 +1,9 @@
 // QML bridge: RemotePlay responsibilities.
 #include "../QmlPlayerBridge_p.h"
+#include <cmath>
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+#include "veyra/remoteplay/ChiakiBackend.h"
+#endif
 
 namespace veyra::ui {
 // --- PS5 Remote Play (P4-e) ---------------------------------------------------
@@ -7,6 +11,150 @@ namespace {
 constexpr uint32_t kPs5Bitrates[] = {5000, 10000, 15000, 20000, 30000, 50000, 80000, 100000};
 #ifdef VEYRA_ENABLE_REMOTEPLAY
 std::filesystem::path ps5Settings() { return remoteplay::profileDirectory() / L"settings.ini"; }
+// PS5 buttons in the order they are stored (ControllerState bit index).
+struct PadAction { const char* name; std::uint32_t bit; };
+constexpr PadAction kPadActions[] = {
+    {"cross", 1u << 0}, {"circle", 1u << 1}, {"square", 1u << 2}, {"triangle", 1u << 3},
+    {"dpad_left", 1u << 4}, {"dpad_right", 1u << 5}, {"dpad_up", 1u << 6}, {"dpad_down", 1u << 7},
+    {"l1", 1u << 8}, {"r1", 1u << 9}, {"l3", 1u << 10}, {"r3", 1u << 11},
+    {"options", 1u << 12}, {"share", 1u << 13}, {"touchpad", 1u << 14}, {"ps", 1u << 15}};
+int padActionIndex(const QString& name) {
+    for (int i = 0; i < 16; ++i) if (name == QLatin1String(kPadActions[i].name)) return i;
+    return -1;
+}
+std::uint32_t padBitFromName(const QString& name, std::uint32_t fallback) {
+    const int index = padActionIndex(name.trimmed().toLower());
+    return index < 0 ? fallback : kPadActions[index].bit;
+}
+// "cross=south,circle=east,..."; an empty source leaves that PS5 button unmapped.
+std::array<std::int8_t,16> padMapFromText(const QString& text) {
+    auto map = remoteplay::ControllerInput::defaultButtonMap();
+    for (const auto& part : text.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        const auto eq = part.indexOf(QLatin1Char('='));
+        if (eq <= 0) continue;
+        const int index = padActionIndex(part.left(eq).trimmed().toLower());
+        if (index < 0) continue;
+        const auto source = part.mid(eq + 1).trimmed().toLower();
+        const int button = source.isEmpty() ? -1 : remoteplay::ControllerInput::buttonSourceFromName(source.toStdString());
+        map[index] = std::int8_t(button);
+    }
+    return map;
+}
+QString padKeyName(unsigned vk) {
+    if (!vk) return {};
+    wchar_t name[64]{};
+    const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    LONG lparam = LONG(scan << 16);
+    // Insert/Delete/Home/End/PageUp/PageDown and the arrows are extended keys.
+    // Without the E0 bit GetKeyNameText names Insert "Num 0" (same scancode as the
+    // numpad key), which made a correct capture look wrong.
+    switch (vk) {
+    case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
+    case VK_PRIOR: case VK_NEXT: case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+        lparam |= 0x01000000; break;
+    default: break;
+    }
+    if (GetKeyNameTextW(lparam, name, 64) > 0) return QString::fromWCharArray(name);
+    return QString::number(vk);
+}
+QString padMapToText(const std::array<std::int8_t,16>& map) {
+    QStringList parts;
+    for (int i = 0; i < 16; ++i) {
+        if (map[i] == remoteplay::ControllerInput::defaultButtonMap()[i]) continue; // store only differences
+        parts << QString::fromLatin1(kPadActions[i].name) + QLatin1Char('=')
+                 + QString::fromLatin1(remoteplay::ControllerInput::buttonSourceName(map[i]));
+    }
+    return parts.join(QLatin1Char(','));
+}
+// VEYRA_LOG_PAD_EDGES: names the PS buttons held in a forwarded state, so a
+// handheld's key can be followed from the log by name.
+std::string psButtonNames(std::uint32_t buttons) {
+    static const struct { std::uint32_t bit; const char* name; } names[] = {
+        {remoteplay::ControllerState::Cross, "Cross"}, {remoteplay::ControllerState::Circle, "Circle"},
+        {remoteplay::ControllerState::Square, "Square"}, {remoteplay::ControllerState::Triangle, "Triangle"},
+        {remoteplay::ControllerState::Left, "Left"}, {remoteplay::ControllerState::Right, "Right"},
+        {remoteplay::ControllerState::Up, "Up"}, {remoteplay::ControllerState::Down, "Down"},
+        {remoteplay::ControllerState::L1, "L1"}, {remoteplay::ControllerState::R1, "R1"},
+        {remoteplay::ControllerState::L3, "L3"}, {remoteplay::ControllerState::R3, "R3"},
+        {remoteplay::ControllerState::Options, "Options"}, {remoteplay::ControllerState::Share, "Share"},
+        {remoteplay::ControllerState::Touchpad, "Touchpad"}, {remoteplay::ControllerState::PS, "PS"}};
+    std::string out;
+    for (const auto& n : names) if (buttons & n.bit) { if (!out.empty()) out += '+'; out += n.name; }
+    return out.empty() ? "none" : out;
+}
+// An Xbox pad carries no touchpad. Opt-in emulation turns Share into one while
+// it is held: the right stick sweeps the touch point, Options sends the click.
+// Share is consumed for the whole gesture, so a game never sees it; the input is
+// still read here, this only rewrites the forwarded report.
+void emulateXboxTouchpad(remoteplay::ControllerState& s, bool enabled, bool realTouchpad, qint64 nowMs,
+                         bool& gesture, bool& optionsHeld, qint64& clickUntil,
+                         int8_t& touchId, std::uint16_t& touchX, std::uint16_t& touchY,
+                         std::uint32_t modifierBit, std::uint32_t clickBit, std::uint32_t psBit,
+                         bool rightStick, bool tapClick, bool& swept,
+                         bool keyModifier, bool keyConfigured) {
+    if (!enabled || realTouchpad || (!modifierBit && !keyConfigured)) { gesture = false; touchId = -1; optionsHeld = false; return; }
+    const bool modifierDown = ((s.buttons & modifierBit) != 0) || keyModifier;
+    if (modifierDown) {
+        if (!gesture) { gesture = true; swept = false; }
+        s.buttons &= ~modifierBit;
+        // The click button is a click edge while the gesture runs, not a pause button:
+        // it is consumed for as long as it is held.
+        if (clickBit) {
+            const bool clickDown = (s.buttons & clickBit) != 0;
+            if (clickDown) {
+                s.buttons &= ~clickBit;
+                if (!optionsHeld) clickUntil = nowMs + 100;
+                swept = true; // an explicit click is not also a tap-click
+            }
+            optionsHeld = clickDown;
+        }
+        // A chord must not leak the guide button either; the console menu stays closed.
+        s.buttons &= ~std::uint32_t(remoteplay::ControllerState::PS);
+        // Modifier + the configured chord button is the PS button. The pad's own Xbox
+        // button would do as well, but Windows answers it with Xbox Game Bar.
+        if (psBit && (s.buttons & psBit)) {
+            s.buttons &= ~psBit;
+            s.buttons |= std::uint32_t(remoteplay::ControllerState::PS);
+            swept = true; // a PS chord is not a tap-click
+        }
+        // Stick to touch coordinates, PS5's 1920x1080 grid; the stick is not the camera here.
+        const int rx = rightStick ? s.rightX : s.leftX, ry = rightStick ? s.rightY : s.leftY;
+        const bool sweeping = std::abs(rx) > 6000 || std::abs(ry) > 6000;
+        if (sweeping) {
+            swept = true;
+            touchId = 0;
+            touchX = std::uint16_t(std::clamp(959 + rx * 900 / 32767, 0, 1919));
+            touchY = std::uint16_t(std::clamp(539 + ry * 500 / 32767, 0, 1079));
+        }
+        if (nowMs < clickUntil) {
+            s.buttons |= std::uint32_t(remoteplay::ControllerState::Touchpad);
+            // A click without a contact has no position; games that read the touch
+            // point while the button is down get the centre.
+            if (touchId < 0) { touchId = 0; touchX = 959; touchY = 539; }
+        } else if (!sweeping) {
+            touchId = -1;
+        }
+        s.touches[0] = remoteplay::ControllerState::Touch{touchId, touchX, touchY};
+        s.touches[1] = remoteplay::ControllerState::Touch{};
+        if (rightStick) { s.rightX = 0; s.rightY = 0; } else { s.leftX = 0; s.leftY = 0; }
+        return;
+    }
+    // Modifier released. A hold that never moved the touch point is a click, so one
+    // back button covers both press-to-click and hold-plus-stick-to-swipe.
+    if (gesture) {
+        gesture = false;
+        if (tapClick && !swept) clickUntil = nowMs + 100;
+    }
+    optionsHeld = false;
+    if (nowMs < clickUntil) {
+        s.buttons |= std::uint32_t(remoteplay::ControllerState::Touchpad);
+        if (touchId < 0) { touchId = 0; touchX = 959; touchY = 539; }
+    } else if (touchId >= 0) {
+        touchId = -1;
+    }
+    s.touches[0] = remoteplay::ControllerState::Touch{touchId, touchX, touchY};
+    s.touches[1] = remoteplay::ControllerState::Touch{};
+}
 #endif
 }
 QVariantMap QmlPlayerBridge::ps5() const {
@@ -159,7 +307,7 @@ void QmlPlayerBridge::moonlightCapture(bool on) {
         return;
     }
     if (!i.snapshot.moonlightActive || !i.videoWindow) return;
-    i.moonlightCapture->setWindow(GetAncestor(i.videoWindow, GA_ROOT));
+    i.moonlightCapture->setWindow(GetAncestor(i.videoWindow, GA_ROOTOWNER));
     // The tick keeps trying until the window is in the foreground (right after connecting it may not be yet).
     i.moonlightWantCapture = !i.moonlightCapture->capture(true);
 #else
@@ -292,10 +440,19 @@ void QmlPlayerBridge::ps5Load() {
         bool known = false;
         for (const auto& p : i.ps5ProfileList) known = known || p.toMap().value("id").toString() == QString::fromStdWString(i.ps5Profile);
         if (!known) i.ps5Profile = i.ps5ProfileList.isEmpty() ? std::wstring{} : i.ps5ProfileList.front().toMap().value("id").toString().toStdWString();
-        // Form defaults, then the selected pairing's own values.
+        // Form defaults, then the selected pairing's own values. With no saved
+        // pairing (first run) keep what the user or a scan already filled in:
+        // reopening the dialog used to wipe a scanned address and a typed
+        // Account ID, which made 配对并保存 look like it did nothing.
+        const QString pendingHost = i.ps5Form.value("host").toString();
+        const QString pendingAccount = i.ps5Form.value("account").toString();
         i.ps5Form = QVariantMap{{"host", QString()}, {"account", QString()}, {"quality", 3}, {"codec", 0}, {"bitrate", 2}, {"viewOnly", false},
             {"decode", int(std::min(2u, GetPrivateProfileIntW(L"RemotePlay", L"DecodeMode", 0, ps5Settings().c_str())))},
             {"sampling", int(std::min(1u, GetPrivateProfileIntW(L"RemotePlay", L"FineSampling", 1, ps5Settings().c_str())))}};
+        if (i.ps5Profile.empty()) {
+            i.ps5Form["host"] = pendingHost;
+            i.ps5Form["account"] = pendingAccount;
+        }
         if (!i.ps5Profile.empty())
             if (auto saved = remoteplay::loadProfile(directory / i.ps5Profile)) {
                 i.ps5Form["host"] = QString::fromStdString(saved->host);
@@ -466,12 +623,14 @@ bool QmlPlayerBridge::ps5Connect() {
         i.engine.openRemotePlay(i.videoWindow, std::move(*request), i.options);
         i.openingSessionId = i.engine.snapshot().sessionId;
         refreshSubtitles({});
-        // Controller forwarding at 8 ms, as 1.4.4; view-only leaves the pad to the PS5.
+        // Controller forwarding at 4 ms, matching the session's send cadence;
+        // view-only leaves the pad to the PS5.
         // Started with the session: the poll stops the pad when no session runs.
         if (!viewOnly) {
             if (!i.acquirePad(Impl::PadPs5)) veyra::log::warn("remoteplay-input", "SDL gamepad initialization failed");
             if (!i.controllerTimer) {
                 i.controllerTimer = new QTimer(this);
+                i.controllerTimer->setTimerType(Qt::PreciseTimer);
                 connect(i.controllerTimer, &QTimer::timeout, this, [this] {
                     auto& j = *impl_;
                     const auto s = j.engine.snapshot();
@@ -484,7 +643,7 @@ bool QmlPlayerBridge::ps5Connect() {
                     }
                 });
             }
-            i.controllerTimer->start(8);
+            i.controllerTimer->start(4);
         } else {
             if (i.controllerTimer) i.controllerTimer->stop();
             i.releasePad(Impl::PadPs5);
@@ -584,7 +743,11 @@ void QmlPlayerBridge::tickPs5() {
                     break;
                 }
             }
-            if (!selected && r.hosts.size() == 1) i.ps5Form["host"] = QString::fromStdString(r.hosts.front().first);
+            if (!selected && r.hosts.size() == 1) {
+                i.ps5Form["host"] = QString::fromStdString(r.hosts.front().first);
+                // Observable proof that 查找 (or the auto-scan on open) reached the form.
+                veyra::log::info("remoteplay-ui", std::format("scan filled host={}", r.hosts.front().first));
+            }
             else if (selected && !matched) i.ps5Status = tr("发现主机，但无法确认是已配对的这一台。保留原地址，可核对后手动修改。");
             else if (!selected && r.hosts.size() > 1) i.ps5Status = tr("发现多台 PS5，请填写要配对的主机 IP，避免选错主机。");
         }
@@ -626,6 +789,10 @@ QVariantMap QmlPlayerBridge::ps5Control() const {
 #endif
     out[QStringLiteral("enabled")] = impl_->prefBool("ps5CaptureControl", false);
     out[QStringLiteral("background")] = impl_->prefBool("ps5ControlBackground", false);
+    out[QStringLiteral("touchpad")] = impl_->prefBool("ps5ControlTouchpad", false);
+    out[QStringLiteral("inputHz")] = impl_->prefInt("ps5InputHz", 250);
+    out[QStringLiteral("mouse")] = impl_->prefBool("ps5MouseAim", false);
+    out[QStringLiteral("mouseSensitivity")] = impl_->prefInt("ps5MouseSensitivity", 5);
     return out;
 }
 // liveKind is "ps5", "screen", "moonlight" or "xbox" for those sources; a file
@@ -641,8 +808,38 @@ bool QmlPlayerBridge::captureCardLive() const {
     return playing && s.capture && impl_->liveKind == QLatin1String("capture");
 }
 void QmlPlayerBridge::ps5ControlSet(const QString& key, const QVariant& value) {
+    if (key == QLatin1String("mouse") || key == QLatin1String("mouseSens")) {
+        const bool aim = key == QLatin1String("mouse");
+        const auto previous = impl_->prefs;
+        if (aim) impl_->prefs[QStringLiteral("ps5MouseAim")] = value.toBool();
+        else impl_->prefs[QStringLiteral("ps5MouseSensitivity")] = std::clamp(value.toInt(), 1, 10);
+        if (!impl_->savePrefs()) {
+            impl_->prefs = previous;
+            emit notice(tr("鼠标瞄准设置保存失败"), true);
+            emit ps5ControlChanged();
+            return;
+        }
+        if (aim) {
+            impl_->ps5MouseAim.store(value.toBool());
+            if (!value.toBool()) impl_->ps5Mouse.capture(false);
+        } else {
+            impl_->ps5MouseSensitivity.store(std::clamp(value.toInt(), 1, 10));
+        }
+        emit ps5ControlChanged();
+        return;
+    }
+    if (key == QLatin1String("rate")) {
+        const int hz = std::clamp(value.toInt(), 125, 500);
+        const auto previous = impl_->prefs;
+        impl_->prefs[QStringLiteral("ps5InputHz")] = hz;
+        if (!impl_->savePrefs()) { impl_->prefs = previous; emit notice(tr("输入采样率保存失败"), true); }
+        else impl_->controller.setForwardRateHz(hz);
+        emit ps5ControlChanged();
+        return;
+    }
     static const QHash<QString, QString> keys{{QStringLiteral("enabled"), QStringLiteral("ps5CaptureControl")},
-                                              {QStringLiteral("background"), QStringLiteral("ps5ControlBackground")}};
+                                              {QStringLiteral("background"), QStringLiteral("ps5ControlBackground")},
+                                              {QStringLiteral("touchpad"), QStringLiteral("ps5ControlTouchpad")}};
     if (!keys.contains(key)) return;
     const bool on = value.toBool();
     const auto previous = impl_->prefs;
@@ -659,6 +856,233 @@ void QmlPlayerBridge::ps5ControlSet(const QString& key, const QVariant& value) {
 }
 void QmlPlayerBridge::ps5ControlRestart() {
     if (impl_->prefBool("ps5CaptureControl", false) && captureCardLive()) startPs5Control(true);
+}
+void QmlPlayerBridge::applyPadMap() {
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    impl_->controller.setButtonMap(padMapFromText(impl_->prefString("ps5PadMap")));
+    const auto identity = impl_->prefString("ps5ControllerType");
+    remoteplay::setControllerIdentity(identity == QLatin1String("dualsense") ? 1
+                                    : identity == QLatin1String("ds4") ? 2 : 0);
+#endif
+}
+QVariantMap QmlPlayerBridge::ps5Pad() const {
+    QVariantMap out;
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    const auto map = padMapFromText(impl_->prefString("ps5PadMap"));
+    QVariantMap mapped;
+    for (int i = 0; i < 16; ++i)
+        mapped[QString::fromLatin1(kPadActions[i].name)] =
+            QString::fromLatin1(remoteplay::ControllerInput::buttonSourceName(map[i]));
+    out[QStringLiteral("map")] = mapped;
+    const auto gesture = [this](const char* key, const char* fallback) {
+        const auto value = impl_->prefString(key);
+        return value.isEmpty() ? QString::fromLatin1(fallback) : value;
+    };
+    out[QStringLiteral("touchModifier")] = gesture("ps5PadTouchModifier", "share");
+    out[QStringLiteral("touchClick")] = gesture("ps5PadTouchClick", "options");
+    out[QStringLiteral("touchPS")] = gesture("ps5PadTouchPS", "triangle");
+    const auto stick = impl_->prefString("ps5PadTouchStick");
+    out[QStringLiteral("touchStick")] = stick == QLatin1String("left") ? stick : QStringLiteral("right");
+    out[QStringLiteral("tapClick")] = impl_->prefBool("ps5PadTouchTapClick", true);
+    out[QStringLiteral("touchKeyName")] = padKeyName(unsigned(impl_->prefInt("ps5PadTouchVk", 0)));
+    out[QStringLiteral("touchKeyCapturing")] = impl_->padTouchKey.capturing.load();
+    const auto identity = impl_->prefString("ps5ControllerType");
+    out[QStringLiteral("controllerType")] = identity == QLatin1String("dualsense") || identity == QLatin1String("ds4")
+        ? identity : QStringLiteral("auto");
+#endif
+    return out;
+}
+bool QmlPlayerBridge::ps5PadSet(const QString& key, const QString& value) {
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    auto& i = *impl_;
+    const QString name = key.trimmed().toLower();
+    const QString text = value.trimmed().toLower();
+    QString prefKey;
+    if (padActionIndex(name) >= 0) {
+        if (!text.isEmpty() && text != QLatin1String("none") && remoteplay::ControllerInput::buttonSourceFromName(text.toStdString()) < 0) return false;
+        const int index = padActionIndex(name);
+        auto map = padMapFromText(i.prefString("ps5PadMap"));
+        map[index] = text == QLatin1String("none") ? std::int8_t(-1)
+                   : text.isEmpty() ? remoteplay::ControllerInput::defaultButtonMap()[index]
+                   : std::int8_t(remoteplay::ControllerInput::buttonSourceFromName(text.toStdString()));
+        prefKey = QStringLiteral("ps5PadMap");
+        const auto previous = i.prefs;
+        i.prefs[prefKey] = padMapToText(map);
+        if (!i.savePrefs()) { i.prefs = previous; emit notice(tr("按键映射保存失败"), true); return false; }
+    } else if (name == QLatin1String("touchmodifier") || name == QLatin1String("touchclick") || name == QLatin1String("touchps")) {
+        if (!text.isEmpty() && padActionIndex(text) < 0) return false;
+        prefKey = name == QLatin1String("touchmodifier") ? QStringLiteral("ps5PadTouchModifier")
+                : name == QLatin1String("touchclick") ? QStringLiteral("ps5PadTouchClick") : QStringLiteral("ps5PadTouchPS");
+        const auto previous = i.prefs;
+        if (text.isEmpty()) i.prefs.remove(prefKey); else i.prefs[prefKey] = text;
+        if (!i.savePrefs()) { i.prefs = previous; emit notice(tr("按键映射保存失败"), true); return false; }
+    } else if (name == QLatin1String("touchstick")) {
+        if (text != QLatin1String("left") && text != QLatin1String("right")) return false;
+        const auto previous = i.prefs;
+        i.prefs[QStringLiteral("ps5PadTouchStick")] = text;
+        if (!i.savePrefs()) { i.prefs = previous; emit notice(tr("按键映射保存失败"), true); return false; }
+    } else if (name == QLatin1String("touchtapclick")) {
+        const bool on = text == QLatin1String("true") || text == QLatin1String("1");
+        const auto previous = i.prefs;
+        i.prefs[QStringLiteral("ps5PadTouchTapClick")] = on;
+        if (!i.savePrefs()) { i.prefs = previous; emit notice(tr("按键映射保存失败"), true); return false; }
+    } else if (name == QLatin1String("touchkey")) {
+        if (text == QLatin1String("capture")) {
+            i.padTouchKey.capturing.store(true);
+            emit ps5PadChanged();
+            return true;
+        }
+        const auto previous = i.prefs;
+        i.prefs.remove(QStringLiteral("ps5PadTouchVk"));
+        if (!i.savePrefs()) { i.prefs = previous; emit notice(tr("按键映射保存失败"), true); return false; }
+        i.padTouchKey.watch.store(0);
+        i.padTouchKey.down.store(false);
+        i.padTouchKey.capturing.store(false);
+    } else if (name == QLatin1String("controllertype")) {
+        if (text != QLatin1String("auto") && text != QLatin1String("dualsense") && text != QLatin1String("ds4")) return false;
+        const auto previous = i.prefs;
+        i.prefs[QStringLiteral("ps5ControllerType")] = text;
+        if (!i.savePrefs()) { i.prefs = previous; emit notice(tr("控制器类型保存失败"), true); return false; }
+    } else return false;
+    applyPadMap();
+    emit ps5PadChanged();
+    return true;
+#else
+    Q_UNUSED(key); Q_UNUSED(value);
+    return false;
+#endif
+}
+void QmlPlayerBridge::ps5PadReset() {
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    auto& i = *impl_;
+    const auto previous = i.prefs;
+    for (const char* key : {"ps5PadMap", "ps5PadTouchModifier", "ps5PadTouchClick", "ps5PadTouchPS", "ps5PadTouchStick", "ps5PadTouchTapClick", "ps5PadTouchVk"})
+        i.prefs.remove(QString::fromLatin1(key));
+    i.padTouchKey.watch.store(0);
+    i.padTouchKey.down.store(false);
+    i.padTouchKey.capturing.store(false);
+    if (!i.savePrefs()) { i.prefs = previous; emit notice(tr("恢复默认失败"), true); return; }
+    applyPadMap();
+    emit ps5PadChanged();
+#endif
+}
+QVariantMap QmlPlayerBridge::ps5Kbm() const {
+    QVariantMap out;
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    const auto& p = impl_->prefs;
+    const auto d = [&](const char* key, double fallback) {
+        return p.value(QString::fromLatin1(key), fallback).toDouble();
+    };
+    const auto b = [&](const char* key, bool fallback) {
+        return p.value(QString::fromLatin1(key), fallback).toBool();
+    };
+    out[QStringLiteral("enabled")] = b("ps5KbmEnabled", false);
+    out[QStringLiteral("sensitivity")] = d("ps5KbmSensitivity", 1.8);
+    out[QStringLiteral("curveType")] = int(d("ps5KbmCurveType", 0));
+    out[QStringLiteral("deadzone")] = d("ps5KbmDeadzone", 0.0);
+    out[QStringLiteral("antiDeadzone")] = d("ps5KbmAntiDeadzone", 0.15);
+    out[QStringLiteral("smoothing")] = d("ps5KbmSmoothing", 0.5);
+    out[QStringLiteral("leftValue")] = d("ps5KbmLeftValue", 1.0);
+    out[QStringLiteral("leftRamp")] = d("ps5KbmLeftRamp", 4.0);
+    out[QStringLiteral("r2Depth")] = d("ps5KbmR2Depth", 1.0);
+    out[QStringLiteral("l2Depth")] = d("ps5KbmL2Depth", 1.0);
+    out[QStringLiteral("flick")] = b("ps5KbmFlick", true);
+    out[QStringLiteral("invertY")] = b("ps5KbmInvertY", false);
+    out[QStringLiteral("mode")] = impl_->kbm.mode();
+    out[QStringLiteral("modeCount")] = impl_->kbm.modeCount();
+#endif
+    return out;
+}
+void QmlPlayerBridge::applyKbmPrefs() {
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    auto& i = *impl_;
+    const auto& p = i.prefs;
+    const auto d = [&](const char* key, double fallback) {
+        return p.value(QString::fromLatin1(key), fallback).toDouble();
+    };
+    const auto b = [&](const char* key, bool fallback) {
+        return p.value(QString::fromLatin1(key), fallback).toBool();
+    };
+    KbmTuning t;
+    t.sensitivity = float(d("ps5KbmSensitivity", 1.8));
+    t.curveType = int(d("ps5KbmCurveType", 0));
+    t.deadzone = float(d("ps5KbmDeadzone", 0.0));
+    t.antiDeadzone = float(d("ps5KbmAntiDeadzone", 0.15));
+    t.smoothing = float(d("ps5KbmSmoothing", 0.5));
+    t.leftValue = float(d("ps5KbmLeftValue", 1.0));
+    t.leftRamp = float(d("ps5KbmLeftRamp", 4.0));
+    t.r2Depth = float(d("ps5KbmR2Depth", 1.0));
+    t.l2Depth = float(d("ps5KbmL2Depth", 1.0));
+    t.flick = b("ps5KbmFlick", true);
+    t.invertY = b("ps5KbmInvertY", false);
+    i.kbm.setTuning(t);
+    i.kbmEnabled.store(b("ps5KbmEnabled", false));
+    if (!i.kbmEnabled.load()) i.kbm.releaseAll();
+#endif
+}
+bool QmlPlayerBridge::ps5KbmSet(const QString& key, const QVariant& value) {
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    auto& i = *impl_;
+    const QString k = key.trimmed();
+    if (k == QLatin1String("mode")) {
+        const int index = value.toInt();
+        if (index < 0 || index >= i.kbm.modeCount()) return false;
+        i.kbm.setMode(index);
+        emit ps5KbmChanged();
+        return true;
+    }
+    static const QHash<QString, QString> names{
+        {QStringLiteral("enabled"), QStringLiteral("ps5KbmEnabled")},
+        {QStringLiteral("sensitivity"), QStringLiteral("ps5KbmSensitivity")},
+        {QStringLiteral("curveType"), QStringLiteral("ps5KbmCurveType")},
+        {QStringLiteral("deadzone"), QStringLiteral("ps5KbmDeadzone")},
+        {QStringLiteral("antiDeadzone"), QStringLiteral("ps5KbmAntiDeadzone")},
+        {QStringLiteral("smoothing"), QStringLiteral("ps5KbmSmoothing")},
+        {QStringLiteral("leftValue"), QStringLiteral("ps5KbmLeftValue")},
+        {QStringLiteral("leftRamp"), QStringLiteral("ps5KbmLeftRamp")},
+        {QStringLiteral("r2Depth"), QStringLiteral("ps5KbmR2Depth")},
+        {QStringLiteral("l2Depth"), QStringLiteral("ps5KbmL2Depth")},
+        {QStringLiteral("flick"), QStringLiteral("ps5KbmFlick")},
+        {QStringLiteral("invertY"), QStringLiteral("ps5KbmInvertY")}};
+    if (!names.contains(k)) return false;
+    QVariant stored;
+    if (k == QLatin1String("enabled") || k == QLatin1String("flick") || k == QLatin1String("invertY")) {
+        stored = value.toBool();
+    } else {
+        bool ok = false;
+        const double v = value.toDouble(&ok);
+        if (!ok) return false;
+        const auto between = [&](double low, double high) { return v >= low && v <= high; };
+        if (k == QLatin1String("sensitivity") && !between(0.1, 10.0)) return false;
+        if (k == QLatin1String("curveType") && !between(0.0, 2.0)) return false;
+        if (k == QLatin1String("deadzone") && !between(0.0, 0.5)) return false;
+        if (k == QLatin1String("antiDeadzone") && !between(0.0, 0.9)) return false;
+        if (k == QLatin1String("smoothing") && !between(0.0, 0.95)) return false;
+        if (k == QLatin1String("leftValue") && !between(0.05, 1.0)) return false;
+        if (k == QLatin1String("leftRamp") && !between(0.0, 50.0)) return false;
+        if ((k == QLatin1String("r2Depth") || k == QLatin1String("l2Depth")) && !between(0.0, 1.0)) return false;
+        stored = k == QLatin1String("curveType") ? QVariant(int(v)) : QVariant(v);
+    }
+    const auto previous = i.prefs;
+    i.prefs[names.value(k)] = stored;
+    if (!i.savePrefs()) {
+        i.prefs = previous;
+        emit notice(tr("键鼠映射保存失败"), true);
+        emit ps5KbmChanged();
+        return false;
+    }
+    if (k == QLatin1String("enabled") && value.toBool()) {
+        i.kbm.releaseAll();
+        i.kbmLastTick = 0;
+    }
+    applyKbmPrefs();
+    emit ps5KbmChanged();
+    return true;
+#else
+    Q_UNUSED(key);
+    Q_UNUSED(value);
+    return false;
+#endif
 }
 void QmlPlayerBridge::startPs5Control(bool restart) {
 #ifdef VEYRA_ENABLE_REMOTEPLAY
@@ -685,9 +1109,106 @@ void QmlPlayerBridge::startPs5Control(bool restart) {
         profile = i.ps5Profile;
     }
     const auto running = i.engine.remoteControlStatus();
+    // One pad reader for the controller-only session: ControllerInput's
+    // forwarding thread reads the pad every 4 ms, the session's own send
+    // cadence, and hands each state straight to it. The interface thread may
+    // stall for a second without input following it.
+    const auto startPadForwarding = [this, restart] {
+        auto& j = *impl_;
+        // A restart re-opens the pad as well: SDL is ended and started again,
+        // the one recovery from a pad that is connected but stays silent.
+        if (restart) j.controller.stopForwarding();
+        j.acquirePad(Impl::PadPs5Control, /*startReader=*/false);
+        j.ps5InputFocused.store(j.prefBool("ps5ControlBackground", false) || QGuiApplication::focusWindow() != nullptr);
+        j.ps5TouchEmuWanted.store(j.prefBool("ps5ControlTouchpad", false));
+        applyPadMap();
+        if (j.controller.forwarding()) return;
+        remoteplay::ControllerInput::Forwarding forwarding;
+        forwarding.focused = [this] { return impl_->ps5InputFocused.load(); };
+        forwarding.prepare = [this](remoteplay::ControllerState& state, bool focused) {
+            auto& k = *impl_;
+            // 键鼠映射 (GTA6 preset) takes precedence over the simple mouse aim.
+            if (k.kbmEnabled.load()) {
+                const remoteplay::HostTime now = remoteplay::monotonic100ns();
+                double dt = k.kbmLastTick ? double(now - k.kbmLastTick) / 10000000.0 : 0.004;
+                k.kbmLastTick = now;
+                KeyMouseMapper::Output mapped;
+                k.kbm.tick(dt, mapped);
+                if (mapped.leftX != 0.0f || mapped.leftY != 0.0f) {
+                    state.leftX = std::int16_t(std::lround(std::clamp(mapped.leftX, -1.0f, 1.0f) * 32767.0f));
+                    state.leftY = std::int16_t(std::lround(std::clamp(mapped.leftY, -1.0f, 1.0f) * 32767.0f));
+                }
+                if (mapped.mouseActive) {
+                    state.rightX = std::int16_t(std::lround(std::clamp(mapped.rightX, -1.0f, 1.0f) * 32767.0f));
+                    state.rightY = std::int16_t(std::lround(std::clamp(mapped.rightY, -1.0f, 1.0f) * 32767.0f));
+                }
+                state.buttons |= mapped.buttons;
+                if (mapped.l2) state.l2 = std::max(state.l2, mapped.l2);
+                if (mapped.r2) state.r2 = std::max(state.r2, mapped.r2);
+            } else if (k.ps5MouseAim.load() && k.ps5Mouse.captured()) {
+                const int dx = k.ps5Mouse.dx.exchange(0, std::memory_order_relaxed);
+                const int dy = k.ps5Mouse.dy.exchange(0, std::memory_order_relaxed);
+                k.ps5Mouse.wheel.exchange(0, std::memory_order_relaxed);
+                if (dx || dy) {
+                    // ~600 stick units per pixel at sensitivity 5; a 10 px poll is full deflection.
+                    const int gain = 600 * k.ps5MouseSensitivity.load();
+                    state.rightX = std::int16_t(std::clamp(dx * gain, -32767, 32767));
+                    state.rightY = std::int16_t(std::clamp(dy * gain, -32767, 32767));
+                    k.ps5MouseWasMoving = true;
+                } else if (k.ps5MouseWasMoving) {
+                    // One centred poll after the mouse stops, then the controller stick may act again.
+                    state.rightX = 0; state.rightY = 0; k.ps5MouseWasMoving = false;
+                }
+                const unsigned held = k.ps5Mouse.buttons.load();
+                if (held & 1u) state.r2 = 255;
+                if (held & 2u) state.l2 = 255;
+            } else {
+                k.ps5MouseWasMoving = false;
+            }
+            // Opt-in Xbox-pad touchpad emulation; a pad with a real touchpad passes through.
+            k.ps5TouchEmu = k.ps5TouchEmuWanted.load();
+            emulateXboxTouchpad(state, k.ps5TouchEmu, k.controller.activeHasTouchpad(),
+                qint64(remoteplay::monotonic100ns() / 10000),
+                k.ps5TouchGesture, k.ps5TouchOptionsHeld, k.ps5TouchClickUntilMs,
+                k.ps5TouchEmuId, k.ps5TouchEmuX, k.ps5TouchEmuY,
+                k.ps5TouchModifier.load(), k.ps5TouchClick.load(), k.ps5TouchPS.load(), k.ps5TouchStickRight.load(),
+                k.ps5TouchTapClick.load(), k.ps5TouchSwept,
+                k.padTouchKey.down.load(), k.padTouchKey.watch.load() != 0);
+            // Field diagnosis (VEYRA_LOG_PAD_EDGES): name each button change and
+            // each stick/trigger engage, so a handheld's key can be followed by name.
+            if (!k.padEdgeLog && qEnvironmentVariableIsSet("VEYRA_LOG_PAD_EDGES")) k.padEdgeLog = true;
+            if (!k.padEdgeLog) return;
+            if (state.buttons != k.padEdgeButtons) {
+                k.padEdgeButtons = state.buttons;
+                veyra::log::info("remoteplay-input", std::format("pad edge buttons=0x{:04X} ({}) focused={}",
+                    state.buttons, psButtonNames(state.buttons), focused));
+            }
+            if (state.touches[0].id != k.padEdgeTouchId || state.touches[0].x != k.padEdgeTouchX ||
+                state.touches[0].y != k.padEdgeTouchY) {
+                k.padEdgeTouchId = state.touches[0].id;
+                k.padEdgeTouchX = state.touches[0].x;
+                k.padEdgeTouchY = state.touches[0].y;
+                veyra::log::info("remoteplay-input", std::format("pad edge touch id={} x={} y={}",
+                    int(state.touches[0].id), state.touches[0].x, state.touches[0].y));
+            }
+            const int reach = std::max({std::abs(int(state.leftX)), std::abs(int(state.leftY)),
+                                        std::abs(int(state.rightX)), std::abs(int(state.rightY))});
+            // Hysteresis: one line when a stick or trigger engages, one when all rest.
+            const int level = reach > 16000 || state.l2 > 200 || state.r2 > 200 ? 1
+                            : reach < 8000 && state.l2 < 50 && state.r2 < 50 ? 0 : -1;
+            if (level >= 0 && level != k.padEdgeAnalog) {
+                k.padEdgeAnalog = level;
+                veyra::log::info("remoteplay-input", std::format("pad edge axes lx={} ly={} rx={} ry={} l2={} r2={}",
+                    state.leftX, state.leftY, state.rightX, state.rightY, state.l2, state.r2));
+            }
+        };
+        forwarding.sink = [this](const remoteplay::ControllerState& state) { impl_->engine.remotePlayController(state); };
+        forwarding.feedback = [this] { return impl_->engine.remotePlayFeedback(); };
+        if (!j.controller.startForwarding(std::move(forwarding)))
+            veyra::log::warn("remoteplay-input", "pad forwarding could not start");
+    };
     if (!restart && running.requested && (running.alive || running.starting) && profile == i.ps5ControlProfile) {
-        if (!(i.padUsers & Impl::PadPs5Control)) i.acquirePad(Impl::PadPs5Control);
-        if (i.ps5ControlTimer && !i.ps5ControlTimer->isActive()) i.ps5ControlTimer->start(8);
+        startPadForwarding();
         return;
     }
     // Keepalive profile, the lightest the console accepts. Never written back to the pairing.
@@ -699,23 +1220,7 @@ void QmlPlayerBridge::startPs5Control(bool restart) {
     i.ps5ControlNoticed.clear();
     i.ps5ControlNoPair = false;
     i.engine.startRemoteControl(std::move(desc));
-    // The pad is read on the UI thread every 8 ms, as for the PS5 stream (the
-    // session sends one state per 4 ms and queues the rest).
-    if (!i.acquirePad(Impl::PadPs5Control)) veyra::log::warn("remoteplay-input", "SDL gamepad initialization failed");
-    if (!i.ps5ControlTimer) {
-        i.ps5ControlTimer = new QTimer(this);
-        connect(i.ps5ControlTimer, &QTimer::timeout, this, [this] {
-            auto& j = *impl_;
-            // A PS5 stream polls the pad with its own timer and takes the slot.
-            if (j.snapshot.remotePlay || !j.engine.remoteControlRequested()) {
-                j.ps5ControlTimer->stop(); j.releasePad(Impl::PadPs5Control); return;
-            }
-            const bool focused = QGuiApplication::focusWindow() != nullptr || j.prefBool("ps5ControlBackground", false);
-            j.engine.remotePlayController(j.controller.poll(focused));
-            j.controller.feedback(j.engine.remotePlayFeedback(), focused);
-        });
-    }
-    i.ps5ControlTimer->start(8);
+    startPadForwarding();
     tickPs5Control(true);
 #else
     (void)restart;
@@ -724,6 +1229,9 @@ void QmlPlayerBridge::startPs5Control(bool restart) {
 void QmlPlayerBridge::stopPs5Control() {
 #ifdef VEYRA_ENABLE_REMOTEPLAY
     auto& i = *impl_;
+    // The reader ends first, so no state is handed to a session that is closing.
+    i.controller.stopForwarding();
+    i.releasePad(Impl::PadPs5Control);
     if (!i.engine.remoteControlRequested()) return;
     veyra::log::info("remoteplay-control", "stop");
     i.engine.stopRemoteControl();
@@ -734,6 +1242,34 @@ void QmlPlayerBridge::stopPs5Control() {
 void QmlPlayerBridge::tickPs5Control(bool force) {
 #ifdef VEYRA_ENABLE_REMOTEPLAY
     auto& i = *impl_;
+    // What the forwarding thread needs from the interface: its two switches and
+    // the touch gesture's button choices.
+    i.ps5InputFocused.store(i.prefBool("ps5ControlBackground", false) || QGuiApplication::focusWindow() != nullptr);
+    i.ps5TouchEmuWanted.store(i.prefBool("ps5ControlTouchpad", false));
+    i.ps5TouchModifier.store(padBitFromName(i.prefString("ps5PadTouchModifier"), 1u << 13));
+    i.ps5TouchClick.store(padBitFromName(i.prefString("ps5PadTouchClick"), 1u << 12));
+    i.ps5TouchPS.store(padBitFromName(i.prefString("ps5PadTouchPS"), 1u << 3));
+    i.ps5TouchStickRight.store(i.prefString("ps5PadTouchStick") != QLatin1String("left"));
+    i.ps5TouchTapClick.store(i.prefBool("ps5PadTouchTapClick", true));
+    i.padTouchKey.watch.store(unsigned(i.prefInt("ps5PadTouchVk", 0)));
+    i.padTouchKey.active = i.controller.forwarding();
+    i.controller.setForwardRateHz(i.prefInt("ps5InputHz", 250));
+    // 鼠标瞄准: capture only while the pad is actually forwarded; focus loss
+    // releases it and the next tick re-captures when the window is in front.
+    i.ps5MouseAim.store(i.prefBool("ps5MouseAim", false));
+    i.ps5MouseSensitivity.store(std::clamp(i.prefInt("ps5MouseSensitivity", 5), 1, 10));
+    i.kbmEnabled.store(i.prefBool("ps5KbmEnabled", false));
+    const bool wantMouse = (i.ps5MouseAim.load() || i.kbmEnabled.load()) && i.controller.forwarding();
+    if (wantMouse != i.ps5Mouse.captured()) {
+        i.ps5Mouse.capture(wantMouse);
+        if (!wantMouse) i.kbm.releaseAll();
+    }
+    if (!i.padTouchKey.active) i.padTouchKey.down.store(false);
+    // A PS5 stream polls the pad with its own timer and takes the slot.
+    if (i.controller.forwarding() && (i.snapshot.remotePlay || !i.engine.remoteControlRequested())) {
+        i.controller.stopForwarding();
+        i.releasePad(Impl::PadPs5Control);
+    }
     if (!force && ++i.ps5ControlTicks % 15) return; // ~4 Hz from the 60 Hz poll
     // Switched on while the capture card was still opening, or the capture came
     // back by itself: start once it is live. A failed session stays requested
@@ -760,6 +1296,9 @@ void QmlPlayerBridge::tickPs5Control(bool force) {
     next[QStringLiteral("pad")] = (i.padUsers & Impl::PadPs5Control) && c.connected ? QString::fromStdString(c.name) : QString();
     next[QStringLiteral("gyro")] = c.gyro && c.accel;
     next[QStringLiteral("touch")] = c.touch;
+    // Forwarded pad rate; 0 means no active pad state is reaching the session
+    // (no pad, focus lost with background forwarding off, or a dead session).
+    next[QStringLiteral("inputFps")] = std::round(i.controller.forwardedHz());
     if (next == i.ps5ControlState) return;
     i.ps5ControlState = next;
     if (state != i.ps5ControlNoticed) {

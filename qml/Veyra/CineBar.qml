@@ -432,6 +432,7 @@ Rectangle {
 
         // --- right: preset, volume, picture and bar controls ----------
         RowLayout {
+            // Sized to its content: this build adds its own buttons to the cluster.
             Layout.fillWidth: false
             Layout.minimumWidth: implicitWidth
             Layout.alignment: Qt.AlignVCenter | Qt.AlignRight
@@ -474,6 +475,25 @@ Rectangle {
             }
 
             RotateButton { objectName: "cine-rotate" }
+
+            // 简要画面 HUD 设置：显示开关、四角位置、大小、显示哪几行。
+            Item {
+                objectName: "cine-hud"
+                implicitWidth: 34; implicitHeight: 32
+                readonly property int corner: Number(veyra.preferences.hudCorner !== undefined ? veyra.preferences.hudCorner : 0)
+                Text {
+                    anchors.centerIn: parent
+                    text: "FPS"
+                    color: parent.corner > 0 ? Theme.ok : (hudHover.hovered ? "#FFFFFF" : Theme.t2)
+                    font.family: Theme.fontMono; font.pixelSize: 11; font.bold: true
+                }
+                HoverHandler { id: hudHover; cursorShape: Qt.PointingHandCursor }
+                ToolTip.visible: hudHover.hovered
+                ToolTip.text: qsTr("帧率与延迟 HUD：显示 / 位置 / 大小 / 内容")
+                TapHandler {
+                    onTapped: veyra.openHudDialog()
+                }
+            }
 
             Item {
                 implicitWidth: 32; implicitHeight: 32

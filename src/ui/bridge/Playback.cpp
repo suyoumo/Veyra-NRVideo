@@ -1,6 +1,9 @@
 // QML bridge: Playback responsibilities.
 #include "../QmlPlayerBridge_p.h"
 #include "../LiveTranslation.h"
+#include <gdiplus.h>
+#include <cmath>
+namespace veyra::ui { void ensureGdiplus(); }
 
 #include <regex>
 #include "veyra/pipeline/NrReuse.h"
@@ -193,6 +196,157 @@ int QmlPlayerBridge::thumbnailGeneration() const { return impl_->thumbnailGenera
 
 QObject* QmlPlayerBridge::playlist() const { return impl_->playlist; }
 void QmlPlayerBridge::showPlaylist() { emit playlistRequested(); }
+void QmlPlayerBridge::updateHudOverlay(const QImage& image, int x, int y) {
+    // 视频直出: the HUD is drawn by the present blit (PresentBlitOverlay) instead
+    // of QML over the picture, so the video window stays a whole rectangle and the
+    // display scans it out directly. Straight alpha, BGRA8, top-down.
+    engine::VideoOverlay overlay;
+    if (!image.isNull() && image.width() > 0 && image.height() > 0) {
+        const QImage bgra = image.convertToFormat(QImage::Format_ARGB32);
+        overlay.width = unsigned(bgra.width());
+        overlay.height = unsigned(bgra.height());
+        overlay.bgra.resize(size_t(bgra.width()) * size_t(bgra.height()) * 4);
+        for (int row = 0; row < bgra.height(); ++row)
+            std::memcpy(overlay.bgra.data() + size_t(row) * size_t(bgra.width()) * 4,
+                        bgra.constScanLine(row), size_t(bgra.width()) * 4);
+        overlay.x = x;
+        overlay.y = y;
+        overlay.show = true;
+    }
+    impl_->engine.setVideoOverlay(std::move(overlay));
+}
+void QmlPlayerBridge::refreshHudOverlay() {
+    // 视频直出: draw the frame-rate HUD into a small bitmap and let the present
+    // blit put it over the picture (engine/VideoOverlay.h). Grabbing the QML item
+    // instead (grabToImage) re-rendered the window and cost the display its
+    // direct scanout: measured Composed 400/400 frames with the grab, Independent
+    // Flip 400/400 without it. Nothing here touches the window.
+    auto& i = *impl_;
+    if (!i.prefBool("directPresent", false)) { if (hudOverlayShown_) { hudOverlayShown_ = false; i.engine.setVideoOverlay({}); } return; }
+    const int corner = i.prefInt("hudCorner", 0);
+    if (corner <= 0 || i.videoWindow == nullptr || !i.snapshot.running) {
+        if (hudOverlayShown_) { hudOverlayShown_ = false; i.engine.setVideoOverlay({}); }
+        return;
+    }
+    RECT client{};
+    if (!GetClientRect(i.videoWindow, &client) || client.right < 2 || client.bottom < 2) return;
+    const int items = i.prefInt("hudItems", 127);
+    // QML lays the HUD out in logical pixels at hudScale; the swap chain is in
+    // physical pixels, so every size below is multiplied by the window's device
+    // ratio as well (this screen runs at 1.75).
+    double dpr = 1.0;
+    for (QWindow* w : QGuiApplication::topLevelWindows())
+        if (w && w->isVisible() && w->devicePixelRatio() > 0.5) { dpr = w->devicePixelRatio(); break; }
+    const double scale = std::clamp(i.prefInt("hudScale", 100) / 100.0, 0.8, 2.0) * dpr;
+    const double scanout = presentMonKnown() ? presentMonP50Ms() : displayScanoutP50Ms();
+    struct Line { QString text; QRgb colour; double size; };
+    QVector<Line> lines;
+    const QRgb ok = qRgb(0x6f, 0xd0, 0x8a), normal = qRgb(0xe6, 0xe8, 0xee), dim = qRgb(0xb8, 0xbd, 0xc9);
+    auto add = [&](int bit, const QString& label, double value, bool known, QRgb colour, double size) {
+        if ((items & bit) == 0) return;
+        // Fixed width: a changing digit count would resize the bitmap and force a new texture on every update.
+                lines.append({label + QStringLiteral("  ") + (known ? QString::number(value, 'f', 1).rightJustified(5, QLatin1Char(' ')) : QStringLiteral("    —")), colour, size});
+    };
+    add(1, tr("帧率"), submitFps(), submitFpsKnown(), ok, 13);
+    add(2, tr("1% low"), submitLowFps(), submitLowFpsKnown(), dim, 12);
+    add(4, tr("采集延迟"), captureDriverAgeP50Ms(), captureDriverAgeP50Ms() > 0, normal, 12);
+    add(8, tr("引擎延迟"), captureToPresentP50Ms(), captureToPresentP50Ms() > 0, normal, 12);
+    add(16, tr("上屏等待"), scanout, scanout > 0, normal, 12);
+    if ((items & 32) != 0) {
+        const double total = captureDriverAgeP50Ms() + captureToPresentP50Ms() + scanout;
+        lines.append({tr("上屏总延迟") + QStringLiteral("  ") + (total > 0 ? QString::number(total, 'f', 1) : QStringLiteral("—")), normal, 12});
+    }
+    // Same last row as the QML HUD, so both copies show the same set of lines.
+    add(64, tr("处理耗时"), chainTotalMs(), chainTotalMsKnown(), dim, 12);
+    if (lines.isEmpty()) { if (hudOverlayShown_) { hudOverlayShown_ = false; i.engine.setVideoOverlay({}); } return; }
+    ensureGdiplus();
+    // Measure with GDI+ itself. An estimate from character count was too small for
+    // the CJK labels (a glyph is about one em wide) and the box cut the text off.
+    Gdiplus::Bitmap measuring(1, 1, PixelFormat32bppARGB);
+    Gdiplus::Graphics measureGraphics(&measuring);
+    measureGraphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    Gdiplus::StringFormat noWrap;
+    noWrap.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    float width = 0, lineHeight = 0;
+    for (const auto& line : lines) {
+        Gdiplus::Font font(L"Consolas", float(line.size * scale), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::RectF bounds;
+        measureGraphics.MeasureString(line.text.toStdWString().c_str(), -1, &font, Gdiplus::PointF(0, 0), &noWrap, &bounds);
+        width = std::max(width, bounds.Width);
+        lineHeight = std::max(lineHeight, bounds.Height);
+    }
+    lineHeight = std::ceil(lineHeight * 0.92f);   // MeasureString keeps descender padding
+    const int padX = int(std::round(10 * scale)), padY = int(std::round(7 * scale));
+    const int w = int(std::ceil(width)) + padX * 2, h = int(lineHeight) * lines.size() + padY * 2;
+    Gdiplus::Bitmap bitmap(w, h, PixelFormat32bppARGB);
+    {
+        Gdiplus::Graphics graphics(&bitmap);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+        Gdiplus::SolidBrush background(Gdiplus::Color(210, 0, 0, 0));
+        Gdiplus::GraphicsPath path;
+        const double radius = 8 * scale;
+        const float d = float(radius * 2);
+        path.AddArc(Gdiplus::RectF(0.0f, 0.0f, d, d), 180.0f, 90.0f);
+        path.AddArc(Gdiplus::RectF(float(w) - d, 0.0f, d, d), 270.0f, 90.0f);
+        path.AddArc(Gdiplus::RectF(float(w) - d, float(h) - d, d, d), 0.0f, 90.0f);
+        path.AddArc(Gdiplus::RectF(0.0f, float(h) - d, d, d), 90.0f, 90.0f);
+        path.CloseFigure();
+        graphics.FillPath(&background, &path);
+        int y = padY;
+        for (const auto& line : lines) {
+            Gdiplus::Font font(L"Consolas", float(line.size * scale), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+            Gdiplus::SolidBrush brush(Gdiplus::Color(255, qRed(line.colour), qGreen(line.colour), qBlue(line.colour)));
+            Gdiplus::StringFormat format;
+            format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            graphics.DrawString(line.text.toStdWString().c_str(), -1, &font, Gdiplus::PointF(float(padX), float(y)), &format, &brush);
+            y += int(lineHeight);
+        }
+    }
+    engine::VideoOverlay overlay;
+    overlay.width = unsigned(w); overlay.height = unsigned(h);
+    // Placement mirrors the QML HUD in Main.qml: 12 logical px from the side,
+    // hudOffsetY below the top edge for 左上/右上, flush for the 置顶 corners and
+    // 12 px above the bottom edge for 左下/右下. x/y/show must be filled here:
+    // VideoPresenter::applyVideoOverlay only draws when overlayShown_.show is set
+    // (an overlay with show == false is invisible, which is exactly how the HUD
+    // disappeared when these lines were lost).
+    const bool rightSide = corner == 2 || corner == 4 || corner == 6;
+    const bool bottomSide = corner == 3 || corner == 4;
+    const bool topFlush = corner == 5 || corner == 6;
+    const int margin = int(std::round(12 * dpr));
+    const int offsetY = int(std::round(i.prefInt("hudOffsetY", 96) * dpr));
+    overlay.x = int(std::max<LONG>(0, rightSide ? client.right - w - margin : margin));
+    overlay.y = int(std::max<LONG>(0, bottomSide ? client.bottom - h - margin : topFlush ? 0 : LONG(offsetY)));
+    overlay.show = true;
+    overlay.bgra.resize(size_t(w) * size_t(h) * 4);
+    {
+        Gdiplus::BitmapData data{};
+        Gdiplus::Rect rect(0, 0, w, h);
+        if (bitmap.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok) return;
+        for (int row = 0; row < h; ++row)
+            std::memcpy(overlay.bgra.data() + size_t(row) * size_t(w) * 4,
+                        static_cast<const uint8_t*>(data.Scan0) + size_t(row) * size_t(data.Stride), size_t(w) * 4);
+        bitmap.UnlockBits(&data);
+    }
+    hudOverlayShown_ = true;
+    // VEYRA_HUD_PROBE=1: one line per second saying what the bridge sent. The
+    // normal run stays silent; this exists because a missing HUD can be either
+    // side (the bridge not sending, or the blit not drawing).
+    static const bool hudProbe = GetEnvironmentVariableW(L"VEYRA_HUD_PROBE", nullptr, 0) > 0;
+    if (hudProbe) {
+        static auto lastProbe = std::chrono::steady_clock::time_point{};
+        const auto nowProbe = std::chrono::steady_clock::now();
+        if (nowProbe - lastProbe >= std::chrono::seconds(1)) {
+            lastProbe = nowProbe;
+            veyra::log::info("hud-probe", std::format(
+                "side=bridge corner={} client={}x{} bitmap={}x{} rect={},{} show={} items={} running={}",
+                corner, int(client.right), int(client.bottom), w, h, overlay.x, overlay.y,
+                overlay.show ? 1 : 0, items, i.snapshot.running ? 1 : 0));
+        }
+    }
+    i.engine.setVideoOverlay(std::move(overlay));
+}
 void QmlPlayerBridge::addPlaylistFilesDialog() {
     const auto paths = QFileDialog::getOpenFileNames(nullptr, tr("添加文件到播放列表"), {},
         tr("媒体文件 (*.mp4 *.mkv *.mov *.avi *.webm *.ts *.m2ts *.mts *.m4v *.wmv *.mpg *.mpeg *.vob *.flv *.ogv *.asf *.3gp *.jpg *.jpeg *.png *.bmp *.webp);;所有文件 (*)"));

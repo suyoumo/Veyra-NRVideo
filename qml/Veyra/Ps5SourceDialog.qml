@@ -22,7 +22,13 @@ DialogLayer {
     }
     Connections {
         target: dialogHost
-        function onDialogChanged() { if (dialogHost.dialog === "ps5") veyra.ps5Load() }
+        function onDialogChanged() {
+            if (dialogHost.dialog !== "ps5") return
+            veyra.ps5Load()
+            // First run: look for the console as soon as the dialog opens, so the
+            // address fills in without pressing 查找 (the result lands via ps5Changed).
+            if (!veyra.ps5.host) veyra.ps5Scan()
+        }
     }
     readonly property var qualities: [{ id: "0", label: "720p · 30 fps" }, { id: "1", label: "720p · 60 fps" }, { id: "2", label: "1080p · 30 fps" }, { id: "3", label: "1080p · 60 fps" }]
     readonly property var bitrates: [5, 10, 15, 20, 30, 50, 80, 100].map((m, i) => ({ id: String(i), label: m + " Mbps" }))
@@ -79,6 +85,10 @@ DialogLayer {
             VButton { text: qsTr("删除"); ghost: true; enabled: !veyra.ps5.busy && veyra.ps5.profile.length > 0; onClicked: veyra.ps5Forget() }
         }
     }
+    // Kept next to the pairing rows on purpose: at the very bottom of the
+    // scrolling dialog the validation message was invisible, so a click with
+    // empty fields looked like nothing happened.
+    DialogNote { visible: (veyra.ps5.status || "").length > 0; text: (veyra.ps5.busy ? qsTr("处理中 · ") : "") + (veyra.ps5.status || "") }
 
     DialogSection { text: qsTr("串流（重连生效）") }
     DialogGroup {
@@ -158,5 +168,4 @@ DialogLayer {
             }
         }
     }
-    DialogNote { visible: (veyra.ps5.status || "").length > 0; text: (veyra.ps5.busy ? qsTr("处理中 · ") : "") + (veyra.ps5.status || "") }
 }

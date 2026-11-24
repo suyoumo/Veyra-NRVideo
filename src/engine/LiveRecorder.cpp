@@ -1,5 +1,6 @@
 #include "veyra/engine/LiveRecorder.h"
 #include "veyra/engine/MicrophoneCapture.h"
+#include "veyra/engine/SystemAudioLoopback.h"
 #include "veyra/engine/ReplayBuffer.h"
 #include "veyra/pipeline/GpuPassUtils.h"
 #include "veyra/sink/MfLiveEncoder.h"
@@ -441,7 +442,7 @@ bool writeReplayFile(const std::wstring& path,const ReplayBuffer::Clip& clip,std
 // slots and conversion (engine thread), the encoder thread and the writer
 // thread. Created by record() on the engine thread; LiveRecorder keeps it
 // until both threads are done.
-struct LiveRecorder::Segment final : sink::RecordingAudioSink, MicrophoneSink {
+struct LiveRecorder::Segment final : sink::RecordingAudioSink, MicrophoneSink, SystemAudioSink {
     // Fixed at creation.
     ComPtr<ID3D12Device> device;
     uint32_t sourceWidth=0,sourceHeight=0;
@@ -799,6 +800,12 @@ struct LiveRecorder::Segment final : sink::RecordingAudioSink, MicrophoneSink {
         if(!microphone||!audio||closing.load()||!count)return;
         micLane.push(stereo,count,sink::AudioFormat{},capturedUs,this);
     }
+    // 全屏录制: the system loopback is the game sound; it takes the place of
+    // the player's tap so a game Veyra does not play still reaches the file.
+    void systemPcm(const float* stereo,size_t count,int64_t capturedUs) override {
+        if(!sound||!audio||closing.load()||!count)return;
+        soundLane.push(stereo,count,sink::AudioFormat{},capturedUs,this);
+    }
 
     // ---- writer thread ---------------------------------------------------------
     static void freeOutput(OutputFile& out){
@@ -1073,6 +1080,7 @@ struct LiveRecorder::State {
     void retire(const std::shared_ptr<Segment>& segment,const std::wstring& why){
         if(!segment)return;
         sink::removeRecordingAudioSink(segment.get());
+        detachSystemAudio(segment.get());
         detachMicrophone(segment.get());
         if(!why.empty()&&segment->noteText().empty())segment->setNote(why);
         if(const auto name=segment->encoderText();!name.empty())encoder=name;
@@ -1385,7 +1393,12 @@ bool LiveRecorder::record(ID3D12GraphicsCommandList* list,const Frame& frame){
         std::wstring reason;
         if(!segment->create(reason))return fail(reason);
         s.current=segment;++s.files;++s.nextNumber;s.audioTrack=segment->audio;
-        if(segment->sound)sink::addRecordingAudioSink(segment);
+        if(segment->sound){
+            // 全屏录制 takes the game's own output; every other mode takes what
+            // the player renders.
+            if(s.settings.systemAudio)attachSystemAudio(segment);
+            else sink::addRecordingAudioSink(segment);
+        }
         if(segment->microphone)attachMicrophone(segment,s.settings.microphoneId);
         veyra::log::info("live-recorder",std::format("{} {} path={} extent={}x{} source={}x{} hdr={} codec={} fps={} bitrateMbps={} encoder={} audio={} microphone={}",
             s.replayMode?"replay buffer":"file",s.files,segment->name(),segment->width,segment->height,segment->sourceWidth,segment->sourceHeight,

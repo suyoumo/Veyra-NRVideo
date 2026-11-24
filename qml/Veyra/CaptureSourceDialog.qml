@@ -303,6 +303,20 @@ DialogLayer {
             }
         }
         VRow {
+            objectName: "capture-aver-lowlatency-row"
+            label: qsTr("AVerMedia 低延迟模式")
+            hint: !veyra.captureAverPcieDevice
+                  ? qsTr("仅 AVerMedia PCIe 卡（GC573/Live Gamer 4K 等）可用")
+                  : qsTr("连接时把驱动排队压到 1 帧：输出缓冲建议与接收端要求同时压到 1（覆盖「设备缓冲」设置），砍掉 DMA 完成后到回调之间的在途帧；单缓冲在系统卡顿时可能丢帧。开关后点「连接并开始」重新连接生效；实际效果看日志 capture-buffer 的 actual buffers 与 capture-driver-age")
+            VSwitch {
+                objectName: "capture-aver-lowlatency"
+                enabled: veyra.captureAverPcieDevice
+                opacity: enabled ? 1 : 0.35
+                checked: veyra.preferences.averLowLatency === true
+                onToggled: checked => veyra.setPreference("averLowLatency", checked)
+            }
+        }
+        VRow {
             label: qsTr("设备帧率 FPS")
             hint: qsTr("0 = 沿用所选格式；设备返回其他帧率会报错，不在软件中偷偷丢帧")
             DialogTextField {
@@ -528,18 +542,80 @@ DialogLayer {
         }
         VRow {
             visible: captureDialog.pcOn
+            label: qsTr("模拟触控板")
+            hint: captureDialog.pc.touch === true
+                  ? qsTr("已检测到带触控板的手柄，直接使用真实触控板；此开关只在没有触控板的手柄上生效")
+                  : qsTr("Xbox 手柄没有触控板：打开后按住「进入触摸模式的键」，推摇杆＝滑动，按「点击键」＝触控板点击，按「PS 组合键」＝PS。默认 Share / Options / Y；具体键位在「按键映射」里改。手势期间这些键不会传给游戏；接真 DualSense 时自动用真实触控板")
+            VSwitch {
+                objectName: "capture-ps5-touchpad"
+                checked: captureDialog.pc.touchpad === true
+                onToggled: checked => veyra.ps5ControlSet("touchpad", checked)
+            }
+        }
+        VRow {
+            visible: captureDialog.pcOn
+            label: qsTr("按键映射")
+            hint: qsTr("每个 PS5 按键对应哪个 Xbox 按键、触摸手势用哪些键、PS5 把本机识别成 DualSense 还是 DualShock 4")
+            VButton { objectName: "capture-ps5-padmap"; text: qsTr("配置…"); ghost: true; onClicked: dialogHost.open("padmap") }
+        }
+        VRow {
+            visible: captureDialog.pcOn
             label: qsTr("手柄")
             hint: qsTr("谁按键就用谁：本机手柄、串流软件建的虚拟手柄都可以")
             Text {
                 objectName: "capture-ps5-pad"
-                text: (captureDialog.pc.pad || "").length > 0
-                      ? captureDialog.pc.pad + " · " + (captureDialog.pc.gyro === true ? qsTr("有陀螺仪") : qsTr("无陀螺仪"))
-                      : captureDialog.pc.state === "off" || captureDialog.pc.state === "nopair" ? "—" : qsTr("未检测到手柄")
+                text: {
+                    const pc = captureDialog.pc
+                    const rate = pc.inputFps > 0 ? " · " + Math.round(pc.inputFps) + " Hz" : ""
+                    if ((pc.pad || "").length > 0)
+                        return pc.pad + " · " + (pc.gyro === true ? qsTr("有陀螺仪") : qsTr("无陀螺仪")) + rate
+                    if (pc.state === "off" || pc.state === "nopair") return "—"
+                    return qsTr("未检测到手柄")
+                }
                 color: Theme.t1
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fsSmall
                 elide: Text.ElideRight
                 width: Math.min(implicitWidth, 260)
+            }
+        }
+        VRow {
+            visible: captureDialog.pcOn
+            label: qsTr("输入采样率")
+            hint: qsTr("Veyra 读取并转发手柄的频率。远程游玩在状态变化时立即发包，这里只是上限；500 Hz 最多省约 2ms 采样等待，实际受手柄报告率与 PS5 处理限制")
+            VSeg {
+                objectName: "capture-ps5-rate"
+                options: [{ id: "125", label: "125 Hz" }, { id: "250", label: "250 Hz" }, { id: "500", label: "500 Hz" }]
+                current: String(captureDialog.pc.inputHz || 250)
+                onPicked: id => veyra.ps5ControlSet("rate", Number(id))
+            }
+        }
+        VRow {
+            visible: captureDialog.pcOn
+            label: qsTr("键鼠映射")
+            hint: qsTr("GTA6 预设：WASD 移动、鼠标瞄准、左右键开火/瞄准，鼠标侧键 2 切换步行/驾驶；手柄仍是主输入，键鼠只做叠加")
+            VButton { objectName: "capture-ps5-kbm"; text: qsTr("配置…"); ghost: true; onClicked: dialogHost.open("kbm") }
+        }
+        VRow {
+            visible: captureDialog.pcOn
+            label: qsTr("鼠标瞄准")
+            hint: qsTr("简易版：手柄仍是主输入；鼠标控右摇杆瞄准，左键＝R2 开火、右键＝L2 瞄准。开启键鼠映射后这项被接管")
+            VSwitch {
+                objectName: "capture-ps5-mouse"
+                checked: captureDialog.pc.mouse === true
+                onToggled: checked => veyra.ps5ControlSet("mouse", checked)
+            }
+        }
+        VRow {
+            visible: captureDialog.pcOn && captureDialog.pc.mouse === true
+            label: qsTr("鼠标灵敏度")
+            hint: qsTr("每像素对应的右摇杆偏转；越高转得越快，1 最慢、10 最快")
+            VSelect {
+                objectName: "capture-ps5-mouse-sens"
+                implicitWidth: 100
+                value: (captureDialog.pc.mouseSensitivity || 5) + " / 10"
+                options: [1,2,3,4,5,6,7,8,9,10].map(v => ({ id: String(v), label: v + " / 10" }))
+                onPicked: id => veyra.ps5ControlSet("mouseSens", Number(id))
             }
         }
     }

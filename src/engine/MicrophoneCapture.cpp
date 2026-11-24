@@ -30,6 +30,9 @@ namespace veyra::engine {
 using Microsoft::WRL::ComPtr;
 namespace {
 
+// Voice gain into every listener (see setMicrophoneGainDb).
+std::atomic<float> g_micGain{1.0f};
+
 constexpr int kRate=48000;
 // PKEY_Device_FriendlyName (functiondiscoverykeys_devpkey.h), defined here so
 // this library does not depend on another translation unit instantiating it.
@@ -91,6 +94,13 @@ struct Hub {
 
     void deliver(const float* pcm,size_t frames,int64_t capturedUs){
         std::lock_guard lock(m);
+        const float gain=g_micGain.load(std::memory_order_relaxed);
+        std::vector<float> scaled;
+        if(gain!=1.0f){
+            scaled.assign(pcm,pcm+frames*2);
+            for(auto& sample:scaled)sample=std::clamp(sample*gain,-1.0f,1.0f);
+            pcm=scaled.data();
+        }
         for(const auto& sink:sinks)sink->microphonePcm(pcm,frames,capturedUs);
         ++status.packets;
     }
@@ -304,6 +314,16 @@ MicrophoneStatus microphoneStatus(){
     auto& h=hub();
     std::lock_guard lock(h.m);
     return h.status;
+}
+
+void setMicrophoneGainDb(float db){
+    const float clamped=std::clamp(db,0.0f,24.0f);
+    g_micGain.store(clamped>0.0f?std::pow(10.0f,clamped/20.0f):1.0f,std::memory_order_relaxed);
+}
+
+float microphoneGainDb(){
+    const float gain=g_micGain.load(std::memory_order_relaxed);
+    return gain>1.0f?20.0f*std::log10(gain):0.0f;
 }
 
 } // namespace veyra::engine

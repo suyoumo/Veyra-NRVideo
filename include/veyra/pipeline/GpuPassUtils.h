@@ -322,17 +322,23 @@ struct GraphicsPass {
     UINT increment = 0;
 
     // `constantCount` is the number of 32-bit root constants the pass declares at b0.
-    // PresentBlit declares 16 including the optional HDR curve; callers write
-    // all 16, including neutral values when the curve flag is off.
+    // PresentBlit declares 24 including the optional HDR curve and the overlay.
+    // `overlaySrv` adds a second one-descriptor table at t1 (pixel stage) for the
+    // overlay image; a pass that leaves it off keeps its two-parameter signature.
     bool create(ID3D12Device* device, const std::vector<uint8_t>& vs,
                 const std::vector<uint8_t>& ps, UINT heapSlots, DXGI_FORMAT outputFormat=DXGI_FORMAT_R8G8B8A8_UNORM,
-                UINT constantCount=16)
+                UINT constantCount=16, bool overlaySrv=false)
     {
         if(constantCount==0||constantCount>62)return false;
         D3D12_DESCRIPTOR_RANGE1 srvRange{};
         srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRange.NumDescriptors = 1;
         srvRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+        D3D12_DESCRIPTOR_RANGE1 overlayRange{};
+        overlayRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        overlayRange.NumDescriptors = 1;
+        overlayRange.BaseShaderRegister = 1;
+        overlayRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
         D3D12_STATIC_SAMPLER_DESC sampler{};
         sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -341,7 +347,7 @@ struct GraphicsPass {
         sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         sampler.ShaderRegister = 0;
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_ROOT_PARAMETER1 rp[2]{};
+        D3D12_ROOT_PARAMETER1 rp[3]{};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rp[0].Constants.ShaderRegister = 0;
@@ -350,9 +356,17 @@ struct GraphicsPass {
         rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         rp[1].DescriptorTable.NumDescriptorRanges = 1;
         rp[1].DescriptorTable.pDescriptorRanges = &srvRange;
+        UINT parameters=2;
+        if(overlaySrv){
+            rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            rp[2].DescriptorTable.NumDescriptorRanges = 1;
+            rp[2].DescriptorTable.pDescriptorRanges = &overlayRange;
+            parameters=3;
+        }
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC rd{};
         rd.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-        rd.Desc_1_1.NumParameters = 2;
+        rd.Desc_1_1.NumParameters = parameters;
         rd.Desc_1_1.pParameters = rp;
         rd.Desc_1_1.NumStaticSamplers = 1;
         rd.Desc_1_1.pStaticSamplers = &sampler;

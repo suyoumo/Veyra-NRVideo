@@ -41,6 +41,17 @@ struct RecordingSettings {
     bool microphone=false;       // record a microphone
     std::wstring microphoneId;   // its endpoint; empty: the default recording device
     bool microphoneTrack=false;  // on a track of its own instead of mixed into the sound
+    // Record Veyra's own window (picture plus interface) instead of the picture
+    // alone: WindowCaptureFeeder.h feeds this recorder, not the presenter.
+    bool ui=false;
+    uint64_t window=0;           // the HWND to capture when ui is set
+    // 全屏录制: the game is not played by Veyra, so the sound comes from the
+    // system loopback (SystemAudioLoopback.h) instead of the player's tap.
+    bool systemAudio=false;
+    // 区域录制: keep one rectangle of the monitor, in its pixels; zero width
+    // records the whole screen.
+    int32_t regionX=0,regionY=0;
+    uint32_t regionW=0,regionH=0;
     uint32_t splitSeconds=0;     // 0: no time limit, otherwise split at a keyframe
     uint64_t splitBytes=0;       // 0: no size limit; a file can exceed the target by a GOP
     // NVENC tuning (from PushFPS): 0 off, 1 two-pass at quarter resolution, 2 two-pass at full

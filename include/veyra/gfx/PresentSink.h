@@ -232,7 +232,14 @@ private:
     int64_t lastSyncQpc_=0;
     double refreshQpc_=0,latchMs_=2;
     bool displayLatencyEnabled_=true;
+    // The last Present allowed tearing: its scanout cannot be dated on the
+    // refresh grid, so takeDisplayLatency publishes the latch sample there.
+    bool lastPresentTore_=false;
     std::vector<double> displayLatencyMs_;
+    // Grid-free samples: SyncQPCTime - the newest present's own QPC, i.e. when the
+    // frame the display just consumed actually went up. Valid with VRR too, where
+    // the fixed vblank grid the displayLatencyMs_ maths assumes does not exist.
+    std::vector<double> latchLatencyMs_;
 };
 
 } // namespace veyra::gfx

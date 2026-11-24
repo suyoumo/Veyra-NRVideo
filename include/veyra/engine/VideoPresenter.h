@@ -12,10 +12,12 @@
 #include "veyra/gfx/NvidiaVrr.h"
 #include "veyra/engine/PresentationSettings.h"
 #include "veyra/engine/PresentCapture.h"
+#include "veyra/engine/VideoOverlay.h"
 #include "veyra/engine/DisplayStateService.h"
 #include "veyra/engine/FullscreenFrameStats.h"
 #include <chrono>
 #include <array>
+#include <mutex>
 #include <optional>
 namespace veyra::gfx { class D3D12DeviceContext; class CommandSlotRing; }
 namespace veyra::pipeline { class EnhanceGraph; }
@@ -65,6 +67,9 @@ public:
     // the follow path from changing anything.
     void setFrameDovi(const pipeline::DoviFrameInfo& d){latestDovi_=d;}
     const pipeline::DoviFrameInfo& frameDovi() const {return latestDovi_;}
+    // VideoOverlay.h. Any thread; the owner thread uploads it before the next
+    // present. An empty image with show=false takes it off again.
+    void setVideoOverlay(VideoOverlay overlay);
     PresentationSettings configurePresentation(gfx::D3D12DeviceContext&,PresentationSettings,bool fg,std::wstring& status);
     bool presentationReady(){return sink_.presentationReady();}
     gfx::PresentSink::RefreshGrid refreshGrid()const{return sink_.refreshGrid();}
@@ -167,6 +172,24 @@ private:
     gfx::PresentSink sink_;
     pipeline::GraphicsPass pass_;
     pipeline::ComputePass presentMotionPass_;
+    // Overlay (VideoOverlay.h): three upload-heap textures in rotation. The GPU
+    // reads one at present time, so a texture is rewritten only after the fence
+    // of the present that last read it has completed; otherwise the upload waits
+    // a frame and the previous image stays on screen.
+    static constexpr unsigned kOverlayTextures=3;
+    // 16 for the blit itself (see PresentBlit.hlsl), 8 for the overlay.
+    static constexpr UINT kPresentBlitConstants=24;
+    std::mutex overlayMutex_;VideoOverlay overlayPending_;uint64_t overlayVersion_=0,overlayAppliedVersion_=0;
+    struct OverlayTexture{
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource, upload;
+        unsigned width=0,height=0,rowPitch=0;
+        uint64_t fenceUsed=0;
+        bool readState=false;  // resource is in PIXEL_SHADER_RESOURCE, not COMMON
+    };
+    std::array<OverlayTexture,kOverlayTextures> overlayTextures_;unsigned overlayNext_=0;
+    VideoOverlay overlayShown_;int overlayShownSlot_=-1;
+    // Fills the eight overlay constants of the present blit; true when an image is up.
+    bool applyVideoOverlay(gfx::D3D12DeviceContext& ctx,ID3D12GraphicsCommandList* list,ID3D12Fence* fence,pipeline::EnhanceGraph& graph,float* dims);
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,2> presentMotion_;
     PreviewView previousXessView_{};
     unsigned previousXessWidth_=0,previousXessHeight_=0;

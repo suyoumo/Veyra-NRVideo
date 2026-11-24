@@ -98,6 +98,9 @@ bool QmlPlayerBridge::beginMaskDraw(bool allEffects,const QString& shape) {
 void QmlPlayerBridge::updateProtectionDraw(double x0, double y0, double x1, double y1) {
     auto& i = *impl_;
     if (i.protDraw.isEmpty() || !i.videoWindow) return;
+    // 视频直出: a layered child over the picture forces composition again, and
+    // the direct window has no hole to show it through.
+    if (i.prefBool("directPresent", false)) { emit notice(tr("视频直出时不能在画面上绘制：请先关闭「视频直出」"), true); return; }
     if (!i.protOverlay) { ensureGdiplus(); i.protOverlay = createSubtitleOverlay(i.videoWindow); }
     if (!i.protOverlay) return;
     RECT client{}; GetClientRect(i.videoWindow, &client);
@@ -265,6 +268,7 @@ void QmlPlayerBridge::updateMaskOverlay() {
     }
     if(geometry.size()==3){if(i.protOverlay)ShowWindow(i.protOverlay,SW_HIDE);i.maskOverlayGeometry.clear();return;}
     if(geometry==i.maskOverlayGeometry&&i.protOverlay&&IsWindowVisible(i.protOverlay))return;
+    if(i.prefBool("directPresent",false)){if(i.protOverlay)ShowWindow(i.protOverlay,SW_HIDE);return;}
     if(!i.protOverlay){ensureGdiplus();i.protOverlay=createSubtitleOverlay(i.videoWindow);}
     if(!i.protOverlay)return;
     SetWindowPos(i.protOverlay,HWND_TOP,0,0,c.right,c.bottom,SWP_NOACTIVATE);

@@ -83,4 +83,7 @@ struct PairResult {
 // Cancellation stops the upstream registration and joins before returning.
 PairResult pairLocalPs5(std::string host,const AccountId&,std::string_view eightDigitPin,
     std::stop_token stop={},std::chrono::milliseconds timeout=std::chrono::seconds(30));
+// Which pad the console is told is connected: 0 auto (DualSense unless view-only),
+// 1 DualSense, 2 DualShock 4. Read when a session starts; safe from the UI thread.
+void setControllerIdentity(int mode);
 } // namespace veyra::remoteplay

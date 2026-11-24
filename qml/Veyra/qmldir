@@ -62,6 +62,7 @@ VTelemetryValue 1.0 VTelemetryValue.qml
 AnrDownloadRow 1.0 AnrDownloadRow.qml
 SponsorPanel 1.0 SponsorPanel.qml
 RotateButton 1.0 RotateButton.qml
+RegionSelect 1.0 RegionSelect.qml
 
 
 # Professional-view reusable components
@@ -86,6 +87,9 @@ CaptureGuideDialog 1.0 CaptureGuideDialog.qml
 OnboardingGuide 1.0 OnboardingGuide.qml
 DynamicHudRow 1.0 DynamicHudRow.qml
 Ps5SourceDialog 1.0 Ps5SourceDialog.qml
+PadMapDialog 1.0 PadMapDialog.qml
+HudSettingsDialog 1.0 HudSettingsDialog.qml
+KbmSettingsDialog 1.0 KbmSettingsDialog.qml
 PcSourceDialog 1.0 PcSourceDialog.qml
 XboxSourceDialog 1.0 XboxSourceDialog.qml
 ScreenSourceDialog 1.0 ScreenSourceDialog.qml

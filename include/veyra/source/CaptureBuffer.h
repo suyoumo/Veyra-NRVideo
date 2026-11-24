@@ -38,4 +38,11 @@ constexpr long captureDesiredVideoBuffers(CaptureBufferMode mode, long width, lo
     }
     return 0;
 }
+
+// AVerMedia 低延迟模式（GC573 等 VEN_1461 PCIe 卡）。Magewell 的低延迟靠厂商 SDK 的
+// partial notify（帧未到齐就能读），DirectShow 没有等价物；本卡能压到的是分配器建议
+// 1 帧 + 直连回调。全局偏好镜像 magewell::setLowLatencyPreference 的模式：连接建图时
+// 读取，覆盖「设备缓冲」设置；生效需要重新连接。
+void setAverLowLatencyPreference(bool enabled);
+bool averLowLatencyPreference();
 }

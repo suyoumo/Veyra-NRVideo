@@ -9,6 +9,9 @@
 #include "veyra/media/FormatBadgeWindow.h"
 #include "veyra/ngx/DlssgLite.h"
 #include "veyra/RuntimePaths.h"
+#include "veyra/ui/GamePassthrough.h"
+#include "veyra/ui/KeyMouseMapper.h"
+#include "veyra/ui/Ps5MouseCapture.h"
 #include <QAbstractNativeEventFilter>
 #include <QGuiApplication>
 #include <QScreen>
@@ -188,6 +191,14 @@ namespace bridge_detail {
 // WM_DISPLAYCHANGE reaches every top-level window when a display mode, refresh
 // rate or HDR state, or the set of screens, changes: the 可变刷新 state is then
 // read once more (DisplayStateService) instead of on a timer.
+// 刷新显示器状态: WM_DISPLAYCHANGE flips the flag; the VRR state is then read once more.
+struct DisplayChangeFilter final : QAbstractNativeEventFilter {
+    bool* changed = nullptr;
+    bool nativeEventFilter(const QByteArray& type, void* message, qintptr*) override {
+        if (changed && type == "windows_generic_MSG" && static_cast<const MSG*>(message)->message == WM_DISPLAYCHANGE) *changed = true;
+        return false;
+    }
+};
 struct DisplayEventFilter final : QAbstractNativeEventFilter {
     bool* changed = nullptr;
     bool nativeEventFilter(const QByteArray& type, void* message, qintptr*) override {
@@ -202,6 +213,39 @@ struct DisplayEventFilter final : QAbstractNativeEventFilter {
             const auto* pos = reinterpret_cast<const WINDOWPOS*>(msg->lParam);
             if (pos && (pos->flags & SWP_SHOWWINDOW))
                 source::excludeWindowFromScreenCapture(msg->hwnd);
+        }
+        return false;
+    }
+};
+// 触摸键（键盘）: a keyboard key used as the touchpad modifier. The handheld maps
+// its back button to a key in Armoury Crate; Moonlight forwards the keyboard, so no
+// gamepad button is consumed (GTA6's L3 stays free). Seen only while a Veyra window
+// has focus, which is the streamed app.
+struct PadTouchKeyFilter final : QAbstractNativeEventFilter {
+    std::atomic<unsigned> watch{0};
+    std::atomic<bool> down{false};
+    std::atomic<bool> capturing{false};
+    bool active = false;                  // consume only while the pad is forwarded
+    std::function<void(unsigned)> onCaptured;
+    bool nativeEventFilter(const QByteArray& type, void* message, qintptr*) override {
+        if (type != "windows_generic_MSG" && type != "windows_dispatcher_MSG") return false;
+        auto* msg = static_cast<MSG*>(message);
+        if (msg->message != WM_KEYDOWN && msg->message != WM_KEYUP &&
+            msg->message != WM_SYSKEYDOWN && msg->message != WM_SYSKEYUP) return false;
+        const unsigned vk = unsigned(msg->wParam);
+        if (capturing.load()) {
+            const bool isDown = msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN;
+            if (!isDown) return true;
+            capturing.store(false);
+            if (onCaptured) onCaptured(vk == VK_ESCAPE ? 0u : vk);
+            return true;
+        }
+        if (active && watch.load() && vk == watch.load()) {
+            const bool isDown = msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN;
+            // One line per press/release: proves whether the key reaches Veyra at all.
+            if (down.exchange(isDown) != isDown)
+                veyra::log::info("remoteplay-input", std::format("touch key {} vk={}", isDown ? "down" : "up", vk));
+            return true; // the touch key never reaches the game or another app
         }
         return false;
     }
@@ -396,6 +440,8 @@ struct QmlPlayerBridge::Impl {
     uint64_t replaySaved = 0;      // its saved-clip counter already announced
     QVariantList microphones;      // recording endpoints, {id, label}
     QString microphoneNotice;      // the microphone failure last announced
+    // 声音自检 (AudioProbe.h): game/microphone peaks and the endpoint state.
+    QVariantMap audioTest;
   // Custom: the display whose HDR curve is currently applied (see syncHdrDisplayProfile).
   QString hdrProfileDisplay;
   // Custom: the title whose curve is currently applied (see syncHdrTitleProfile).
@@ -493,13 +539,49 @@ struct QmlPlayerBridge::Impl {
     std::atomic<bool> ps5Done{false};
     bool ps5Busy = false;
     QTimer* controllerTimer = nullptr;
-    // PS5 手柄控制 (capture card dialog).
-    QTimer* ps5ControlTimer = nullptr;
+    // PS5 手柄控制 (capture card dialog). The pad is read on ControllerInput's
+    // forwarding thread: the plain fields below belong to that thread, and the
+    // two atomics are what the interface publishes to it.
     QVariantMap ps5ControlState;
     std::wstring ps5ControlProfile;          // pairing (or test host) the session was started with
     QString ps5ControlNoticed;               // state the last notice was shown for
     int ps5ControlTicks = 0;
     bool ps5ControlNoPair = false;           // switched on without a pairing; cleared once pairings exist
+    std::atomic<bool> ps5InputFocused{false};
+    std::atomic<bool> ps5TouchEmuWanted{false};
+    // Touch gesture knobs, published by the interface thread and read per poll:
+    // which PS5 button opens the gesture, which one clicks, the PS chord, and the
+    // stick that sweeps the touch point.
+    std::atomic<std::uint32_t> ps5TouchModifier{1u<<13};
+    std::atomic<std::uint32_t> ps5TouchClick{1u<<12};
+    std::atomic<std::uint32_t> ps5TouchPS{1u<<3};
+    std::atomic<bool> ps5TouchStickRight{true};
+    // Tap = click: releasing the modifier without sweeping the stick sends a
+    // touchpad click, so one back button covers both click and swipe.
+    std::atomic<bool> ps5TouchTapClick{true};
+    // 鼠标瞄准: raw mouse -> right stick / L2 / R2 while forwarding. The capture
+    // object owns the cursor; the forwarding thread consumes the deltas.
+    Ps5MouseCapture ps5Mouse;
+    std::atomic<bool> ps5MouseAim{false};
+    std::atomic<int> ps5MouseSensitivity{5};
+    bool ps5MouseWasMoving = false; // forwarding thread only
+    // 键鼠映射: GTA6 preset, default/driving modes, tuned from the KBM dialog.
+    KeyMouseMapper kbm;
+    std::atomic<bool> kbmEnabled{false};
+    remoteplay::HostTime kbmLastTick = 0;       // forwarding thread only
+    bool padEdgeLog = false;                 // VEYRA_LOG_PAD_EDGES: name each button change
+    std::uint32_t padEdgeButtons = 0;
+    int padEdgeAnalog = 0;                   // -1: inside the stick/trigger hysteresis band
+    int8_t padEdgeTouchId = -1;
+    std::uint16_t padEdgeTouchX = 0, padEdgeTouchY = 0;
+    // Xbox pads have no touchpad; opt-in emulation turns Share into one while held.
+    bool ps5TouchEmu = false;                // copy of ps5TouchEmuWanted on the forwarding thread
+    bool ps5TouchGesture = false;            // modifier held => touchpad mode
+    bool ps5TouchOptionsHeld = false;
+    bool ps5TouchSwept = false;              // the stick (or a chord) moved during this hold
+    qint64 ps5TouchClickUntilMs = 0;
+    int8_t ps5TouchEmuId = -1;
+    std::uint16_t ps5TouchEmuX = 959, ps5TouchEmuY = 539;
 #ifdef VEYRA_ENABLE_REMOTEPLAY
     remoteplay::ControllerInput controller;
     // One SDL pad reader shared by PS5 stream, PS5 手柄控制, PC and Xbox streaming.
@@ -507,8 +589,9 @@ struct QmlPlayerBridge::Impl {
     // source that just ended never cuts off the pad the next source started using.
     enum PadUser : unsigned { PadPs5 = 1, PadPs5Control = 2, PadMoonlight = 4, PadXbox = 8 };
     unsigned padUsers = 0;
-    bool acquirePad(unsigned user) {
-        const bool ok = controller.start(); // no-op once initialized
+    // startReader: false when the forwarding thread will own SDL instead.
+    bool acquirePad(unsigned user, bool startReader = true) {
+        const bool ok = !startReader || controller.start(); // no-op once initialized
         padUsers |= user;
         controller.setFollowLastPressed((padUsers & PadPs5Control) != 0);
         return ok;
@@ -560,7 +643,8 @@ struct QmlPlayerBridge::Impl {
     bool displayChecking=false,displayRecheckPending=false,displayChanged=false;
     uint64_t displayRecheckGeneration=0;
     std::chrono::steady_clock::time_point displayRecheckSince{};
-    DisplayEventFilter displayEventFilter;
+    DisplayChangeFilter displayChangeFilter;
+    bridge_detail::PadTouchKeyFilter padTouchKey;
     std::atomic<double> gpuUtil{-1.0};
     // Hardware adapters in Windows' high-performance order (discrete first). The
     // sampler only counts engines of the adapter whose LUID is in gpuMonitorLuid
@@ -612,6 +696,15 @@ struct QmlPlayerBridge::Impl {
                 id.toStdString(), uint32_t(d.AdapterLuid.HighPart), d.AdapterLuid.LowPart, d.DedicatedVideoMemory >> 20));
         }
     }
+    // 游戏模式: the native side, the capture it belongs to and what the UI reported.
+    ui::GamePassthrough game;
+    std::wstring gameModeUri;          // the screen URI startScreenCapture opened in game mode
+    uint64_t gameModeSessionId = 0;    // its engine session once the open ran
+    bool gameModeLive = false, gamePanelOpen = false, gameRefused = false;
+    bool gameModeShown = false, passthroughShown = false, gameInputShown = false;
+    QRectF gameVideoRect;
+    QPointer<QWindow> gameWindow;
+    HMONITOR gameMonitor = nullptr;
     // The monitored GPU also computes when 设置 -> "同时用这块显卡运算" is on
     // and a specific GPU (not 自动) is chosen; otherwise the default order.
     QString computeGpuName;

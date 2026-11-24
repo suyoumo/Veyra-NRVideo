@@ -44,7 +44,23 @@ int wmain(int argc,wchar_t** argv){
         settings.nr=effects==L"on"||effects==L"nr";
         settings.sr=effects==L"on"||effects==L"sr";
         settings.nrTemporal=GetEnvironmentVariableW(L"VEYRA_TEST_NR_TEMPORAL",nullptr,0)>0;
-        veyra::log::info("test",std::string("NR temporal=")+(settings.nrTemporal?"on":"off"));
+        // Repeat-pair bypass (EnhancementSettings::fgSkipRepeats) for A/B runs on a
+        // recorded 30 fps source in a 60 Hz container.
+        {wchar_t skip[8]{};if(GetEnvironmentVariableW(L"VEYRA_TEST_FG_SKIP_REPEATS",skip,8))settings.fgSkipRepeats=_wtoi(skip)>0;}
+        {wchar_t quality[16]{};if(GetEnvironmentVariableW(L"VEYRA_TEST_VFG_QUALITY",quality,16))settings.vfgQuality=unsigned(std::clamp(_wtoi(quality),0,5));}
+        // The remaining switches reproduce one live capture configuration on real hardware
+        // (the console setup: VFG High 2X, NR, DLAA) for same-EXE A/B runs.
+        {wchar_t v[16]{};if(GetEnvironmentVariableW(L"VEYRA_TEST_FG_BACKEND",v,16)&&std::wstring_view(v)==L"vfg")settings.frameGenerationBackend=FrameGenerationBackend::Vfg;}
+        {wchar_t v[8]{};if(GetEnvironmentVariableW(L"VEYRA_TEST_DLAA",v,8)&&_wtoi(v)>0){settings.sr=false;settings.antiAlias.enabled=true;settings.antiAlias.method=AntiAliasMethod::Dlaa;}}
+        {wchar_t v[8]{};if(GetEnvironmentVariableW(L"VEYRA_TEST_VFG_AUTO_REGULATE",v,8))settings.vfgAutoRegulate=_wtoi(v)>0;}
+        {wchar_t v[8]{};if(GetEnvironmentVariableW(L"VEYRA_TEST_FG_LOW_LATENCY",v,8))settings.fgLowLatencyPresent=_wtoi(v)>0;}
+        // The console setup's presentation (low queue, tearing, NVIDIA low latency, no
+        // output cap), so a live run sees the same fast-model and present path as the app.
+        {wchar_t v[8]{};if(GetEnvironmentVariableW(L"VEYRA_TEST_PRESENTATION",v,8)&&wcscmp(v,L"user")==0){
+            PresentationSettings presentation;presentation.enabled=true;presentation.display=DisplaySync::Tearing;presentation.nvidiaLowLatency=NvidiaLowLatency::On;
+            engine.requestPresentation(presentation);}}
+        veyra::log::info("test",std::string("backend=")+std::string(frameGenerationBackendName(settings.frameGenerationBackend))+" nr="+(settings.nr?"on":"off")+" sr="+(settings.sr?"on":"off")+" dlaa="+(settings.antiAlias.enabled&&settings.antiAlias.usesDlaa()?"on":"off")+
+            " FG skip repeats="+(settings.fgSkipRepeats?"on":"off")+" vfgQuality="+std::to_string(settings.vfgQuality)+" autoRegulate="+(settings.vfgAutoRegulate?"on":"off")+" lowLatencyPresent="+(settings.fgLowLatencyPresent?"on":"off"));
         if(liveProfile){settings.flow=FlowQuality::Performance;settings.videoSrQuality=0;settings.srTarget=veyra::pipeline::SrTarget::Uhd4K;}
         if(nr900Profile)settings.nrPolicy=veyra::pipeline::NrSizePolicy::P900;
         if(nr720Profile)settings.nrPolicy=veyra::pipeline::NrSizePolicy::P720;

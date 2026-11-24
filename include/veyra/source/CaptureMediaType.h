@@ -1,4 +1,5 @@
 #pragma once
+#include <ppl.h>   // parallel_for in copyCaptureSample
 #include "veyra/pipeline/ColorMetadata.h"
 #include "veyra/source/CapturePixelFormat.h"
 #include <windows.h>
@@ -188,7 +189,13 @@ inline bool copyCaptureSample(const CaptureMediaLayout& layout,const uint8_t* sr
     // When rows are flipped, read the source ascending and write the
     // destination descending: the read stream keeps the hardware prefetcher
     // (walking the source backwards cost ~2x on the 4K RGB24 case).
-    for(unsigned sourceRow=0;sourceRow<layout.height;++sourceRow){
+    // A 4K P010 sample is 25 MB and one core copies it at about 17 GB/s (1.46 ms
+    // measured on the capture callback thread); the plain row copies are spread
+    // over the thread pool when the picture is large, which is the whole reason
+    // the row work is a lambda here. Rows that need a per-pixel conversion stay
+    // on the caller's thread (they are small formats in practice).
+    const bool plainRows=(layout.format!=AV_PIX_FMT_BGR0&&layout.format!=AV_PIX_FMT_YUYV422)||!rowConvert;
+    const auto copyRow=[&](unsigned sourceRow){
         const unsigned dstRow=flip?layout.height-1-sourceRow:sourceRow;
         const auto* s=src+size_t(sourceRow)*layout.stride;auto* d=dst.data[0]+ptrdiff_t(dstRow)*dst.linesize[0];
         if(layout.format==AV_PIX_FMT_BGR0&&layout.packing==CapturePacking::Bgr24){for(unsigned x=0;x<layout.width;++x){d[x*4]=s[x*3];d[x*4+1]=s[x*3+1];d[x*4+2]=s[x*3+2];d[x*4+3]=255;}}
@@ -198,8 +205,17 @@ inline bool copyCaptureSample(const CaptureMediaLayout& layout,const uint8_t* sr
         }else if(layout.format==AV_PIX_FMT_YUYV422&&(layout.packing==CapturePacking::Uyvy||layout.packing==CapturePacking::Yvyu)){
             const bool uy=layout.packing==CapturePacking::Uyvy;for(unsigned x=0;x<layout.rowBytes;x+=4){d[x]=s[x+(uy?1:0)];d[x+1]=s[x+(uy?0:3)];d[x+2]=s[x+(uy?3:2)];d[x+3]=s[x+(uy?2:1)];}
         }else std::memcpy(d,s,layout.rowBytes);
-    }
-    for(unsigned p=1;p<layout.planes;++p)for(unsigned y=0;y<layout.height/2;++y){
+    };
+    if(plainRows&&layout.height>=720)concurrency::parallel_for(0u,layout.height,copyRow);
+    else for(unsigned sourceRow=0;sourceRow<layout.height;++sourceRow)copyRow(sourceRow);
+    if(layout.planes>1&&layout.height>=720){
+        const auto copyChroma=[&](unsigned p,unsigned y){
+            const auto* s=src+(p==1?layout.chromaOffset:layout.secondChromaOffset)+size_t(flip?layout.height/2-1-y:y)*layout.chromaStride;auto* d=dst.data[p]+ptrdiff_t(y)*dst.linesize[p];
+            if(layout.packing==CapturePacking::Nv21){for(unsigned x=0;x<layout.chromaRowBytes;x+=2){d[x]=s[x+1];d[x+1]=s[x];}}
+            else std::memcpy(d,s,layout.chromaRowBytes);
+        };
+        for(unsigned p=1;p<layout.planes;++p)concurrency::parallel_for(0u,layout.height/2,[&](unsigned y){copyChroma(p,y);});
+    }else for(unsigned p=1;p<layout.planes;++p)for(unsigned y=0;y<layout.height/2;++y){
         const auto* s=src+(p==1?layout.chromaOffset:layout.secondChromaOffset)+size_t(flip?layout.height/2-1-y:y)*layout.chromaStride;auto* d=dst.data[p]+ptrdiff_t(y)*dst.linesize[p];
         if(layout.packing==CapturePacking::Nv21){for(unsigned x=0;x<layout.chromaRowBytes;x+=2){d[x]=s[x+1];d[x+1]=s[x];}}
         else std::memcpy(d,s,layout.chromaRowBytes);

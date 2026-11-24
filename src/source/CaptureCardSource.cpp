@@ -234,6 +234,12 @@ std::wstring deviceLeaseName(std::wstring path) {
     return key.empty() ? std::wstring{} : L"Local\\Veyra.Capture." + std::wstring(key.begin(), key.end());
 }
 
+// Latest capture-driver-age window for the interface (see the header).
+std::atomic<double> g_driverAgeP50{0},g_driverAgeP95{0};
+}
+double captureDriverAgeP50Ms(){return g_driverAgeP50.load();}
+double captureDriverAgeP95Ms(){return g_driverAgeP95.load();}
+namespace {
 // Legacy qedit interfaces are intentionally declared without obsolete qedit.h,
 // which conflicts with modern D3D headers. ABI follows Microsoft DirectShow.
 struct __declspec(uuid("0579154A-2B53-4994-B0D0-E773148EFF85")) ISampleGrabberCB: IUnknown {virtual HRESULT STDMETHODCALLTYPE SampleCB(double,IMediaSample*)=0;virtual HRESULT STDMETHODCALLTYPE BufferCB(double,BYTE*,long)=0;};
@@ -470,9 +476,17 @@ bool parseCapturePath(std::wstring_view path,CaptureSelection& selection){
 // picture (PictureCompare.h) and tags the frame with its picture number. About
 // 0.3 ms for 1440p NV12 plus a copy of each new picture, so only while a
 // content mode asks for it.
+// Every kPictureCompareRowStep-th row only. A whole 4K P010 sample costs about
+// 2.1 ms per frame on the capture callback thread, and the repeat-pair bypass
+// (EnhancementSettings::fgSkipRepeats) pays it on every frame just to answer
+// "same picture or not": a row sample keeps the same band and outlier rules over
+// a fraction of the bytes. Motion that changes a picture alters whole rows, so a
+// sampled row sees it; both observe() and commit() use this stride, so the
+// reference holds exactly the rows that get compared.
+constexpr unsigned kPictureCompareRowStep=8;
 static unsigned capturePicturePlanes(const CaptureMediaLayout& layout,const uint8_t* data,pipeline::PicturePlane (&planes)[3]){
-    planes[0]={data,layout.stride,layout.rowBytes,layout.height};unsigned count=1;
-    for(unsigned p=1;p<layout.planes&&p<3;++p)planes[count++]={data+(p==1?layout.chromaOffset:layout.secondChromaOffset),layout.chromaStride,layout.chromaRowBytes,layout.height/2};
+    planes[0]={data,layout.stride*kPictureCompareRowStep,layout.rowBytes,(layout.height+kPictureCompareRowStep-1)/kPictureCompareRowStep};unsigned count=1;
+    for(unsigned p=1;p<layout.planes&&p<3;++p)planes[count++]={data+(p==1?layout.chromaOffset:layout.secondChromaOffset),layout.chromaStride*kPictureCompareRowStep,layout.chromaRowBytes,(layout.height/2+kPictureCompareRowStep-1)/kPictureCompareRowStep};
     return count;
 }
 // Returns true when the sample is a new picture whose copy into the reference
@@ -528,6 +542,22 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
     // 1-3 ms and used to block tryRead for its whole duration, sweep
     // 2026-09-22 C3), then publishes it by pointer swap.
     AVFrame* stagingFrame=nullptr;bool stagingBusy=false;
+    // Zero-copy: upload-buffer memory handed to the driver as its sample pool.
+    // slotCount==3 means the callback can publish the filled frame without the
+    // 4K memcpy (see zeroCopyPublish in SampleCB).
+    std::pair<uint8_t*,AVFrame*> zeroCopySlots[3]{{nullptr,nullptr},{nullptr,nullptr},{nullptr,nullptr}};
+    int zeroCopySlotCount=0;bool zeroCopyActive=false;
+    // Slot base pointer of a mailbox frame (nullptr when zero-copy is off).
+    uint8_t* frameBase(const AVFrame* f)const{
+        if(!f)return nullptr;
+        for(int i=0;i<zeroCopySlotCount;++i)if(zeroCopySlots[i].second==f)return zeroCopySlots[i].first;
+        return nullptr;
+    }
+    AVFrame* frameForSlot(const uint8_t* data)const{
+        if(!data)return nullptr;
+        for(int i=0;i<zeroCopySlotCount;++i)if(zeroCopySlots[i].first==data)return zeroCopySlots[i].second;
+        return nullptr;
+    }
     // Owner wake event for tryRead callers that prefer an event over a timer
     // (capture latency review item 2).
     HANDLE frameEvent=nullptr;
@@ -673,9 +703,21 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
         }
         driverAges.push_back(ms);
         if(driverAges.size()<600)return age;
-        std::sort(driverAges.begin(),driverAges.end());
-        log::info("capture-driver-age",std::format("frames={} p50Ms={:.1f} p95Ms={:.1f} minMs={:.1f} maxMs={:.1f} driverBuffers={} clock=host-monotonic",
-            driverAges.size(),driverAges[driverAges.size()/2],driverAges[driverAges.size()*95/100],driverAges.front(),driverAges.back(),driverBuffers));
+        auto sorted=driverAges;std::sort(sorted.begin(),sorted.end());
+        const double rawP50=sorted[sorted.size()/2],rawP95=sorted[std::min(sorted.size()-1,sorted.size()*95/100)];
+        const double minMs=sorted.front();
+        // The graph clock vs the driver's stream-time origin can drift by several
+        // ms after a reconnect or a display-mode change, shifting EVERY age by the
+        // same amount (measured 2026-11-16: p50 17.8/min 16.0 in one session,
+        // 22.8/21.0 in another, identical arrival cadence). Publish the
+        // anchor-free form instead: one frame plus the queue above the session's
+        // observed floor, so the number means the same thing every session.
+        const double periodMs=nominalDuration100ns>0?double(nominalDuration100ns)/10000.0:1000.0/60.0;
+        const double anchorFreeP50=periodMs+(rawP50-minMs),anchorFreeP95=periodMs+(rawP95-minMs);
+        g_driverAgeP50.store(anchorFreeP50);
+        g_driverAgeP95.store(anchorFreeP95);
+        log::info("capture-driver-age",std::format("frames={} p50Ms={:.1f} p95Ms={:.1f} minMs={:.1f} maxMs={:.1f} driverBuffers={} anchorFreeP50Ms={:.1f} anchorFreeP95Ms={:.1f} (driver timestamp -> our callback; includes one frame if the driver stamps the frame start; anchorFree subtracts the per-session clock offset)",
+            sorted.size(),rawP50,rawP95,minMs,sorted.back(),driverBuffers,anchorFreeP50,anchorFreeP95));
         driverAges.clear();
         return age;
     }
@@ -732,6 +774,16 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
     }
     const bool uploadFrames=uploadFormat!=AV_PIX_FMT_NONE;
     unsigned uploadBacked=0;
+    // Zero-copy may have preallocated the three upload frames before the pins
+    // were connected (the slot pool must exist at negotiation time); keep them
+    // and only report their state here.
+    if(p.frame&&p.pendingFrame&&p.stagingFrame){
+        for(auto* f:{p.frame,p.pendingFrame,p.stagingFrame})if(pipeline::captureUploadFrame(f))++uploadBacked;
+        log::info("capture",std::format("mailbox frames reused uploadBacked={} of 3 (preallocated for zero-copy)",uploadBacked));
+        p.stagingBusy=false;
+        if(!p.frameEvent)p.frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        return p.frameEvent!=nullptr;
+    }
     for(auto** f:{&p.frame,&p.pendingFrame,&p.stagingFrame}){
         *f=uploadFrames?pipeline::allocCaptureUploadFrame(static_cast<ID3D12Device*>(desc.d3d12Device),uploadFormat,unsigned(p.info.width),unsigned(p.info.height),packed10):nullptr;
         if(*f){++uploadBacked;continue;}
@@ -742,6 +794,20 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
         if(av_frame_get_buffer(*f,256)<0)return false;
     }
     log::info("capture",std::format("mailbox frames uploadBacked={} of 3 layoutFormat={} frameFormat={} (single CPU copy when 3)",uploadBacked,int(p.layout.format),int(uploadFrames&&uploadBacked==3?uploadFormat:p.layout.format)));
+    // Zero-copy slots: the three mailbox frames' upload memory, handed to the
+    // driver as its sample pool. Only meaningful when all three are upload
+    // backed (semiplanar planes contiguous) and the layout has a known size.
+    p.zeroCopySlotCount=0;
+    if(uploadBacked==3&&p.layout.sampleBytes>0){
+        AVFrame* const frames[3]={p.frame,p.pendingFrame,p.stagingFrame};
+        for(int i=0;i<3;++i){
+            auto* info=pipeline::captureUploadFrame(frames[i]);
+            if(!info||!info->mapped||info->planes!=2)break;
+            p.zeroCopySlots[i]={info->mapped,frames[i]};
+            ++p.zeroCopySlotCount;
+        }
+        if(p.zeroCopySlotCount!=3)p.zeroCopySlotCount=0;
+    }
     p.stagingBusy=false;
     if(!p.frameEvent)p.frameEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     return p.frameEvent!=nullptr;
@@ -880,11 +946,19 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
         bool enqueued=false;uint64_t timingSequence=0;int64_t copied100ns=0;double lockWaitMs=0,arrivalDeltaMs=0,ptsDeltaMs=0;
         // Native path: claim the staging frame, copy outside the lock.
         AVFrame* staged=nullptr;bool stagedOk=false,probeNow=false,commitPicture=false;CaptureSignalSample signalSample;
+        // Set when the driver's sample already lives in a mailbox frame the
+        // driver filled directly (zero-copy); publishing skips the copy.
+        AVFrame* zeroCopyFrame=nullptr;
         // A new picture's reference copy runs when this call returns (every path), after the publish below.
         struct CommitAfterPublish{Impl& p;const uint8_t* data;bool& owed;~CommitAfterPublish(){if(owed)commitCaptureSample(p.layout,data,p.pictureReference);}} commitLater{*this,data,commitPicture};
         if(valid&&!compressedPath){
-            {std::lock_guard lock(mutex);if(stagingFrame&&!stagingBusy){stagingBusy=true;staged=stagingFrame;}
-                if(signalProbeEnabled&&arrival>=nextSignalProbe){nextSignalProbe=arrival+std::chrono::seconds(1);probeNow=true;}}
+            // Zero-copy: the driver wrote straight into one of our upload
+            // frames, so this sample needs no staging copy at all.
+            if(zeroCopyActive)zeroCopyFrame=frameForSlot(data);
+            if(!zeroCopyFrame){
+                {std::lock_guard lock(mutex);if(stagingFrame&&!stagingBusy){stagingBusy=true;staged=stagingFrame;}}
+            }
+            {std::lock_guard lock(mutex);if(signalProbeEnabled&&arrival>=nextSignalProbe){nextSignalProbe=arrival+std::chrono::seconds(1);probeNow=true;}}
             if(probeNow)signalSample=sampleCaptureSignal(layout,data,size_t(sample->GetActualDataLength()));
             if(staged)stagedOk=writeCaptureFrame(layout,data,size_t(sample->GetActualDataLength()),*staged,verticalFlip.load(),pictureCompare.load(std::memory_order_relaxed)?&pictureReference:nullptr,&commitPicture);
         }
@@ -952,7 +1026,14 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
                     lastCallbackTime=time;
                     compressedQueue.push_back(std::move(entry));enqueued=true;
                 }else{
-                    if(staged){
+                    if(zeroCopyFrame){
+                        // Publish the frame the driver just filled; no copy.
+                        // stagingFrame stays null so all three slots remain
+                        // eligible for the driver (usable() only bars the
+                        // reader's frame and the waiting one).
+                        stagingBusy=false;
+                        pendingFrame=zeroCopyFrame;stagingFrame=nullptr;
+                    }else if(staged){
                         stagingBusy=false;
                         if(!stagedOk){callbackError=true;wake.notify_one();return S_OK;}
                         // Publish: the copied frame becomes pendingFrame; the
@@ -996,8 +1077,7 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
     }
     HRESULT STDMETHODCALLTYPE BufferCB(double,BYTE*,long)override{return E_NOTIMPL;}
 };
-CaptureCardSource::CaptureCardSource():p_(std::make_unique<Impl>()){}
-HANDLE CaptureCardSource::frameEvent()const{return p_->frameEvent;}
+CaptureCardSource::CaptureCardSource():p_(std::make_unique<Impl>()){}HANDLE CaptureCardSource::frameEvent()const{return p_->frameEvent;}
 CaptureCardSource::~CaptureCardSource(){close();if(p_->frameEvent){CloseHandle(p_->frameEvent);p_->frameEvent=nullptr;}}
 std::vector<CaptureDevice> CaptureCardSource::deviceDetails(bool audio){
     std::vector<CaptureDevice> result;
@@ -1165,6 +1245,15 @@ void CaptureCardSource::setBufferMode(unsigned mode){
     const auto policy=static_cast<CaptureBufferMode>(clamped);
     log::info("capture-buffer",std::format("mode={} ({}) takes effect on the next connect",clamped,captureBufferModeKey(policy)));
 }
+// AVerMedia 低延迟模式偏好（CaptureBuffer.h）：连接建图时读取，覆盖「设备缓冲」把视频
+// pin 的分配器建议压到 1 帧。Magewell 的 partial notify 是厂商 SDK 专有，DirectShow 路径
+// 上 1 帧分配器 + 直连回调就是 GC573 这类 PCIe 卡的采集延迟下限。
+std::atomic<bool> g_averLowLatency{false};
+void setAverLowLatencyPreference(bool enabled){
+    if(g_averLowLatency.exchange(enabled)==enabled)return;
+    log::info("capture-buffer",std::format("aver low-latency={} (forces a 1-frame allocator suggestion on the next connect; overrides the buffer mode)",enabled?1:0));
+}
+bool averLowLatencyPreference(){return g_averLowLatency.load();}
 void CaptureCardSource::setVerticalFlip(bool enabled){
     auto& p=*p_;
     if(p.verticalFlip.exchange(enabled)==enabled)return;
@@ -1443,12 +1532,102 @@ bool CaptureCardSource::configureDevice(const SourceOpenDesc& desc) {
         // suggestion is advisory; a refusal keeps the driver's defaults and is
         // reported after the connect instead of failing the device.
         const auto bufferPolicy=static_cast<CaptureBufferMode>(p.bufferMode);
-        const long suggestedBuffers=bmdCompat?0:captureDesiredVideoBuffers(bufferPolicy,long(nativeLayout.width),long(nativeLayout.height));
+        // AVerMedia 低延迟模式（GC573 等 VEN_1461/VID_07CA PCIe 卡）：覆盖「设备缓冲」，
+        // 输出 pin 建议与 sink 自身的分配器要求同时压到 1 帧，避免 DirectShow 协商把
+        // 下游库存的 3 帧要求合并回去（现场记录 2026-10-01：只建议输出 pin 时驱动
+        // 回报 actual=4）。偏好对其他厂商卡不生效。
+        std::wstring averPathLower(devicePath);
+        std::transform(averPathLower.begin(),averPathLower.end(),averPathLower.begin(),[](wchar_t c){return wchar_t(std::towlower(c));});
+        const bool averDevice=averPathLower.find(L"ven_1461")!=std::wstring::npos||averPathLower.find(L"vid_07ca")!=std::wstring::npos;
+        const bool averLowLatency=averLowLatencyPreference()&&averDevice&&!bmdCompat;
+        const long suggestedBuffers=bmdCompat?0:averLowLatency?1:captureDesiredVideoBuffers(bufferPolicy,long(nativeLayout.width),long(nativeLayout.height));
         ComPtr<IPin> input,output;
-        hr=createNativeCaptureSink(*native,timedCaptureDelivery([&p](double time,IMediaSample* sample){return p.SampleCB(time,sample);}),p.grabFilter,input,bmdCompat?CaptureAllocatorMode::Upstream:CaptureAllocatorMode::SinkDefault);
-        if(SUCCEEDED(hr))hr=p.graph->AddFilter(p.grabFilter.Get(),L"Native frame mailbox");
-        if(SUCCEEDED(hr))output=formatPin;
-        if(SUCCEEDED(hr)&&suggestedBuffers>0)suggestCaptureVideoBuffering(output.Get(),suggestedBuffers,LONG(nativeLayout.sampleBytes));
+        // Zero-copy attempt (AVerMedia low-latency mode only): hand the driver
+        // the three upload buffers as its sample pool, so each frame lands in
+        // the memory the graph already reads and the 4K memcpy disappears.
+        // The driver may refuse a foreign allocator; every failure falls back
+        // to the stock path inside the same connect.
+        // The slot memory must exist before the pin negotiates. The graph layout
+        // is only derived after the connect, so build the three upload frames
+        // here straight from the requested media type (exact format match is
+        // still verified after ConnectDirect).
+        // Opt-in only (VEYRA_CAPTURE_ZEROCOPY=1): the GC573 firmware rejected
+        // the foreign allocator at ConnectDirect (hr=0x80040204) on 2026-11-16,
+        // so the default path must stay the advisory one. Kept for cards that
+        // do accept a caller-owned pool.
+        static const bool zeroCopyOptIn=GetEnvironmentVariableW(L"VEYRA_CAPTURE_ZEROCOPY",nullptr,0)!=0;
+        const bool zeroCopyCandidate=zeroCopyOptIn&&averLowLatency&&!bmdCompat&&!p.verticalFlip.load()&&nativeSupported&&
+            nativeLayout.planes==2&&(nativeLayout.format==AV_PIX_FMT_P010||nativeLayout.format==AV_PIX_FMT_P016||nativeLayout.format==AV_PIX_FMT_NV12);
+        if(zeroCopyCandidate&&!p.frame&&desc.d3d12Device){
+            bool ok=true;
+            for(auto** f:{&p.frame,&p.pendingFrame,&p.stagingFrame}){
+                *f=pipeline::allocCaptureUploadFrame(static_cast<ID3D12Device*>(desc.d3d12Device),nativeLayout.format,
+                    unsigned(nativeLayout.width),unsigned(nativeLayout.height),false);
+                if(!*f){ok=false;break;}
+            }
+            if(ok){
+                p.zeroCopySlotCount=0;
+                AVFrame* const frames[3]={p.frame,p.pendingFrame,p.stagingFrame};
+                for(int i=0;i<3;++i){
+                    auto* slotInfo=pipeline::captureUploadFrame(frames[i]);
+                    if(!slotInfo||!slotInfo->mapped||slotInfo->planes!=2)break;
+                    p.zeroCopySlots[i]={slotInfo->mapped,frames[i]};
+                    ++p.zeroCopySlotCount;
+                }
+                if(p.zeroCopySlotCount!=3)p.zeroCopySlotCount=0;
+                log::info("capture-zerocopy",std::format("prealloc slots={} format={} {}x{} bytes={}",p.zeroCopySlotCount,
+                    int(nativeLayout.format),nativeLayout.width,nativeLayout.height,unsigned long long(nativeLayout.sampleBytes)));
+            }else{
+                av_frame_free(&p.frame);av_frame_free(&p.pendingFrame);av_frame_free(&p.stagingFrame);
+                log::warn("capture-zerocopy","upload frame preallocation failed; using the normal mailbox");
+            }
+        }
+        const bool zeroCopyWanted=averLowLatency&&p.zeroCopySlotCount==3&&!bmdCompat&&!p.verticalFlip.load();
+        log::info("capture-zerocopy",std::format("wanted={} slots={} sampleBytes={} flip={} (wanted needs the AVerMedia mode, three upload frames and no manual flip)",zeroCopyWanted?1:0,p.zeroCopySlotCount,unsigned long long(p.layout.sampleBytes),p.verticalFlip.load()?1:0));
+        if(zeroCopyWanted){
+            std::vector<std::pair<uint8_t*,long>> slots;
+            slots.reserve(3);
+            for(int i=0;i<3;++i)slots.emplace_back(p.zeroCopySlots[i].first,long(p.layout.sampleBytes));
+            ComPtr<IMemAllocator> slotAllocator;
+            // Refuse the slot the reader currently owns and the one waiting to
+            // be presented; staging is unused in zero-copy mode, so the third
+            // slot always stays available for the driver.
+            auto usable=[&p](const uint8_t* data){
+                std::lock_guard lock(p.mutex);
+                // Before the first delivered picture every slot belongs to the
+                // driver's pre-roll (DirectShow may fill all of them back to
+                // back); excluding any of them here made ConnectDirect fail.
+                if(p.received==0)return data!=nullptr;
+                return data!=nullptr&&data!=p.frameBase(p.frame)&&data!=p.frameBase(p.pendingFrame);
+            };
+            const auto allocatorHr=createCaptureSlotAllocator(std::move(slots),usable,slotAllocator.GetAddressOf());
+            if(SUCCEEDED(allocatorHr)){
+                hr=createNativeCaptureSink(*native,timedCaptureDelivery([&p](double time,IMediaSample* sample){return p.SampleCB(time,sample);}),p.grabFilter,input,slotAllocator.Get());
+                if(SUCCEEDED(hr))hr=p.graph->AddFilter(p.grabFilter.Get(),L"Native frame mailbox");
+                if(SUCCEEDED(hr))output=formatPin;
+                if(SUCCEEDED(hr))hr=p.graph->ConnectDirect(output.Get(),input.Get(),native);
+                if(FAILED(hr)){
+                    log::warn("capture-zerocopy",std::format("slot allocator refused hr=0x{:08X}; falling back to the advisory buffer path",uint32_t(hr)));
+                    input.Reset();output.Reset();p.grabFilter.Reset();
+                    if(SUCCEEDED(hr)||true){/* rebuild below */}
+                }else{
+                    p.zeroCopyActive=true;
+                    p.driverBuffers=3;
+                }
+            }else{
+                log::warn("capture-zerocopy",std::format("allocator creation failed hr=0x{:08X}; using the advisory path",uint32_t(allocatorHr)));
+            }
+        }
+        if(!p.zeroCopyActive){
+            if(averLowLatency){
+                hr=createNativeCaptureSink(*native,timedCaptureDelivery([&p](double time,IMediaSample* sample){return p.SampleCB(time,sample);}),p.grabFilter,input,suggestedBuffers);
+            }else{
+                hr=createNativeCaptureSink(*native,timedCaptureDelivery([&p](double time,IMediaSample* sample){return p.SampleCB(time,sample);}),p.grabFilter,input,bmdCompat?CaptureAllocatorMode::Upstream:CaptureAllocatorMode::SinkDefault);
+            }
+            if(SUCCEEDED(hr))hr=p.graph->AddFilter(p.grabFilter.Get(),L"Native frame mailbox");
+            if(SUCCEEDED(hr))output=formatPin;
+        }
+        if(SUCCEEDED(hr)&&!p.zeroCopyActive&&suggestedBuffers>0)suggestCaptureVideoBuffering(output.Get(),suggestedBuffers,LONG(nativeLayout.sampleBytes));
         // OBS HDevice::ConnectPins (fixed commit/license in NativeCaptureSink.cpp)
         // lets the output pin supply its configured media type. Check the actual
         // layout after connection so this cannot silently pick another mode.
@@ -1465,8 +1644,10 @@ bool CaptureCardSource::configureDevice(const SourceOpenDesc& desc) {
             const bool negotiated=suggestedBuffers>0;
             const bool honored=negotiated&&SUCCEEDED(allocatorHr)&&actual.cBuffers==suggestedBuffers;
             p.driverBuffers=SUCCEEDED(allocatorHr)?actual.cBuffers:0;
-            log::info("capture-buffer",std::format("mode={} requested={} actual buffers={} bytes={} align={} hr=0x{:08X} {}",captureBufferModeKey(bufferPolicy),suggestedBuffers,actual.cBuffers,actual.cbBuffer,actual.cbAlign,uint32_t(allocatorHr),!negotiated?"(driver default)":honored?"(driver honored)":"(driver ignored; negotiation not applied)"));
+            log::info("capture-buffer",std::format("mode={} requested={} actual buffers={} bytes={} align={} hr=0x{:08X} averLL={} {}",captureBufferModeKey(bufferPolicy),suggestedBuffers,actual.cBuffers,actual.cbBuffer,actual.cbAlign,uint32_t(allocatorHr),averLowLatency?1:0,!negotiated?"(driver default)":honored?"(driver honored)":"(driver ignored; negotiation not applied)"));
         }
+        if(p.zeroCopyActive)
+            log::info("capture-zerocopy",std::format("active=1 slots={} bytes={} (driver fills the upload frames directly; callback copy skipped)",p.zeroCopySlotCount,unsigned long long(p.layout.sampleBytes)));
         log::info("capture",std::format("native ConnectDirect subtype=0x{:08X} hr=0x{:08X} converters=0",native->subtype.Data1,uint32_t(hr)));
     }else{
         log::warn("capture",std::format("explicit RGB32 compatibility path subtype=0x{:08X} diagnostic={} (decoder/color converter may be inserted)",requestedSubtype.Data1,desc.legacyCaptureRgbForDiagnostic));
@@ -2527,6 +2708,7 @@ void CaptureCardSource::closeGraph(bool stopped)noexcept{
     for(auto*& frame:p.compressedFree)if(frame)av_frame_free(&frame);
     p.compressedFree.clear();
     av_frame_free(&p.frame);av_frame_free(&p.pendingFrame);av_frame_free(&p.stagingFrame);p.stagingBusy=false;
+    p.zeroCopyActive=false;p.zeroCopySlotCount=0;
     if(p.pendingHardware)av_frame_free(&p.pendingHardware);if(p.hardwareRead)av_frame_free(&p.hardwareRead);
     p.compressedDecoder.close();
     if(p.decodeDevice){p.decodeDevice->Release();p.decodeDevice=nullptr;}if(p.decodeQueue){p.decodeQueue->Release();p.decodeQueue=nullptr;}

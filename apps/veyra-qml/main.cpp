@@ -197,7 +197,7 @@ HWND createVideoWindow() {
     // work: Windows refuses with ERROR_CANNOT_MAKE (1406), which is what left the
     // video window invalid and the swapchain at 1x1. WS_POPUP with no WS_VISIBLE
     // creates cleanly; SetParent plus the child style below turns it into a child.
-    HWND created = CreateWindowExW(WS_EX_NOPARENTNOTIFY | WS_EX_TOOLWINDOW, cls, L"",
+    HWND created = CreateWindowExW(WS_EX_NOPARENTNOTIFY | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, cls, L"",
                                    WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
                                    0, 0, 16, 16, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (created == nullptr) {
@@ -209,9 +209,24 @@ HWND createVideoWindow() {
 // Places the native video window at the QML item's position. Qt reports the
 // item's geometry in scene coordinates, which for a child of the window's
 // content item are already window-relative.
+// 视频直出 (QML window property "directPresent", from the saved preference): the
+// video window stays a top-level popup instead of becoming a WS_CHILD of the QML
+// window. A child window is always composited by DWM, which costs a full display
+// pipeline stage; an unowned top-level flip window is scanned out directly.
+bool directVideoPresent(QQuickWindow* window) {
+    return window && window->property("directPresent").toBool();
+}
+
 bool syncVideoGeometry(QQuickWindow* window, QQuickItem* host) {
-    if (!window || !host || !g_video || GetParent(g_video) != reinterpret_cast<HWND>(window->winId()))
-        return false;
+    const HWND appWindow = window ? reinterpret_cast<HWND>(window->winId()) : nullptr;
+    const bool direct = directVideoPresent(window);
+    if (!window || !host || !g_video) return false;
+    // Direct present: the window is its own top-level, owned by the app window
+    // (an owner keeps it above the app window and hides it when that is
+    // minimised; it is still not a child). Otherwise the window must still be the
+    // Qt window's child, or the layout below means nothing.
+    const HWND parent = GetParent(g_video);
+    if (direct ? (parent != nullptr && parent != appWindow) : parent != appWindow) return false;
     const QPointF topLeft = host->mapToScene(QPointF(0, 0));
     const qreal dpr = window->devicePixelRatio();
     if (host->width() < 1 || host->height() < 1 ||
@@ -224,16 +239,37 @@ bool syncVideoGeometry(QQuickWindow* window, QQuickItem* host) {
     // spans the window must use its actual physical client extent: Qt rounds
     // the HWND at fractional DPI, whereas flooring width*dpr can leave a
     // one-pixel strip outside the video (for example 642 DIP at 125%).
-    const int x = int(std::floor(topLeft.x() * dpr));
-    const int y = int(std::floor(topLeft.y() * dpr));
-    int w = std::max(1, int(std::floor(host->width() * dpr)));
-    int h = std::max(1, int(std::floor(host->height() * dpr)));
+    const bool aligned = window->property("gameAligned").toBool();
+    const auto physical = [aligned](qreal value) { return int(aligned ? std::round(value) : std::floor(value)); };
+    const int xClient = physical(topLeft.x() * dpr);
+    const int yClient = physical(topLeft.y() * dpr);
+    int x = xClient;
+    int y = yClient;
+    int w = std::max(1, physical(host->width() * dpr));
+    int h = std::max(1, physical(host->height() * dpr));
     RECT parentClient{};
     if (GetClientRect(reinterpret_cast<HWND>(window->winId()), &parentClient)) {
         if (std::abs(topLeft.x()) < 0.001 && std::abs(host->width() - window->width()) < 0.001)
             w = std::max(1L, parentClient.right);
         if (std::abs(topLeft.y()) < 0.001 && std::abs(host->height() - window->height()) < 0.001)
             h = std::max(1L, parentClient.bottom);
+    }
+    if (direct) {
+        // The QML rectangle is window-relative; a top-level window needs screen
+        // coordinates. Map the CLIENT origin, not the window rect: a captioned,
+        // bordered window puts the content a few pixels in, and using the frame
+        // origin shifted the picture right and down and left a strip uncovered.
+        // A minimised app must take its video with it, and the video must stay
+        // immediately above the app window (not topmost: other programs still
+        // cover both).
+        if (IsIconic(appWindow)) {
+            if (IsWindowVisible(g_video)) ShowWindow(g_video, SW_HIDE);
+            return false;
+        }
+        POINT origin{0, 0};
+        if (!ClientToScreen(appWindow, &origin)) return false;
+        x += origin.x;
+        y += origin.y;
     }
     // A film-fitted cinema window can have no fractional HWND pixels. Tell
     // the presenter the exact rounding bound; real bars/zoom/fullscreen retain
@@ -257,19 +293,49 @@ bool syncVideoGeometry(QQuickWindow* window, QQuickItem* host) {
     // Called every rendered frame: only a changed rect reaches the window manager,
     // so a moving popover never makes the presenter see a spurious resize.
     static RECT last{-1, -1, -1, -1};
-    if (IsWindowVisible(g_video) && last.left == x && last.top == y && last.right == w && last.bottom == h) return true;
+    if (IsWindowVisible(g_video) && last.left == x && last.top == y && last.right == w && last.bottom == h) {
+        // Direct present with an unchanged rect: the video must still sit directly
+        // above the app window, hidden windows excepted. Something shown or raised
+        // in between would bury the picture, so put it back (no move, no size).
+        if (direct) {
+            HWND below = GetWindow(g_video, GW_HWNDNEXT);
+            while (below && below != appWindow && !IsWindowVisible(below)) below = GetWindow(below, GW_HWNDNEXT);
+            if (below != appWindow) {
+                HWND above = GetWindow(appWindow, GW_HWNDPREV);
+                if (above == g_video) above = HWND_TOP;
+                SetWindowPos(g_video, above, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                static ULONGLONG lastPutBack = 0;
+                const auto tick = GetTickCount64();
+                if (tick - lastPutBack > 1000) { lastPutBack = tick; veyra::log::info("qml-window", "direct present: video window put back above the app window"); }
+            }
+        }
+        return true;
+    }
     last = RECT{x, y, w, h};
     SetLastError(0);
-    const BOOL placed = SetWindowPos(g_video, HWND_TOP, x, y, w, h,
-                                     SWP_NOACTIVATE | (g_videoHiddenByProbe ? 0 : SWP_SHOWWINDOW));
+    // Z order: hWndInsertAfter names the window that stays ABOVE ours. In direct
+    // present the video belongs right above the app window, so insert it after
+    // whatever currently precedes the app window. That window is often the video
+    // itself (it already is the one right above): inserting a window after itself
+    // is a silent no-op that returns success, which left the picture at its old
+    // size on the first fullscreen toggle (and the unchanged-rect cache never
+    // retried). In that case only move and size, and keep the z-order.
+    HWND after = HWND_TOP;
+    UINT flags = SWP_NOACTIVATE | (g_videoHiddenByProbe ? 0 : SWP_SHOWWINDOW);
+    if (direct) {
+        after = GetWindow(appWindow, GW_HWNDPREV);
+        if (after == g_video) { after = HWND_TOP; flags |= SWP_NOZORDER; }
+        else if (after == nullptr) after = HWND_TOP;
+    }
+    const BOOL placed = SetWindowPos(g_video, after, x, y, w, h, flags);
     const DWORD error = placed ? 0 : GetLastError();
     veyra::log::info("qml-window", std::format(
-        "SetWindowPos rect=({},{}) {}x{} result={} error={}", x, y, w, h, placed != 0, error));
+        "SetWindowPos rect=({},{}) {}x{} result={} error={} direct={} noZOrder={}", x, y, w, h, placed != 0, error, direct, (flags & SWP_NOZORDER) != 0));
     logVideoWindowState(window, host, "geometry");
     return placed != 0;
 }
 
-struct Cover { QRectF rect; qreal radius = 0; };
+struct Cover { QRectF rect; qreal radius = 0; bool informational = false; QString name; };
 
 // cineIn (pages.css @keyframes cineIn, plan M21): the stage is clipped with
 // inset(12% 0 12% 0) and expands to inset(0). The picture is a native window, so
@@ -314,7 +380,11 @@ void collectCovers(QQuickItem* item, QList<Cover>& out) {
         // Scale is folded into the scene rect; the corner radius scales with it.
         const QRectF r = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
         const qreal s = item->width() > 0 ? r.width() / item->width() : 1.0;
-        out << Cover{r, item->property("coverRadius").toReal() * s};
+        // informational: a readout that is over the picture all the time, not
+        // something the pointer reaches for (视频直出 keeps the rectangle whole).
+        const QString name = item->objectName().isEmpty() ? QString::fromLatin1(item->metaObject()->className()) : item->objectName();
+        out << Cover{r, item->property("coverRadius").toReal() * s,
+                     item->objectName() == QLatin1String("video-hud"), name};
     }
     for (QQuickItem* child : item->childItems()) collectCovers(child, out);
 }
@@ -327,6 +397,9 @@ void collectCovers(QQuickItem* item, QList<Cover>& out) {
 // moves or the cineIn inset changes; with neither the window gets its rectangle back.
 void syncVideoCovers(QQuickWindow* window, QQuickItem* host, qreal inset) {
     if (!window || !host || !g_video) return;
+    // 视频直出: see the holes loop below.
+    const bool direct = directVideoPresent(window);
+    std::string directCovers;
     if (g_videoProbe == VideoProbeMode::CoversOnly) inset = 0;
     QList<Cover> covers;
     collectCovers(window->contentItem()->parentItem() ? window->contentItem()->parentItem()
@@ -353,6 +426,30 @@ void syncVideoCovers(QQuickWindow* window, QQuickItem* host, qreal inset) {
                        int(std::ceil(local.width() * dpr)) + 1, int(std::ceil(local.height() * dpr)) + 1);
         holes << QRect(0, 0, int(std::round(c.radius * dpr * 2)), 0);
     }
+    // 视频直出: a hardware plane is a rectangle. Any hole makes the region complex
+    // and DWM composites every frame again (measured on a 4K60 capture: present to
+    // scanout 9.7 ms composed, 1.5 ms flipped). While nothing but informational
+    // covers (the HUD readout) is over the picture, the rectangle stays whole and
+    // those covers sit behind it; the moment a control, a popover or a tooltip
+    // opens, the holes come back so it shows, and latency only then is composed.
+    if (direct) {
+        // Only a cover that is actually over the picture counts: toasts park above
+        // the window's top edge instead of hiding, and one of those kept a hole
+        // (and with it composition) in the window for the whole session.
+        const QRectF picture(0, 0, host->width(), host->height());
+        bool interaction = false;
+        std::string names;
+        for (const Cover& c : covers) {
+            if (c.informational || !c.rect.translated(-origin).intersects(picture)) continue;
+            interaction = true;
+            if (!names.empty()) names += ", ";
+            names += c.name.toStdString() + "(" + std::to_string(int(c.rect.x())) + "," + std::to_string(int(c.rect.y())) + " " +
+                     std::to_string(int(c.rect.width())) + "x" + std::to_string(int(c.rect.height())) + ")";
+        }
+        directCovers = std::format("direct present: covers={} interaction={} non-informational=[{}] (an interaction cover keeps holes in the video window, which means composition)",
+                                   covers.size(), interaction, names.empty() ? "-" : names);
+        if (!interaction) holes.clear();
+    }
     // cineIn rides along as a marker entry so one cache covers both, and the last
     // entry keeps its steadiness on a scene that renders without moving either.
     const int insetBand = int(std::round(inset * h));
@@ -362,6 +459,7 @@ void syncVideoCovers(QQuickWindow* window, QQuickItem* host, qreal inset) {
         if (key == last) return;
         last = key;
     }
+    if (direct && !directCovers.empty()) veyra::log::info("qml-window", directCovers);
     if (g_videoProbe == VideoProbeMode::NoRegion) {
         SetLastError(0);
         const int result = SetWindowRgn(g_video, nullptr, TRUE);
@@ -1331,7 +1429,18 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
         // Parent first: a WS_CHILD window without a parent is not realized, so its
         // rect stays 0x0 and any SetWindowPos is discarded. Reparenting here, not
         // on a later timer tick, is what lets the geometry below take effect.
-        if (GetParent(g_video) == nullptr) {
+        // 视频直出 keeps the popup a top-level window on purpose: a child window is
+        // always composited, and only an own flip window reaches scanout directly.
+        // It is NOT owned by the app window either: Windows treats an owned popup
+        // as part of its owner's composition, and the display stopped scanning it
+        // out directly (measured 1.45 ms unowned, 8.6 ms owned). Minimising is
+        // handled where the rectangle is computed (IsIconic).
+        if (directVideoPresent(window)) {
+            if (GetParent(g_video) != nullptr) {
+                SetWindowLongPtrW(g_video, GWLP_HWNDPARENT, 0);
+                veyra::log::info("qml-window", "direct present: video window unowned");
+            }
+        } else if (GetParent(g_video) == nullptr) {
             const HWND parent = reinterpret_cast<HWND>(window->winId());
             SetParent(g_video, parent);
             // SetParent alone leaves the popup style in place; a child style is what

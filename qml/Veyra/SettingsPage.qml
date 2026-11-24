@@ -316,6 +316,16 @@ VPage {
                             }
                         }
                         VRow {
+                            label: qsTr("帧率与延迟 HUD 下移")
+                            hint: qsTr("HUD 贴顶时会挡住游戏自己的界面；往下挪一截，数值仍然实时刷新")
+                            VSeg {
+                                objectName: "set-hud-offset"
+                                options: [{ id: "0", label: "0" }, { id: "48", label: "48" }, { id: "96", label: "96" }, { id: "144", label: "144" }, { id: "192", label: "192" }]
+                                current: String(veyra.preferences.hudOffsetY !== undefined ? veyra.preferences.hudOffsetY : 96)
+                                onPicked: id => veyra.setPreference("hudOffsetY", Number(id))
+                            }
+                        }
+                        VRow {
                             label: qsTr("界面语言")
                             hint: qsTr("立即生效；日志保持中文，方便反馈问题")
                             VSelect {
@@ -672,6 +682,17 @@ VPage {
                                 VButton { objectName: "set-recdir"; text: qsTr("更改…"); onClicked: veyra.chooseRecordingDirectory() }
                             }
                         }
+                        // 录制界面: the window as the player shows it, panels and
+                        // HUD included, instead of the clean processed picture.
+                        VRow {
+                            label: qsTr("录制界面")
+                            hint: qsTr("开启后录制整个 Veyra 窗口（画面 + 顶栏、右侧面板、HUD）；关闭只录处理后的干净画面")
+                            VSwitch {
+                                objectName: "set-recui"
+                                checked: veyra.recordingUi
+                                onToggled: v => veyra.setPreference("recordUi", v)
+                            }
+                        }
                         VRow {
                             label: qsTr("录制码率")
                             hint: qsTr("自动按画面尺寸和帧率选择；数字为 Mbps，越高越清晰、文件也越大")
@@ -774,6 +795,17 @@ VPage {
                                 value: (options.find(o => o.id === veyra.recordingMicrophoneId)
                                         || { label: qsTr("已选设备（未连接）") }).label
                                 onPicked: id => veyra.setPreference("recordMicDevice", id)
+                            }
+                        }
+                        VRow {
+                            visible: veyra.recordingMicrophone
+                            label: qsTr("麦克风增益")
+                            hint: qsTr("蓝牙耳麦常常比游戏声音低十几 dB，录出来几乎听不见；调高这里让说话声听得清，失真了就调低")
+                            VSeg {
+                                objectName: "set-recmic-gain"
+                                options: [{ id: "0", label: "0" }, { id: "4", label: "4" }, { id: "8", label: "8" }, { id: "12", label: "12" }, { id: "18", label: "18" }, { id: "24", label: "24" }]
+                                current: String(veyra.preferences.recordMicGain !== undefined ? veyra.preferences.recordMicGain : 8)
+                                onPicked: id => veyra.setPreference("recordMicGain", Number(id))
                             }
                         }
                         VRow {

@@ -1,12 +1,179 @@
 // QML bridge: Core responsibilities.
 #include "QmlPlayerBridge_p.h"
+#include "AudioProbe.h"
 #include "LiveTranslation.h"
 #include "veyra/sink/AudioGain.h"
 #include "veyra/engine/MicrophoneCapture.h"
 #include "veyra/ui/NvidiaVrrProfileController.h"
+#include "veyra/Log.h"
+#include <QProcess>
+#include <QFile>
+#include <QFileInfo>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QStringList>
+#include <QVector>
+#include <algorithm>
+#include <format>
+#include <map>
 
 namespace veyra::ui {
-namespace {bool prepareStartupPreset(const engine::PresetEntry& entry, engine::ChainSession& session,
+namespace {
+// PresentMon reader (HUD "上屏等待"). The in-app DXGI frame statistics stop
+// describing a present->display delay once VRR drops the fixed vblank grid, so
+// the interface shows the ETW-truth instead: a child PresentMon writes its CSV,
+// this tailer keeps the last samples for our own process and the HUD reads them
+// through presentMonP50Ms(). PresentMon.exe is optional: without it the HUD
+// falls back to the internal figure.
+struct PresentMonTailer {
+    QProcess process;
+    QByteArray carry;
+    QVector<double> latencies, intervals;
+    QStringList modes;
+    int colUntil=-1, colBetween=-1, colMode=-1;
+    double p50=0, p95=0, between=0;
+    bool started=false;
+    bool exitLogged=false;
+    int failures=0;
+    qint64 lastLogMs=0, lastRowMs=0, restartAtMs=0;
+
+    void clear() { latencies.clear(); intervals.clear(); modes.clear(); p50=p95=between=0; }
+
+    // Once a second, the ETW figures next to the interface's own DXGI reading
+    // (display-latency), so a log holds both rulers of the same session. The
+    // present mode says whether the video reached the panel through a hardware
+    // flip (about 1.5 ms) or through composition (one to two refreshes).
+    void logSummary() {
+        const auto now=QDateTime::currentMSecsSinceEpoch();
+        if (lastLogMs && now-lastLogMs<1000) return;
+        lastLogMs=now;
+        std::map<QString,int> counts;
+        for (const auto& mode : modes) ++counts[mode];
+        std::string modeText;
+        for (const auto& [mode,count] : counts) { if (!modeText.empty()) modeText+=", "; modeText+=mode.toStdString()+"="+std::to_string(count); }
+        const char* state=!started?"stopped":process.state()==QProcess::Running?"running":process.error()==QProcess::FailedToStart?"failed to start":"exited";
+        veyra::log::info("present-mon",std::format("state={} failures={} p50Ms={:.3f} p95Ms={:.3f} betweenDisplayMs={:.3f} samples={} modes={} (ETW truth for this process: Present call start -> displayed on screen; the interface shows p50 as 上屏等待 when samples >= 8)",
+            state,failures,p50,p95,between,latencies.size(),modeText.empty()?"-":modeText));
+    }
+
+    void start(const QString& logDir) {
+        Q_UNUSED(logDir)
+        if (started || failures>=3) return;
+        if (QDateTime::currentMSecsSinceEpoch()<restartAtMs) return;
+        QString tool=QCoreApplication::applicationDirPath()+"/PresentMon.exe";
+        if (!QFile::exists(tool)) tool=QCoreApplication::applicationDirPath()+"/tools/PresentMon.exe";
+        if (!QFile::exists(tool)) { failures=3; return; }
+        QString exe=QFileInfo(QCoreApplication::applicationFilePath()).fileName();
+        // --output_stdout: PresentMon holds an --output_file exclusively, so the
+        // CSV could not be read while it ran.
+        // One fixed session name with --stop_existing_session: a session whose
+        // process was killed (a restarted or crashed parent) stays alive in the
+        // kernel and keeps losing events; after a few of them no new session got
+        // any data. PresentMon stops the stale one itself. A per-PID name, used
+        // before, only made sure every stale session had a name of its own.
+        const QString session=QStringLiteral("veyra-hud");
+        QStringList args{"--process_name",exe,"--output_stdout","--no_console_stats",
+                         "--session_name",session,"--stop_existing_session",
+                         "--timed","3600","--terminate_after_timed",
+                         "--no_track_input","--no_track_gpu"};
+        process.setProgram(tool);
+        process.setArguments(args);
+        process.setProcessChannelMode(QProcess::SeparateChannels);
+        carry.clear(); colUntil=colBetween=colMode=-1;
+        exitLogged=false;
+        process.start();
+        started=true;
+    }
+
+    // Do not leave the ETW session running when the bridge goes away.
+    ~PresentMonTailer() {
+        if (process.state()!=QProcess::NotRunning) {
+            process.kill();
+            process.waitForFinished(1000);
+        }
+    }
+
+    static void splitCsv(const QByteArray& line, QList<QByteArray>& out) {
+        out.clear();
+        QByteArray field;
+        bool quoted=false;
+        for (char c : line) {
+            if (c=='"') { quoted=!quoted; continue; }
+            if (c==',' && !quoted) { out.append(field); field.clear(); continue; }
+            field.append(c);
+        }
+        out.append(field);
+    }
+
+    void poll() {
+        if (!started) return;
+        const QByteArray chunk=process.readAllStandardOutput();
+        carry+=chunk;
+        QList<QByteArray> fields;
+        int nl=-1;
+        while ((nl=carry.indexOf('\n'))>=0) {
+            QByteArray line=carry.left(nl);
+            carry.remove(0,nl+1);
+            if (line.endsWith('\r')) line.chop(1);
+            if (line.isEmpty()) continue;
+            splitCsv(line,fields);
+            if (colUntil<0) {
+                // Column names changed case between PresentMon 1.x (msUntilDisplayed)
+                // and 2.x (MsUntilDisplayed); matching the old spelling exactly
+                // left the feed empty with the bundled 2.6.
+                for (int i=0;i<fields.size();++i) {
+                    const QByteArray name=fields[i].toLower();
+                    if (name=="msuntildisplayed") colUntil=i;
+                    else if (name=="msbetweendisplaychange") colBetween=i;
+                    else if (name=="presentmode") colMode=i;
+                }
+                continue;
+            }
+            if (colUntil>=fields.size()) continue;
+            lastRowMs=QDateTime::currentMSecsSinceEpoch();
+            if (colMode>=0 && colMode<fields.size()) { modes.append(QString::fromLatin1(fields[colMode])); if (modes.size()>400) modes.removeFirst(); }
+            bool ok=false;
+            const double v=fields[colUntil].toDouble(&ok);
+            if (ok && v>0 && v<500) { latencies.append(v); if (latencies.size()>400) latencies.removeFirst(); failures=0; }
+            if (colBetween>=0 && colBetween<fields.size()) {
+                bool ok2=false;
+                const double b=fields[colBetween].toDouble(&ok2);
+                if (ok2 && b>0 && b<500) { intervals.append(b); if (intervals.size()>400) intervals.removeFirst(); }
+            }
+        }
+        if (latencies.size()>=8) {
+            QVector<double> sorted=latencies;
+            std::sort(sorted.begin(),sorted.end());
+            p50=sorted[(sorted.size()-1)/2];
+            p95=sorted[std::min<int>(sorted.size()-1,int((sorted.size()-1)*0.95))];
+        }
+        if (intervals.size()>=8) {
+            QVector<double> sorted=intervals;
+            std::sort(sorted.begin(),sorted.end());
+            between=sorted[(sorted.size()-1)/2];
+        }
+        const auto now=QDateTime::currentMSecsSinceEpoch();
+        // --timed ends the capture after an hour; a child can also die or fail to
+        // start. Figures from a dead child must not stay on screen: forget them
+        // and start a new one a few seconds later (giving up after three in a row).
+        if (process.state()!=QProcess::Running) {
+            if (!exitLogged) { exitLogged=true; logSummary(); if (process.error()==QProcess::FailedToStart) ++failures; }
+            clear();
+            started=false;
+            restartAtMs=now+5000;
+            return;
+        }
+        // No frame of ours for two seconds (capture closed): the last session's
+        // numbers are history, not what the interface should show next.
+        if (lastRowMs && now-lastRowMs>2000 && !latencies.isEmpty()) { clear(); lastRowMs=now; }
+        logSummary();
+    }
+};
+PresentMonTailer& presentMonTailer() { static PresentMonTailer tailer; return tailer; }
+}
+
+namespace {
+bool prepareStartupPreset(const engine::PresetEntry& entry, engine::ChainSession& session,
                           engine::EnhancementSettings& settings, QString& error) {
     if (!session.select(entry.kind)) {
         error = QObject::tr("默认预设的编辑模式无效");
@@ -86,7 +253,16 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     // The compute GPU decides which effects exist, so it is settled before
     // anything below samples the capabilities or restores the saved chain.
     impl_->loadPrefs();
+    // PS5 按键映射 and pad identity are read once the preferences exist; the pad
+    // reader also re-applies them when forwarding starts.
+    applyPadMap();
+    applyKbmPrefs();
+    // 区域录制: the rectangle is a choice for this session. Every launch starts
+    // without one, so the first take asks to draw it instead of silently
+    // recording yesterday's crop; later takes reuse what was drawn.
+    if (impl_->prefBool("recordRegion", false)) impl_->prefs[QStringLiteral("recordRegionW")] = 0;
     impl_->engine.setCaptureAudioMonitoring(impl_->prefBool("captureAudioMonitor",true));
+    engine::setMicrophoneGainDb(float(impl_->prefInt("recordMicGain",8)));
     // Keep main's established key; also read the PR's key for users of its build.
     // Missing/invalid settings stay at unity, never an automatic boost.
     bool volumeOk=false;
@@ -129,8 +305,159 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
 #endif
     connect(&impl_->exportQueue,&QmlExportQueueModel::changed,this,&QmlPlayerBridge::exportChanged);
     if (qApp) qApp->installEventFilter(this);
-    impl_->displayEventFilter.changed = &impl_->displayChanged;
-    if (qApp) qApp->installNativeEventFilter(&impl_->displayEventFilter);
+    // 游戏模式. The native filter also keeps windows shown during a monitor capture
+    // out of that capture, so it is installed for every run.
+    if (qApp) qApp->installNativeEventFilter(&impl_->game);
+    impl_->displayChangeFilter.changed = &impl_->displayChanged;
+    if (qApp) qApp->installNativeEventFilter(&impl_->displayChangeFilter);
+    // 触摸键（键盘）: captures the key for the dialog and consumes it while forwarding.
+    impl_->padTouchKey.watch.store(unsigned(impl_->prefInt("ps5PadTouchVk", 0)));
+    impl_->padTouchKey.onCaptured = [this](unsigned vk) {
+        auto& i = *impl_;
+        if (!vk) { emit ps5PadChanged(); return; }
+        i.prefs[QStringLiteral("ps5PadTouchVk")] = int(vk);
+        if (i.savePrefs()) {
+            i.padTouchKey.watch.store(vk);
+            veyra::log::info("remoteplay-input", std::format("touch key set vk={}", vk));
+        }
+        emit ps5PadChanged();
+    };
+    if (qApp) qApp->installNativeEventFilter(&impl_->padTouchKey);
+    // 鼠标瞄准 (PS5 手柄控制): End releases the capture and clears the switch.
+    impl_->ps5Mouse.onReleased = [this] {
+        auto& i = *impl_;
+        i.prefs[QStringLiteral("ps5MouseAim")] = false;
+        i.prefs[QStringLiteral("ps5KbmEnabled")] = false;
+        i.savePrefs();
+        i.kbmEnabled.store(false);
+        i.kbm.releaseAll();
+        emit ps5ControlChanged();
+        emit ps5KbmChanged();
+        veyra::log::info("remoteplay-input", "mouse aim released by End");
+    };
+    // 键鼠映射: raw events reach the mapper only while it is switched on.
+    impl_->ps5Mouse.onKey = [this](const std::string& name, bool down) {
+        if (impl_->kbmEnabled.load()) impl_->kbm.onKey(name, down);
+    };
+    impl_->ps5Mouse.onMouseButton = [this](const std::string& name, bool down) {
+        if (!impl_->kbmEnabled.load()) return;
+        impl_->kbm.onMouseButton(name, down);
+        if (name == "x2" && down)
+            veyra::log::info("remoteplay-input", std::format("kbm mode={}", impl_->kbm.mode()));
+    };
+    impl_->ps5Mouse.onMouseDelta = [this](int dx, int dy) {
+        if (impl_->kbmEnabled.load()) impl_->kbm.onMouseDelta(dx, dy);
+    };
+    if (qApp) qApp->installNativeEventFilter(&impl_->ps5Mouse);
+    impl_->game.onEvent = [this](ui::GamePassthrough::Event event) {
+        using E = ui::GamePassthrough::Event;
+        switch (event) {
+        case E::PanelHotkey: emit gameHotkey(0); break;
+        case E::ExitHotkey:
+        case E::ExitUnavailable:
+            // Restore input before QML processes its fullscreen notification.
+            impl_->gameRefused = true;
+            impl_->gameInputShown = impl_->passthroughShown = false;
+            emit gameModeChanged();
+            impl_->game.apply(ui::GamePassthrough::Mode::Off);
+            if (event == E::ExitHotkey) emit gameHotkey(1);
+            else emit notice(tr("游戏模式键盘监听不可用，已退出鼠标穿透；请退出全屏后重试"), true);
+            break;
+        case E::HangReleased:
+            // Publish Off before the foreground goes back to Veyra; stay out of
+            // click-through until fullscreen is left.
+            impl_->gameRefused = true;
+            impl_->gameInputShown = impl_->passthroughShown = false;
+            emit gameModeChanged();
+            impl_->game.apply(ui::GamePassthrough::Mode::Off);
+            emit gameModeStopped(tr("界面卡住超过 3 秒，已退出游戏模式")); break;
+        // The game has the keyboard in game mode; the hook hands these over.
+        case E::ScreenshotHotkey: takeScreenshot(); break;
+        case E::RecordHotkey: toggleRecording(QStringLiteral("game-hotkey")); break;
+        case E::ReplayHotkey: saveReplay(QStringLiteral("game-hotkey")); break;
+        }
+    };
+    auto* gameBeat = new QTimer(this);
+    connect(gameBeat, &QTimer::timeout, this, [this] {
+        impl_->game.heartbeat();
+        updateGameGeometry();
+    });
+    gameBeat->start(250);
+    // PresentMon HUD feed: start the child once the log directory is known, then
+    // tail its CSV and let the HUD read the truth. No PresentMon, no change.
+    auto* presentMonTimer=new QTimer(this);
+    connect(presentMonTimer,&QTimer::timeout,this,[this]{
+        auto& tailer=presentMonTailer();
+        if(!tailer.started){
+            const QString logPath=logFile();
+            if(!logPath.isEmpty())tailer.start(QFileInfo(logPath).absolutePath());
+        }
+        tailer.poll();
+    });
+    presentMonTimer->start(700);
+    // 视频直出: the HUD as a bitmap for the present blit (refreshHudOverlay).
+    // Twice a second is enough for a readout and costs one small GDI+ bitmap.
+    auto* hudOverlayTimer=new QTimer(this);
+    connect(hudOverlayTimer,&QTimer::timeout,this,[this]{refreshHudOverlay();});
+    hudOverlayTimer->start(250);
+    // 声音自检: read the probe's peaks ten times a second while its panel is
+    // open, so the bars move and a wrong device explains itself at once.
+    auto* audioTestTimer=new QTimer(this);
+    connect(audioTestTimer,&QTimer::timeout,this,[this]{
+        if(!audioTestRunning())return;
+        const auto probe=takeAudioProbeSnapshot();
+        QString status;
+        if(!probe.micError.empty())status=uiText(probe.micError);
+        else if(probe.micOpen){
+            status=QString::fromStdWString(probe.micDevice);
+            if(probe.micRate)status+=QStringLiteral(" · %1 Hz · %2").arg(probe.micRate)
+                .arg(probe.micChannels<=1?tr("单声道"):tr("立体声"));
+        }else status=tr("正在打开麦克风…");
+        const QVariant recording=impl_->audioTest.value(QStringLiteral("recording"));
+        const QVariant samplePath=impl_->audioTest.value(QStringLiteral("samplePath"));
+        QVariantMap map;
+        map[QStringLiteral("running")]=true;
+        map[QStringLiteral("recording")]=recording;
+        map[QStringLiteral("samplePath")]=samplePath;
+        map[QStringLiteral("gameDb")]=probe.gamePeakDb;
+        map[QStringLiteral("micDb")]=probe.micPeakDb;
+        map[QStringLiteral("micOpen")]=probe.micOpen;
+        map[QStringLiteral("micStatus")]=status;
+        map[QStringLiteral("gameFrames")]=QVariant::fromValue(qulonglong(probe.gameFrames));
+        map[QStringLiteral("micFrames")]=QVariant::fromValue(qulonglong(probe.micFrames));
+        impl_->audioTest=map;
+        emit audioTestChanged();
+    });
+    audioTestTimer->start(100);
+    // Headless 录制自检: VEYRA_RECORD_SELF_TEST=1 starts a take a few seconds
+    // after launch and stops it again, so the recording path (including 全屏录制
+    // without a source) can be checked without clicking. VEYRA_RECORD_SELF_TEST_MS
+    // sets the length.
+    if (qEnvironmentVariableIsSet("VEYRA_RECORD_SELF_TEST")) {
+        const int lengthMs = qEnvironmentVariableIntValue("VEYRA_RECORD_SELF_TEST_MS");
+        QTimer::singleShot(4000, this, [this, lengthMs] {
+            startRecording(QStringLiteral("self-test"));
+            QTimer::singleShot(lengthMs > 0 ? lengthMs : 8000, this, [this] {
+                stopRecording(QStringLiteral("self-test"));
+                QTimer::singleShot(8000, this, [] { QCoreApplication::quit(); });
+            });
+        });
+    }
+    if (const QByteArray target = qgetenv("VEYRA_AUDIO_SELF_TEST"); !target.isEmpty()) {
+        const QString path = QString::fromUtf8(target);
+        const int lengthMs = qEnvironmentVariableIntValue("VEYRA_AUDIO_SELF_TEST_MS");
+        const int delayMs = qEnvironmentVariableIntValue("VEYRA_AUDIO_SELF_TEST_DELAY_MS");
+        startAudioTest();
+        QTimer::singleShot(delayMs > 0 ? delayMs : 8000, this, [this, path, lengthMs] {
+            startSampleCapture();
+            QTimer::singleShot(lengthMs > 0 ? lengthMs : 5000, this, [this, path] {
+                const bool saved = finishSampleCapture(path.toStdWString());
+                veyra::log::info("ui-audio-test", std::format("self test {} path={}", saved ? "saved" : "failed", path.toStdString()));
+                stopAudioTest();
+                if (auto* app = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) app->quit();
+            });
+        });
+    }
 #ifdef VEYRA_ENABLE_MOONLIGHT
     setupMoonlight();
 #endif
@@ -143,6 +470,7 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
     applyPreference(QStringLiteral("audioDevice"));
     applyPreference(QStringLiteral("audioForceStereo"));
     applyPreference(QStringLiteral("magewellLowLatency"));
+    applyPreference(QStringLiteral("averLowLatency"));
     const bool presetsLoaded = impl_->facade.importLegacyStores();
     const auto presetNotice = uiText(impl_->facade.error());
     if (!presetNotice.isEmpty())
@@ -284,6 +612,14 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
         if (p.contains(QStringLiteral("pacingRepair"))) {
             const bool on = p.value(QStringLiteral("pacingRepair")).toBool();
             if (s.pacingRepair != on) { s.pacingRepair = on; changed = true; }
+        }
+        if (p.contains(QStringLiteral("fgLowLatencyPresent"))) {
+            const bool on = p.value(QStringLiteral("fgLowLatencyPresent")).toBool();
+            if (s.fgLowLatencyPresent != on) { s.fgLowLatencyPresent = on; changed = true; }
+        }
+        if (p.contains(QStringLiteral("fgSkipRepeats"))) {
+            const bool on = p.value(QStringLiteral("fgSkipRepeats")).toBool();
+            if (s.fgSkipRepeats != on) { s.fgSkipRepeats = on; changed = true; }
         }
         if (p.contains(QStringLiteral("hudLock"))) {
             const bool on = p.value(QStringLiteral("hudLock")).toBool();
@@ -730,11 +1066,18 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
 QObject* QmlPlayerBridge::liveTranslation() const { return liveTranslation_; }
 
 QmlPlayerBridge::~QmlPlayerBridge() {
+#ifdef VEYRA_ENABLE_REMOTEPLAY
+    // The pad reader is the one thread here that calls into the engine; it ends
+    // before anything it touches is torn down.
+    impl_->controller.stopForwarding();
+#endif
     // Before anything is torn down: this reads the playback position.
     // The overlay is a child window: it has to go before the video window does.
     flushHdrMemory();
     if (qApp) qApp->removeEventFilter(this);
-    if (qApp) qApp->removeNativeEventFilter(&impl_->displayEventFilter);
+    if (qApp) qApp->removeNativeEventFilter(&impl_->displayChangeFilter);
+    if (qApp) qApp->removeNativeEventFilter(&impl_->padTouchKey);
+    if (qApp) qApp->removeNativeEventFilter(&impl_->ps5Mouse);
     // rememberPosition(true) writes every preference, a pending volume included.
     if (impl_->volumeSaveTimer) impl_->volumeSaveTimer->stop();
     rememberPosition(true);
@@ -744,5 +1087,12 @@ QmlPlayerBridge::~QmlPlayerBridge() {
 }
 
 
+
+// PresentMon HUD feed (see PresentMonTailer above). 0/false before the child has
+// produced enough samples, so the HUD can fall back to the internal figure.
+bool QmlPlayerBridge::presentMonKnown() const { return presentMonTailer().p50>0; }
+double QmlPlayerBridge::presentMonP50Ms() const { return presentMonTailer().p50; }
+double QmlPlayerBridge::presentMonP95Ms() const { return presentMonTailer().p95; }
+double QmlPlayerBridge::presentMonBetweenMs() const { return presentMonTailer().between; }
 
 } // namespace veyra::ui

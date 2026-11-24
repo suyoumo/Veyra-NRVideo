@@ -22,6 +22,11 @@ VPage {
     signal requestPage(string page)
     signal requestDialog(string key)
     signal requestFullscreen()
+    // 直播模式 lives in Main.qml (fullscreen state); the page only asks.
+    signal requestLiveMode()
+    // 声音自检 lives in Main.qml (it draws over the native video window).
+    signal requestAudioTest()
+    property bool liveMode: false
     // Fullscreen quick-adjust (Home, Main.qml): only the inspector is shown, moved
     // to the left of the picture, cut out of the native video window.
     property bool overlay: false
@@ -444,6 +449,52 @@ VPage {
                 Accessible.name: screenshotButton.tip
                 onClicked: veyra.takeScreenshot()
             }
+            // 录制模式: 纯画面 records the processed picture alone; 含界面 the
+            // window as it is; 全屏 records the screen with the system sound and
+            // needs no Veyra source (a PC game played on its own).
+            VSeg {
+                objectName: "pro-record-mode"
+                Layout.alignment: Qt.AlignVCenter
+                options: [{ id: "clean", label: qsTr("纯画面") }, { id: "ui", label: qsTr("含界面") }, { id: "full", label: qsTr("全屏") }, { id: "region", label: qsTr("区域") }]
+                current: veyra.recordingRegion ? "region"
+                       : (veyra.recordingFullscreen ? "full" : (veyra.recordingUi ? "ui" : "clean"))
+                onPicked: id => {
+                    veyra.setPreference("recordRegion", id === "region")
+                    veyra.setPreference("recordFullscreen", id === "full")
+                    veyra.setPreference("recordUi", id !== "clean")
+                    // A fresh region choice: ask for the rectangle again on the
+                    // next take.
+                    if (id === "region") veyra.setPreference("recordRegionW", 0)
+                }
+            }
+            // 麦克风: record the voice into the file. The device is chosen in
+            // 设置 → 录制 (麦克风设备); this just arms it for the next take.
+            Row {
+                Layout.alignment: Qt.AlignVCenter
+                spacing: 6
+                Text {
+                    text: qsTr("麦克风")
+                    color: Theme.t2
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fsBody
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                VSwitch {
+                    objectName: "pro-mic-toggle"
+                    anchors.verticalCenter: parent.verticalCenter
+                    checked: veyra.recordingMicrophone
+                    onToggled: v => { veyra.setPreference("recordMic", v); if (v) veyra.refreshMicrophones() }
+                }
+            }
+            // 声音自检: live meters for the rendered sound and the recording
+            // endpoint, so a device that cannot be opened shows here instead of
+            // in a silent recording.
+            VButton {
+                objectName: "pro-audio-test"
+                text: qsTr("检测")
+                ghost: true
+                onClicked: root.requestAudioTest()
+            }
             // Recording: the red dot pulses while the file is open, and a
             // three second countdown runs before the engine is asked to open
             // it. The countdown is an interface animation; the file itself is
@@ -509,12 +560,17 @@ VPage {
                     id: recordMouse
                     objectName: "pro-record-mouse"
                     anchors.fill: parent
-                    enabled: veyra.hasSource && !recordControl.saving
+                    // 全屏/区域录制 records without a Veyra source.
+                    enabled: (veyra.hasSource || veyra.recordingFullscreen || veyra.recordingRegion)
+                             && !recordControl.saving
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
                         if (veyra.recording) { veyra.stopRecording("pro-button"); recordControl.countdown = 0; recordTick.stop(); return }
                         if (recordControl.countdown > 0) { recordControl.countdown = 0; recordTick.stop(); return }
+                        // 区域 without a rectangle yet: the overlay is the next
+                        // step, so skip the countdown and ask for it right away.
+                        if (veyra.recordingRegion && veyra.recordRegionW <= 0) { veyra.startRecording("pro-button"); return }
                         recordControl.countdown = 3
                         recordTick.restart()
                     }
@@ -534,7 +590,7 @@ VPage {
                     interval: 1000
                     repeat: true
                     onTriggered: {
-                        if (!veyra.hasSource) { recordControl.countdown = 0; stop(); return }
+                        if (!veyra.hasSource && !veyra.recordingFullscreen && !veyra.recordingRegion) { recordControl.countdown = 0; stop(); return }
                         recordControl.countdown -= 1
                         recordPop.restart()
                         if (recordControl.countdown <= 0) {
@@ -544,6 +600,16 @@ VPage {
                         }
                     }
                 }
+            }
+            // 直播模式: fullscreen clean picture for a screen capture (OBS
+            // 显示器采集) - no HUD, no pill, no toasts. Esc leaves it.
+            VButton {
+                objectName: "pro-live-mode"
+                iconName: "cast"
+                primary: root.liveMode
+                text: root.liveMode ? qsTr("直播中") : qsTr("直播")
+                tip: qsTr("直播模式：全屏干净画面，界面不再出现；Esc 退出")
+                onClicked: root.requestLiveMode()
             }
             RowLayout {
                 objectName: "pro-virtual-camera-control"
@@ -613,6 +679,7 @@ VPage {
                 onClicked: presetMenu.openAt(this, "down")
             }
         }
+
     }
 
     // One geometry contract for this layout and Main's native video HWND.
@@ -1240,6 +1307,35 @@ VPage {
                             Text {
                                 Layout.fillWidth: true
                                 text: String(veyra.skippedFrames)
+                                color: Theme.t1; font.family: Theme.fontMono; font.pixelSize: 12
+                                horizontalAlignment: Text.AlignRight
+                            }
+                            // 采集卡自身延迟：驱动帧时间戳 → 回调（与 capture-driver-age 同源），
+                            // 补帧/画质增强都不影响它。
+                            Text { text: qsTr("采集延迟"); color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 12 }
+                            Text {
+                                Layout.fillWidth: true
+                                text: veyra.captureDriverAgeP50Ms > 0
+                                      ? veyra.captureDriverAgeP50Ms.toFixed(1) + " / " + veyra.captureDriverAgeP95Ms.toFixed(1) + " ms (p50/p95)"
+                                      : "—"
+                                color: Theme.t1; font.family: Theme.fontMono; font.pixelSize: 12
+                                horizontalAlignment: Text.AlignRight
+                            }
+                            // 上屏总延迟 = 采集延迟 + 采集回调→Present（真实帧）+ Present→上屏。
+                            // 三段各取 p50/p95 相加，是分位近似，不是同一帧的端到端测量。
+                            // 上屏段与画面 HUD 同源：PresentMon 的 ETW 数字优先（VRR 下唯一可信）。
+                            Text { text: qsTr("上屏总延迟"); color: Theme.t3; font.family: Theme.fontUi; font.pixelSize: 12 }
+                            Text {
+                                Layout.fillWidth: true
+                                readonly property real scanoutP50: veyra.presentMonKnown ? veyra.presentMonP50Ms : veyra.displayScanoutP50Ms
+                                readonly property real scanoutP95: veyra.presentMonKnown ? veyra.presentMonP95Ms : veyra.displayScanoutP95Ms
+                                readonly property bool scanoutKnown: scanoutP50 > 0
+                                text: (veyra.captureDriverAgeP50Ms > 0 && veyra.captureToPresentP50Ms > 0)
+                                      ? (scanoutKnown ? "" : "≥") + (veyra.captureDriverAgeP50Ms + veyra.captureToPresentP50Ms + scanoutP50).toFixed(1)
+                                        + " / "
+                                        + (scanoutKnown ? "" : "≥") + (veyra.captureDriverAgeP95Ms + veyra.captureToPresentP95Ms + scanoutP95).toFixed(1)
+                                        + " ms (p50/p95)"
+                                      : "—"
                                 color: Theme.t1; font.family: Theme.fontMono; font.pixelSize: 12
                                 horizontalAlignment: Text.AlignRight
                             }
@@ -1988,6 +2084,36 @@ VPage {
                                     objectName: "list-vfg-auto-regulate"
                                     checked: veyra.vfgAutoRegulate
                                     onToggled: checked => veyra.vfgAutoRegulate = checked
+                                }
+                            }
+                            VRow {
+                                label: qsTr("低延迟上屏")
+                                visible: veyra.fgBackendName !== "xess"
+                                hint: qsTr("补帧画面按「一半的生成帧刚好来得及」来排期，而不是等 95% 都来得及；倍率和输出帧率不变，偶尔来不及的那一帧跳过、由下一张真实帧接上，整体画面更贴近采集 · 默认关闭")
+                                VSwitch {
+                                    objectName: "list-fg-low-latency-present"
+                                    checked: veyra.fgLowLatencyPresent
+                                    onToggled: checked => veyra.fgLowLatencyPresent = checked
+                                }
+                            }
+                            VRow {
+                                label: qsTr("视频直出")
+                                visible: veyra.hasSource
+                                hint: qsTr("画面空闲时视频窗口保持完整矩形，由显卡直接扫描上屏，不再经过系统合成：实测上屏等待从约 10ms 降到约 1.5ms。控制条、菜单、对话框出现时会恢复叠加（这几秒走合成），收起后自动回到直出；HUD 只在界面出现时可见 · 默认关闭，改了要重新打开片源")
+                                VSwitch {
+                                    objectName: "list-direct-present"
+                                    checked: veyra.directPresent
+                                    onToggled: checked => veyra.directPresent = checked
+                                }
+                            }
+                            VRow {
+                                label: qsTr("重复帧不插帧")
+                                visible: veyra.fgBackendName !== "xess"
+                                hint: qsTr("源画面重复上一张时（例如 30 帧游戏经 60Hz 输出，约一半是重复帧）不跑补帧模型，直接显示真实帧。它省的是 GPU：GPU 有余量时不降低延迟，反而因为要在采集回调里比对画面而增加约 0.3 ms——只有 GPU 吃满、补帧开始排队降档时才可能腾出预算。重复帧插出来的本来就是同一张画面，观感不受影响 · 默认关闭")
+                                VSwitch {
+                                    objectName: "list-fg-skip-repeats"
+                                    checked: veyra.fgSkipRepeats
+                                    onToggled: checked => veyra.fgSkipRepeats = checked
                                 }
                             }
                             VRow {

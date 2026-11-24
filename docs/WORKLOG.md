@@ -2022,3 +2022,23 @@ e68c597e 缩减稠密光流搜索的粗排采样，保留完整颜色验证。�
 - T900 实卡使用设备提供的 4K60 MJPEG。实际应用送显约 60 FPS，NR 与 FSR 均运行，NVOF 从 1920×1080 转回 3840×2160。462 次 FSR 评估，0 次派发失败和采集丢帧。RGB 夹具也通过 4K 至 1080p 光流的几何验证。实卡 4K60 NV12 尚未验证。
 - WGC 320 Hz 跟随默认 NR 实测约 125.8 个原始帧、12.5 个生成帧每秒。在本次 HDR 测试场景每秒均有生成帧，数量波动 5 至 29。50% NR 内部尺寸时生成约 95.5 帧每秒。WGC 本轮保持既有节拍策略。冷启动从 WGC 打开到首轮送显，DLSS SR 24.34 秒、RTX Video SR 15.67 秒、Video Effects SR 14.71 秒，模型加载期的原画预览仍待实现。
 - 确认可用管理员权限启动 PresentMon。2.6.0 和 2.5.1 分别只输出 6 条和 2 条记录，无法验收稳定的屏幕显示间隔。完整命令、日志及产物路径见 `E:/项目/Veyra/reports/codex-magpie-perf-20261122/RESULTS.md`。
+2.1.9正式发布并核验：https://github.com/Likely7/Veyra-NRVideo/releases/tag/v2.1.9，发行tag d442b4e、实际产品b430d98、EXEc8a53dc7/PE2.1.9.0；两完整包/两源码/SHA上传，服务端digest/大小、匿名入口、Latest、正文/README/12群原图/双码各220及零起点教程通过。音乐只运行包、无ANR、DLL/88shader和四次解压冷启动通过，原2.1.6两Release保护通过。脚本路径/失败与纠正/实际资产SHA见RELEASE_2.1.9_EXECUTION_2026-11-15.md与reports同任务FINAL。发布后仅追加验收文档，不改tag/二进制/已发布ZIP；群公告669字符提供用户自行发，不群发、不关机。
+## 2026-11-15 README顶部替换日落新Logo
+
+用户要求用新Logo替换README顶部老图。README.md/README_CN.md现有顶部手柄图改为已发布的assets/veyra-logo-dusk.webp，保持原140/160宽度和位置。英文兼容README_EN.md原无Logo且指向README.md，保持该入口。无图像重绘/裁剪、无程序/发行包/版本标签改动，作者/教程及12群/赞助区保持。命令git diff --check、main快进/推送nrvideo main，远端README与Logo原字节验证结果见E:/项目/Veyra/reports/codex-readme-dusk-logo-20261115/FINAL.json；不关机。
+
+## 2026-11-15 README改用用户指定的Veyra NR动态字标
+
+用户纠正：要的是附图Veyra NR字标，要求录制软件里的动效GIF。隔离分支codex/readme-wordmark-gif-20261115，基于62d8f56；README.md/README_CN.md顶部现改为assets/veyra-wordmark-dusk.gif、宽480。英文兼容入口、教程零起点、作者主页、12群与赞助各220保持。
+
+直接用已发布2.1.9 EXE（c8a53dc7…）加载原封未改的DuskIntro.qml，通过组件现有ms时钟与Qt grabToImage采集1–2640ms、25fps共67张1280×800帧，未重制动画。仅私有QA副本注入采集器，独立配置/缓存/日志，无media目录且introMusic=false；供体EXE/Main/组件SHA不变，进程退出0、QML错误0。FFmpeg裁剪/轻度空间降噪以压缩颗粒/缩到480×390，保留入场和日落，完整字标停留1秒后0.4秒淡出，循环起点放完整字标；最终GIF 6497964字节、102帧、4.08秒、无限循环，SHA256 db0d89d34a1716e055d29a146a47dee113a78cae27caad9b01da1a227245b0bb。逐帧解码、首帧/过程接触表与循环时长检查通过。额外Pillow无损重编码候选未通过像素一致性检查，未采用，原FFmpeg成品保留。
+
+实际命令：py -3.11 -X utf8 -B -I reports任务目录/capture.py、encode.py及git diff --check；脚本、FFmpeg完整参数、CAPTURE.json、ENCODE.json、画面证据与远端核验FINAL.json统一在E:/项目/Veyra/reports/codex-readme-wordmark-gif-20261115。采集副本tests同名、缓存tmp同名、日志logs同名。本轮只更新文档展示资产，不重编译、不改版本标签或已发布包；按用户README更新授权合main并推送nrvideo main，不关机。
+
+## 2026-11-15 README字标改为仅文字与太阳、透明背景
+
+用户要求去掉GIF背景，只留文字和太阳。分支codex/readme-wordmark-transparent-20261115基于87f3d2c，私有展示QML只保留已发布DuskIntro原动画方程、原字标三层及条纹太阳，去掉天空/海面/倒影/地平线/光晕/颗粒/火星，不改软件中的QML或其原件。仍通过2.1.9 EXE、独立配置且禁用音乐采集67张RGBA帧；供体EXE/Main/DuskIntro SHA不变、退出0、QML错误0。
+
+生成assets/veyra-wordmark-sun.gif替换README.md/README_CN.md顶部引用，480×364、133帧、6.28秒循环、3441610字节，SHA256 7e87d95d4366f6dd319fdee3c2e55b06ce151cc42afda4251bf03e5974cef75d。原入场倒放再正放，首帧完整字标停留1秒；采用全画布透明清除，每帧至少91089个透明像素。初次Pillow delta编码在全透明帧写入重复文件头，被逐帧/时长校验拦截；改用其帧编码器逐张写完整画布并显式disposal=2后，133帧全部像素与时序一致通过，不带底色、不留残影。GIF只有二值透明，边缘按alpha128量化；深浅背景实际解码预览已检查。旧有背景GIF在Git历史中保留，当前树移除；作者/零起点教程/双码各220及远端并发的Trending/下载数改动保持。
+
+执行命令：py -3.11 -X utf8 -B -I reports任务目录/prepare.py、capture.py、encode.py、verify.py；git diff --check及main快进/推送nrvideo main。脚本/命令参数/CAPTURE.json/ENCODE.json/深浅底预览/独立FFmpeg解码与远端逐字节验证FINAL.json统一在E:/项目/Veyra/reports/codex-readme-wordmark-transparent-20261115；私有app/profile在tests同名、缓存tmp同名、日志logs同名。仅文档展示资产，不重编译或改Release包/标签，不关机。

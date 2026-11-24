@@ -157,6 +157,11 @@ void QmlPlayerBridge::tickSubtitles() {
     // picture and is clipped by the same window region as the video itself.
     if (!i.videoWindow || !IsWindow(i.videoWindow)) return;
     if (!i.subOverlay) {
+        // 视频直出: a layered child window of the video disqualifies the whole
+        // top-level window for direct scanout (DWM must compose both), and the
+        // subtitle draw lands over the picture anyway, which direct present
+        // cannot show. Nothing is created in that mode.
+        if (i.prefBool("directPresent", false)) return;
         // A refused layered child (missing compatibility manifest, old OS) is
         // reported once; retrying every tick would only flood the log.
         if (i.subOverlayFailed) return;

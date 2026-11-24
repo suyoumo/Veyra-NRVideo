@@ -92,6 +92,18 @@ Item {
         id: ps5Dialog
         dialogHost: host    }
 
+    // --- 按键映射（PS5 手柄控制） ---------------------------------------------
+    PadMapDialog {
+        id: padMapDialog
+        dialogHost: host
+    }
+
+    // --- 键鼠映射（PS5 手柄控制） ---------------------------------------------
+    KbmSettingsDialog {
+        id: kbmSettings
+        dialogHost: host
+    }
+
     // --- PC 串流（Sunshine / GameStream） ----------------------------------
     // Hosts, pairing, the host's apps and the stream-core settings. The effect chain is not here: once
     // connected, the picture goes through the software's own pages like any other source.
@@ -171,6 +183,12 @@ Item {
 
     // --- 音频设置 ---------------------------------------------------------
     AudioSettingsDialog {
+        dialogHost: host
+    }
+
+    // --- 帧率 HUD 设置 -----------------------------------------------------
+    HudSettingsDialog {
+        id: hudSettings
         dialogHost: host
     }
 

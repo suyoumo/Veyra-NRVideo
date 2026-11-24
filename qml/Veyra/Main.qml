@@ -21,6 +21,13 @@ Window {
     id: root
     width: 1280
     height: 800
+    // 视频直出: the native video window is a separate top-level window placed over
+    // this one instead of a child. A child window can never reach the scanout
+    // directly, so DWM composes every frame (~10 ms measured on a 4K60 capture);
+    // an unowned top-level flip window costs ~0.4 ms. Cost of the switch: QML
+    // content that used to be drawn over the picture (HUD, cinema controls) ends
+    // up behind it, because nothing may cover a flipping surface.
+    readonly property bool directPresent: veyra.directPresent
     // 极简 follows the film, and a portrait film needs a narrow window (the dock is
     // about 330px wide).
     minimumWidth: cinema ? 360 : 720
@@ -297,6 +304,13 @@ Window {
         ProPage {
             id: proPage
             pageId: "pro"
+            liveMode: root.liveMode
+            onRequestLiveMode: root.toggleLiveMode()
+            onRequestAudioTest: {
+                root.audioTestPanel = !root.audioTestPanel
+                if (root.audioTestPanel) veyra.startAudioTest()
+                else veyra.stopAudioTest()
+            }
             // Also follows wrapping status text and the compact header/transport.
             onVideoViewportChanged: if (root.page === "pro" && !root.fullscreen) videoHost.syncRect()
             home: pages
@@ -467,6 +481,20 @@ Window {
     // Set before the visibility changes: Windows resizes the window first, and the
     // cinema rule would otherwise snap that fullscreen size back to the film.
     property bool fullTarget: false
+    // 直播模式: fullscreen with nothing drawn over the picture - no HUD, no
+    // playback pill, no toasts - so a screen capture (OBS 显示器采集) gets a
+    // clean, unchanging frame. Esc or F leaves it like any fullscreen.
+    property bool liveMode: false
+    function toggleLiveMode() { setLiveMode(!liveMode) }
+    function setLiveMode(on) {
+        if (on === liveMode) return
+        liveMode = on
+        veyra.logUi("live-mode", on ? "on: fullscreen clean picture" : "off")
+        if (on) {
+            if (typeof toast !== "undefined") toast.on = false
+            if (!fullscreen) toggleFullscreen()
+        }
+    }
     property int fullRestoreVisibility: Window.Windowed
     // Windows may briefly report Windowed while restoring a maximized window.
     // Keep cinema sizing out of that native transition, without a polling timer.
@@ -513,6 +541,8 @@ Window {
         fullTarget = fullscreen
         if (!fullscreen) {
             fullLocked = false
+            // Leaving the screen the stream captures ends 直播模式 with it.
+            if (liveMode) liveMode = false
             closeQuickPanel()
             if (cinema && visibility === Window.Windowed && !fullRestorePending) height = Math.round(pictureHeight)
         }
@@ -589,6 +619,94 @@ Window {
             }
         }
     }
+    // 简要画面 HUD：帧率 / 1% low / 采集 / 引擎 / 上屏 / 总延迟 / 处理耗时。
+    // 位置、大小与显示哪些行由「帧率 HUD」对话框设置：hudCorner 0 关 1 左上 2 右上
+    // 3 左下 4 右下；hudScale 80–200%；hudItems 位掩码逐行开关。
+    Rectangle {
+        id: videoHud
+        objectName: "video-hud"
+        // 视频是原生子窗口，带 videoCover 的 QML 项会从它里面挖洞显示（main.cpp）。
+        readonly property bool videoCover: true
+        readonly property int corner: Number(veyra.preferences.hudCorner !== undefined ? veyra.preferences.hudCorner : 0)
+        readonly property real hudScale: Math.max(0.8, Math.min(2.0,
+            Number(veyra.preferences.hudScale !== undefined ? veyra.preferences.hudScale : 100) / 100))
+        readonly property int items: Number(veyra.preferences.hudItems !== undefined ? veyra.preferences.hudItems : 127)
+        readonly property bool rightSide: corner === 2 || corner === 4 || corner === 6
+        readonly property bool bottomSide: corner === 3 || corner === 4
+        // 置顶两项贴住画面上边缘，不再加下移量。
+        readonly property bool topFlush: corner === 5 || corner === 6
+        readonly property real coverRadius: 8 * hudScale
+        // PresentMon 的 ETW 数字优先（VRR 下唯一可信）；没有它才用内部读数。
+        readonly property real scanoutMs: veyra.presentMonKnown ? veyra.presentMonP50Ms : veyra.displayScanoutP50Ms
+        readonly property real scanoutP95Ms: veyra.presentMonKnown ? veyra.presentMonP95Ms : veyra.displayScanoutP95Ms
+        // 上屏那一段不可测时（还没有样本），总延迟按已知的两段给出下限。
+        readonly property bool scanoutKnown: scanoutMs > 0
+        readonly property real totalMs: (veyra.captureDriverAgeP50Ms > 0 && veyra.captureToPresentP50Ms > 0)
+            ? veyra.captureDriverAgeP50Ms + veyra.captureToPresentP50Ms + (scanoutKnown ? scanoutMs : 0) : 0
+        // 直播模式 keeps the HUD: it is the overlay the user wants in the
+        // recording/stream; only the pill, toasts and the rest go away.
+        // 视频直出: the present blit draws this same readout into the video buffer
+        // (refreshHudOverlay, same settings), so this copy hides - two of them
+        // would sit next to each other and only this one would follow the dialog.
+        visible: corner > 0 && items !== 0 && veyra.hasSource && videoHost.width > 0 && !root.directPresent
+        x: videoHost.x + (rightSide ? videoHost.width - width - 12 : 12)
+        // 上边距完全由下移量决定：0 = 贴住画面上边缘（右上不再额外留 38px）。
+        y: bottomSide ? videoHost.y + videoHost.height - height - 12
+                      : topFlush ? videoHost.y
+                      : videoHost.y + Number(veyra.preferences.hudOffsetY !== undefined ? veyra.preferences.hudOffsetY : 96)
+        width: hudColumn.implicitWidth + 20 * hudScale
+        height: hudColumn.implicitHeight + 14 * hudScale
+        radius: 8 * hudScale
+        color: Qt.rgba(0, 0, 0, 0.55)
+        border.width: 1; border.color: Qt.rgba(1, 1, 1, 0.10)
+        z: 75
+        Column {
+            id: hudColumn
+            x: 10 * videoHud.hudScale; y: 7 * videoHud.hudScale; spacing: 1 * videoHud.hudScale
+            Text {
+                visible: (videoHud.items & 1) !== 0
+                text: qsTr("帧率") + "  " + (veyra.submitFpsKnown ? veyra.submitFps.toFixed(1) : "—") + " fps"
+                color: veyra.submitFpsKnown ? Theme.ok : Theme.t3
+                font.family: Theme.fontMono; font.pixelSize: 13 * videoHud.hudScale; font.weight: Font.DemiBold
+            }
+            // 1% low：最近 10 秒提交间隔的 99 分位，卡顿感受的主要指标。
+            Text {
+                visible: (videoHud.items & 2) !== 0
+                text: qsTr("1% low") + "  " + (veyra.submitLowFpsKnown ? veyra.submitLowFps.toFixed(1) : "—") + " fps"
+                color: Theme.t2; font.family: Theme.fontMono; font.pixelSize: 12 * videoHud.hudScale
+            }
+            Text {
+                visible: (videoHud.items & 4) !== 0
+                text: qsTr("采集延迟") + "  " + (veyra.captureDriverAgeP50Ms > 0 ? veyra.captureDriverAgeP50Ms.toFixed(1) : "—") + " ms"
+                color: Theme.t1; font.family: Theme.fontMono; font.pixelSize: 12 * videoHud.hudScale
+            }
+            // 引擎段：采集回调 → Present（含补帧保持与图提交）。
+            Text {
+                visible: (videoHud.items & 8) !== 0
+                text: qsTr("引擎延迟") + "  " + (veyra.captureToPresentP50Ms > 0 ? veyra.captureToPresentP50Ms.toFixed(1) : "—") + " ms"
+                color: Theme.t1; font.family: Theme.fontMono; font.pixelSize: 12 * videoHud.hudScale
+            }
+            // 上屏段：Present → 屏幕真正显示的那次刷新（PresentMon ETW 优先）。
+            Text {
+                visible: (videoHud.items & 16) !== 0
+                text: qsTr("上屏等待") + (veyra.presentMonKnown ? " (PM)" : "") + "  "
+                      + (videoHud.scanoutMs > 0 ? videoHud.scanoutMs.toFixed(1) : "—") + " ms"
+                color: Theme.t1; font.family: Theme.fontMono; font.pixelSize: 12 * videoHud.hudScale
+            }
+            Text {
+                visible: (videoHud.items & 32) !== 0
+                text: qsTr("上屏总延迟") + "  "
+                      + (videoHud.totalMs > 0 ? (videoHud.scanoutKnown ? "" : "≥") + videoHud.totalMs.toFixed(1) : "—") + " ms"
+                color: Theme.t1; font.family: Theme.fontMono; font.pixelSize: 12 * videoHud.hudScale
+            }
+            Text {
+                visible: (videoHud.items & 64) !== 0
+                text: qsTr("处理耗时") + "  " + (veyra.chainTotalMsKnown ? veyra.chainTotalMs.toFixed(1) : "—") + " ms"
+                color: Theme.t3; font.family: Theme.fontMono; font.pixelSize: 12 * videoHud.hudScale
+            }
+        }
+    }
+    // HUD 的位置开关放在播放条的胶囊里（CineBar 的 FPS 按钮），画面上不加按钮。
     // Shared mask input follows the exact native host across list/node/cinema/fullscreen.
     ScreenCropEditor {
         id: screenCrop
@@ -770,7 +888,7 @@ Window {
         // an open dialog, which lives in the main window below it.
         cinema: root.cinema && !root.fullscreen
         pillTop: (root.maximized ? root.height : root.pictureHeight) - 46
-        shown: !root.onboardingActive && veyra.hasSource && !screenCrop.editing && !root.pillHidden && (root.fullscreen ? root.fullControls && !root.fullLocked
+        shown: !root.onboardingActive && veyra.hasSource && !screenCrop.editing && !root.pillHidden && !veyra.gameInputActive && (root.fullscreen ? root.fullControls && !root.fullLocked && !root.liveMode
                                                    : root.cinema && root.shownPage === "min"
                                                      && root.leavingPage === "" && dialogs.dialog === ""
                                                      && root.visibility !== Window.Minimized)
@@ -803,6 +921,9 @@ Window {
     // Rebindable (设置 → 快捷键); the hold-to-compare key is handled by the bridge's
     // application event filter because it needs the key release too.
     Shortcut { sequence: veyra.shortcuts.playPause; enabled: !screenCrop.editing; onActivated: veyra.togglePlayPause() }
+    // 直播模式 toggles from the keyboard too, so it works while the screen is
+    // already fullscreen and the top bar is out of reach.
+    Shortcut { sequence: "Ctrl+Shift+L"; autoRepeat: false; onActivated: root.toggleLiveMode() }
     Shortcut { sequence: veyra.shortcuts.fullscreen; onActivated: root.toggleFullscreen() }
     Shortcut {
         sequence: veyra.shortcuts.fullscreenStats
@@ -861,6 +982,173 @@ Window {
     Shortcut { sequence: "Shift+X"; onActivated: veyra.nudgeSubtitle(1000) }
     Shortcut { sequence: "T"; onActivated: veyra.cycleSubtitle(false) }
     Shortcut { sequence: "Y"; onActivated: veyra.cycleSubtitle(true) }
+
+    // 声音自检：游戏声音与麦克风的电平，以及「录 5 秒 → 播放」的试听。
+    // 视频是原生子窗口，带 videoCover 的项才会从它里面挖洞显示（main.cpp）。
+    property bool audioTestPanel: false
+    Rectangle {
+        id: audioTestBox
+        objectName: "audio-test-panel"
+        readonly property bool videoCover: true
+        readonly property real coverRadius: 8
+        visible: root.audioTestPanel
+        width: 440
+        height: audioTestCol.implicitHeight + 32
+        x: Math.round((root.width - width) / 2)
+        y: Math.round((root.height - height) / 2)
+        radius: Theme.rCard
+        color: Theme.popover
+        border.width: 1
+        border.color: Theme.stroke2
+        z: 60
+        // The probe follows the button, not this item: the initial visible
+        // binding (true -> false) would otherwise stop it right after start.
+        MouseArea { anchors.fill: parent; onClicked: {} }
+        ColumnLayout {
+            id: audioTestCol
+            anchors.fill: parent
+            anchors.margins: 16
+            spacing: 12
+            RowLayout {
+                spacing: 8
+                Text {
+                    text: qsTr("声音自检")
+                    color: Theme.t1
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fsH2
+                    font.weight: Font.DemiBold
+                }
+                Item { Layout.fillWidth: true }
+                Text {
+                    text: veyra.audioTestRunning ? qsTr("检测中") : qsTr("已停止")
+                    color: Theme.t3
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fsSmall
+                }
+            }
+            RowLayout {
+                spacing: 8
+                Text {
+                    text: qsTr("游戏声音")
+                    color: Theme.t2
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fsBody
+                    Layout.preferredWidth: 62
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 8
+                    radius: 4
+                    color: Theme.card3
+                    Rectangle {
+                        height: parent.height
+                        radius: 4
+                        color: veyra.audioTestGameDb > -45 ? Theme.ok : (veyra.audioTestGameDb > -70 ? Theme.warn : Theme.err)
+                        width: parent.width * Math.max(0, Math.min(1, (veyra.audioTestGameDb + 70) / 70))
+                        Behavior on width { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
+                    }
+                }
+                Text {
+                    text: veyra.audioTestGameDb > -119 ? Math.round(veyra.audioTestGameDb) + " dB" : "—"
+                    color: Theme.t3
+                    font.family: Theme.fontMono
+                    font.pixelSize: Theme.fsSmall
+                    Layout.preferredWidth: 52
+                    horizontalAlignment: Text.AlignRight
+                }
+            }
+            RowLayout {
+                spacing: 8
+                Text {
+                    text: qsTr("麦克风")
+                    color: Theme.t2
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fsBody
+                    Layout.preferredWidth: 62
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 8
+                    radius: 4
+                    color: Theme.card3
+                    Rectangle {
+                        height: parent.height
+                        radius: 4
+                        color: veyra.audioTestMicDb > -45 ? Theme.ok : (veyra.audioTestMicDb > -70 ? Theme.warn : Theme.err)
+                        width: parent.width * Math.max(0, Math.min(1, (veyra.audioTestMicDb + 70) / 70))
+                        Behavior on width { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
+                    }
+                }
+                Text {
+                    text: veyra.audioTestMicDb > -119 ? Math.round(veyra.audioTestMicDb) + " dB" : "—"
+                    color: Theme.t3
+                    font.family: Theme.fontMono
+                    font.pixelSize: Theme.fsSmall
+                    Layout.preferredWidth: 52
+                    horizontalAlignment: Text.AlignRight
+                }
+            }
+            Text {
+                text: veyra.audioTestMicStatus
+                color: veyra.audioTestMicOpen ? Theme.t2 : Theme.err
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fsSmall
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+            RowLayout {
+                spacing: 8
+                VButton {
+                    objectName: "audio-test-record"
+                    text: veyra.audioTestRecording ? qsTr("录制中…") : qsTr("录 5 秒")
+                    primary: !veyra.audioTestRecording
+                    enabled: !veyra.audioTestRecording
+                    onClicked: veyra.recordAudioSample()
+                }
+                VButton {
+                    objectName: "audio-test-play"
+                    text: qsTr("播放录音")
+                    ghost: true
+                    enabled: veyra.audioTestSamplePath.length > 0
+                    onClicked: veyra.playAudioSample()
+                }
+                Item { Layout.fillWidth: true }
+                VButton {
+                    text: qsTr("关闭")
+                    ghost: true
+                    onClicked: { root.audioTestPanel = false; veyra.stopAudioTest() }
+                }
+            }
+            Text {
+                text: qsTr("播放游戏声音并说话，点「录 5 秒」；录完点「播放录音」听到的就是实际录制的内容。麦克风打不开时上面会写原因。")
+                color: Theme.t3
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fsSmall
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+        }
+    }
+
+    // 区域录制: drag the rectangle on a dim full-screen window; the take starts
+    // a moment after it hides so the overlay is not in the file.
+    RegionSelect {
+        id: regionSelect
+        onSelected: function(x, y, w, h) {
+            veyra.setRecordRegion(x, y, w, h)
+            regionStart.restart()
+        }
+    }
+    Timer {
+        id: regionStart
+        interval: 400
+        repeat: false
+        onTriggered: veyra.startRecording("region")
+    }
+    Connections {
+        target: veyra
+        function onRequestRegionSelection() { regionSelect.begin(root.screen) }
+    }
 
     // Toasts: a refused edit, a finished export, a failed open.
     UpdateBanner {
@@ -947,14 +1235,17 @@ Window {
     Connections {
         target: veyra
         function onPlaylistRequested() { onboarding.close(); playlistWindow.open() }
-        function onNotice(text, isError) { toast.show(text, isError) }
         function onWarningNotice(text) { toast.show(text, false, true) }
+        // 直播模式 keeps the captured screen free of messages; errors still show,
+        // because a hidden failure is worse than one frame with a message in it.
+        function onNotice(text, isError) { if (!root.liveMode || isError) toast.show(text, isError) }
         function onOverlayRestartSuggested(kind) { onboarding.close(); overlayRestart.kind = kind; overlayRestart.open() }
         function onNavigate(p) {
             onboarding.close()
             // A dialog key opens the dialog; anything else is a page.
             if (p === "network" || p === "capture" || p === "ps5" || p === "moonlight" || p === "xbox" || p === "screen"
-                || p === "subtitle" || p === "translation" || p === "audio" || p === "save" || p === "manage") {
+                || p === "subtitle" || p === "translation" || p === "audio" || p === "save" || p === "manage"
+                || p === "hud" || p === "padmap") {
                 dialogs.open(p)
                 return
             }

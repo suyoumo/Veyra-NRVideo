@@ -38,6 +38,12 @@ struct CaptureMetrics {
     double callbackFps=0, readAgeMs=0, frameAgeMs=0;
     bool sampledBlack=false; // Sparse source pixels, not input signal detection.
 };
+// Last capture-driver-age window (driver frame timestamp -> our callback): the
+// same figures the capture-driver-age log line prints, 0 before the first
+// window. Free functions (like magewell::measuredLatencyMs) so the interface can
+// show the card's own latency without threading it through the engine snapshot.
+double captureDriverAgeP50Ms();
+double captureDriverAgeP95Ms();
 struct CaptureFormatQueryInfo {
     long code=0;
     std::wstring stage;

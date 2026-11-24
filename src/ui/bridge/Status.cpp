@@ -353,7 +353,7 @@ void QmlPlayerBridge::updateRunStatus() {
     // QScreen's cached rate for the actual video host, not an arbitrary popup
     // or another monitor. This uses the existing bounded status cadence.
     double refresh=0;
-    const HWND owner=i.videoWindow?GetAncestor(i.videoWindow,GA_ROOT):nullptr;
+    const HWND owner=i.videoWindow?GetAncestor(i.videoWindow,GA_ROOTOWNER):nullptr;
     for(auto* window:QGuiApplication::topLevelWindows())
         if(window->isVisible()&&window->screen()&&reinterpret_cast<HWND>(window->winId())==owner){refresh=window->screen()->refreshRate();break;}
     i.history.sample(s,{refresh,i.compareMode!=0});
@@ -579,6 +579,9 @@ void QmlPlayerBridge::showFormatBadge(const engine::PlayerSnapshot& s) {
     if (!impl_->videoWindow) return;
     impl_->formatBadgeSession = s.sessionId;
     impl_->formatBadgeLabel = s.sourceHdrLabel;
+    // 视频直出: same reason as the subtitle overlay - a layered child window keeps
+    // the video from being scanned out directly.
+    if (impl_->prefBool("directPresent", false)) return;
     if (!impl_->formatBadge) {
         impl_->formatBadge = std::make_unique<media::FormatBadgeWindow>();
         if (!impl_->formatBadge->create(impl_->videoWindow)) {

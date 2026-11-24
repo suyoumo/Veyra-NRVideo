@@ -1,6 +1,7 @@
 #include "veyra/engine/VideoPresenter.h"
 #include "veyra/engine/DoviCurveAdapter.h" // custom: Dolby Vision level 1 -> curve
 #include "veyra/engine/PresentationGeometry.h"
+#include "veyra/engine/LatencyStats.h"
 #include "veyra/pipeline/EnhanceGraph.h"
 #include "veyra/gfx/D3D12DeviceContext.h"
 #include "veyra/gfx/CommandSlotRing.h"
@@ -8,7 +9,27 @@
 #include <cstdlib> // std::getenv (custom: Dolby Vision follow switch)
 #include <array>
 #include <memory>
+#include <atomic>
 namespace veyra::engine {
+namespace {
+// First descriptor slot of the overlay textures, after the output pool and the
+// four comparison references (see VideoPresenter::applyVideoOverlay).
+constexpr unsigned kOverlayFirst=pipeline::kOutputPoolSlots+8;
+// Live latency chain (LatencyStats.h): published here so the presenter's
+// display-latency window and the engine loop share one TU.
+std::atomic<double> g_captureToPresentP50{0},g_captureToPresentP95{0};
+std::atomic<double> g_displayScanoutP50{0},g_displayScanoutP95{0};
+}
+void publishCaptureToPresent(double p50Ms,double p95Ms){
+    g_captureToPresentP50.store(p50Ms);g_captureToPresentP95.store(p95Ms);
+}
+double captureToPresentP50Ms(){return g_captureToPresentP50.load();}
+double captureToPresentP95Ms(){return g_captureToPresentP95.load();}
+void publishDisplayScanout(double p50Ms,double p95Ms){
+    g_displayScanoutP50.store(p50Ms);g_displayScanoutP95.store(p95Ms);
+}
+double displayScanoutP50Ms(){return g_displayScanoutP50.load();}
+double displayScanoutP95Ms(){return g_displayScanoutP95.load();}
 bool VideoPresenter::beginSourceInput(uint64_t stallUs){
     if(!reflexInputFrame_&&reflex_.active())reflexInputFrame_=reflex_.begin(stallUs);
     auto* xess=sink_.xess();if(!xess)return true;
@@ -36,8 +57,11 @@ bool createPresentationPasses(gfx::D3D12DeviceContext& ctx,pipeline::EnhanceGrap
     std::vector<uint8_t> vs,ps;
     // The output pool contains both parities of every generated subframe.
     // Comparison references follow it, including VFG through 8X.
-    if(!pipeline::loadShaderBytes("PresentBlit_vs.dxil",vs)||!pipeline::loadShaderBytes("PresentBlit_ps.dxil",ps)||
-       !opening.blit.create(ctx.device(),vs,ps,pipeline::kOutputPoolSlots+8,graph.outputFormat(),16))return false;
+    // PresentBlitOverlay adds the video overlay (VideoOverlay.h): 24 constants
+    // instead of 16 and three extra heap slots, one SRV per rotating overlay
+    // texture (a descriptor is rewritten only for a draw that is not in flight).
+    if(!pipeline::loadShaderBytes("PresentBlitOverlay_vs.dxil",vs)||!pipeline::loadShaderBytes("PresentBlitOverlay_ps.dxil",ps)||
+       !opening.blit.create(ctx.device(),vs,ps,pipeline::kOutputPoolSlots+8+3,graph.outputFormat(),24,true))return false;
     if(!xess)return true;
     std::vector<uint8_t> cs;
     auto& motion=opening.motion;
@@ -137,6 +161,11 @@ bool VideoPresenter::open(gfx::D3D12DeviceContext& ctx,HWND window,pipeline::Enh
     if(!prepared&&!createPresentationPasses(ctx,graph,direct,sink_.xess()!=nullptr))return false;
     auto& opening=prepared?*prepared:direct;
     pass_=std::move(opening.blit);
+    // A rebuilt graph brings a new descriptor heap: the overlay SRVs were written
+    // into the old one, so the cached textures must be recreated or the blit
+    // samples an empty slot and the HUD turns invisible (turning NR/AA off rebuilds
+    // the graph). The bridge sends the image again within 250 ms.
+    for(auto& t:overlayTextures_)t={};overlayNext_=0;overlayShown_={};overlayShownSlot_=-1;
     if(sink_.xess()){
         presentMotionPass_=std::move(opening.motion);
         presentMotion_=std::move(opening.motionTextures);
@@ -431,7 +460,7 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
     const bool p7Frame=graph.doviP7Active();
     const float ditherFlag=(graph.hdrOutput()&&p7Frame)?512.0f:0.0f;   // 256 is the alpha round trip in 2.1.6
     const float mainFlags=samplingFlags+curveFlag+(curveFlag&&graph.hdr10Output()?36.0f:0.0f)+ditherFlag;
-    float dims[16]={renderW,renderH,mainFlags,inverseFit,float(rc.right),float(rc.bottom),view.centerX,view.centerY};
+    float dims[kPresentBlitConstants]={renderW,renderH,mainFlags,inverseFit,float(rc.right),float(rc.bottom),view.centerX,view.centerY};
     // The blit sees the per-frame curve when Dolby Vision follow is on; every
     // other frame (and every non-DV source) passes the user's settings through.
     dims[8]=float(effective.shadowLiftEv100)/100.0f;
@@ -455,6 +484,9 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         dims[13]=float(effective.peakCapNits);
     }
     dims[14]=0.0f;dims[15]=0.0f;
+    // The overlay (VideoOverlay.h) goes up with the picture; its texture is read
+    // by this command list, so the slot is dated with the fence submitted below.
+    const int overlayBound=applyVideoOverlay(ctx,list,fence,graph,dims)?overlayShownSlot_:-1;
     if(traceDovi){
         // Gated trace: proves the per-frame curve reached the blit constants.
         // Throttled like the source-side dovi-probe so a long file stays small.
@@ -474,8 +506,9 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         // The counter advances outside the branch, so the periodic sample fires.
         ++doviFollowCount;
     }
-    list->SetGraphicsRoot32BitConstants(0,16,dims,0);
+    list->SetGraphicsRoot32BitConstants(0,kPresentBlitConstants,dims,0);
     list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(slot+(generated?2:0))*pass_.increment});
+    list->SetGraphicsRootDescriptorTable(2,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(kOverlayFirst+(overlayBound>=0?unsigned(overlayBound):0))*pass_.increment});
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);list->DrawInstanced(3,1,0,0);
     bool probeIssued=false;
     const bool observe=probeObserved_&&curveFlag!=0.0f;
@@ -502,14 +535,15 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         state.transition(list,source,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         // Restore the present state for comparisons, subtitles and provider work.
         list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(pass_.rootSig.Get());list->SetPipelineState(pass_.pso.Get());
-        list->SetGraphicsRoot32BitConstants(0,16,dims,0);
+        list->SetGraphicsRoot32BitConstants(0,kPresentBlitConstants,dims,0);
         list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(slot+(generated?2:0))*pass_.increment});
+        list->SetGraphicsRootDescriptorTable(2,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(kOverlayFirst+(overlayBound>=0?unsigned(overlayBound):0))*pass_.increment});
         probeCurve_=hdrCurve;probeIdentity_=identity;probeIssued=true;
     }
     if(comparison&&!generated&&referencesValid){
         auto* reference=baseReference?graph.baseReference(slot):graph.sourceReference(slot);
         D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=reference;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;b.Transition.StateBefore=D3D12_RESOURCE_STATE_COMMON;b.Transition.StateAfter=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;list->ResourceBarrier(1,&b);
-        dims[2]=samplingFlags+curveFlag+(graph.hdr10Output()?4:graph.hdrOutput()?0:1)+(graph.videoHdrActive()?8:0);list->SetGraphicsRoot32BitConstants(0,16,dims,0);list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(pipeline::kOutputPoolSlots+slot+(baseReference?2:0))*pass_.increment});
+        dims[2]=samplingFlags+curveFlag+(graph.hdr10Output()?4:graph.hdrOutput()?0:1)+(graph.videoHdrActive()?8:0);list->SetGraphicsRoot32BitConstants(0,kPresentBlitConstants,dims,0);list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(pipeline::kOutputPoolSlots+slot+(baseReference?2:0))*pass_.increment});
         if(comparison==2)rect.right=LONG(std::clamp((rc.right*.5f+(std::clamp(split,0.0f,1.0f)-view.centerX)*renderW)*sink_.bufferWidth()/rc.right,0.0f,float(sink_.bufferWidth())));list->RSSetScissorRects(1,&rect);list->DrawInstanced(3,1,0,0);
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);
         if(veyra::log::verboseFrameLogs())veyra::log::info("comparison",std::format("real-frame source={} epoch={} revision={} reference={} mode={} split={} (same leased frame)",identity.sourceFrameId,identity.epoch,identity.settingsRevision,baseReference?"base":"input",comparison,split));
@@ -629,9 +663,10 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
                 list->SetDescriptorHeaps(1,heaps);
                 list->SetGraphicsRootSignature(pass_.rootSig.Get());list->SetPipelineState(pass_.pso.Get());
                 auto uiDims=std::to_array(dims);uiDims[2]=mainFlags+256.f;
-                list->SetGraphicsRoot32BitConstants(0,16,uiDims.data(),0);
+                list->SetGraphicsRoot32BitConstants(0,kPresentBlitConstants,uiDims.data(),0);
                 list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+
                     size_t(pipeline::kOutputPoolSlots+4+slot)*pass_.increment});
+                list->SetGraphicsRootDescriptorTable(2,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+size_t(kOverlayFirst)*pass_.increment});
                 list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 list->DrawInstanced(3,1,0,0);
                 frameStats_.draw(list,uiRtv,bufferWidth,bufferHeight,overlayCorner);
@@ -647,7 +682,7 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
                 list->RSSetScissorRects(1,&all);
                 list->SetDescriptorHeaps(1,heaps);
                 list->SetGraphicsRootSignature(pass_.rootSig.Get());list->SetPipelineState(pass_.pso.Get());
-                list->SetGraphicsRoot32BitConstants(0,16,dims,0);
+                list->SetGraphicsRoot32BitConstants(0,kPresentBlitConstants,dims,0);
                 list->SetGraphicsRootDescriptorTable(1,{pass_.heap->GetGPUDescriptorHandleForHeapStart().ptr+
                     size_t(pipeline::kOutputPoolSlots+6+slot)*pass_.increment});
                 list->DrawInstanced(3,1,0,0);
@@ -681,6 +716,7 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
 
     gpuTimer_.mark(list,diagnostics::GpuStage::Blit,true);gpuTimer_.resolve(list);
     if(!ring.submitAndSignal(commandSlot))return false;gpuTimer_.submitted(ring.lastSignaledValue());
+    if(overlayBound>=0)overlayTextures_[size_t(overlayBound)].fenceUsed=ring.lastSignaledValue();
     reflex_.blitEnd(reflexFrame);
     if(captureRecorded){captureRecorded=false;capture_->submitted(fence,ring.lastSignaledValue());}
     if(probeIssued){probePending_=true;probeFenceValue_=ring.lastSignaledValue();}
@@ -710,6 +746,10 @@ bool VideoPresenter::present(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& 
         const bool vrrCapable = gfx::vrrPresentationAvailable(vrr_);
         // ADL reports FreeSync availability in this mode, without a scanout-active flag.
         const bool vrrActive = (!vrr_.amd && vrrSync_) || vrr_.enabled || vrr_.inVrrMode;
+        // takeDisplayLatency prefers the grid-free latch samples, which stay valid
+        // with VRR engaged. Publish only sane values and keep the previous one
+        // otherwise, so a statistics gap shows the last good figure instead of 0.
+        if(scanout.samples>0&&scanout.p50Ms>=0&&scanout.p50Ms<200)veyra::engine::publishDisplayScanout(scanout.p50Ms,scanout.p95Ms);
         if(scanout.samples||scanout.compositionMode>=0)veyra::log::info("display-latency",std::format("presentToScanoutP50Ms={:.3f} presentToScanoutP95Ms={:.3f} presentToScanoutMaxMs={:.3f} samples={} replacedAtLeast={} compositionMode={} refreshHz={:.3f} vrrCapable={} vrrActive={} (DXGI frame statistics: Present call to the vblank that showed it, VSync and Automatic DXGI presents; Automatic dates only frames named as shown; compositionMode 0 composed 1 overlay 2 none 3 failure -1 unknown; not a photon measurement)",scanout.p50Ms,scanout.p95Ms,scanout.maxMs,scanout.samples,scanout.replacedAtLeast,scanout.compositionMode,sink_.displayRefreshHz(),vrrCapable,vrrActive));
         const double sampleSeconds = scanoutSampleAt_.time_since_epoch().count() > 0
             ? std::chrono::duration<double>(presentEnd - scanoutSampleAt_).count() : 0;
@@ -772,10 +812,125 @@ void VideoPresenter::publishLiveCoverage(const HdrCurveSettings& curve,pipeline:
     // A real black frame has samples with zero events and is valid.
 }
 
+void VideoPresenter::setVideoOverlay(VideoOverlay overlay){
+    std::lock_guard lock(overlayMutex_);overlayPending_=std::move(overlay);++overlayVersion_;
+}
+
+bool VideoPresenter::applyVideoOverlay(gfx::D3D12DeviceContext& ctx,ID3D12GraphicsCommandList* list,ID3D12Fence* fence,pipeline::EnhanceGraph& graph,float* dims){
+    dims[16]=0;dims[17]=0;dims[18]=0;dims[19]=0;
+    dims[20]=0;dims[21]=float(graph.hdr10Output()?2:graph.hdrOutput()?1:0);dims[22]=0;dims[23]=0;
+    // XeSS composes its own UI surfaces on the provider path; the overlay is the
+    // native blit's.
+    if(sink_.xess()||!list)return false;
+    VideoOverlay next;bool fresh=false;
+    {
+        std::lock_guard lock(overlayMutex_);
+        if(overlayVersion_!=overlayAppliedVersion_){next=overlayPending_;overlayAppliedVersion_=overlayVersion_;fresh=true;}
+    }
+    auto transition=[&](ID3D12Resource* resource,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after){
+        D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource=resource;barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore=before;barrier.Transition.StateAfter=after;list->ResourceBarrier(1,&barrier);
+    };
+    if(fresh){
+        bool stored=false;
+        if(next.bgra.empty()){overlayShown_={};overlayShownSlot_=-1;stored=true;}
+        for(unsigned attempt=0;attempt<kOverlayTextures&&!stored;++attempt){
+            const unsigned index=(overlayNext_+attempt)%kOverlayTextures;auto& t=overlayTextures_[index];
+            // The GPU may still be reading this texture in the present that last
+            // bound it.
+            if(t.resource&&t.fenceUsed&&fence&&!pipeline::fenceComplete(fence,t.fenceUsed))continue;
+            if(!t.resource||t.width!=next.width||t.height!=next.height){
+                t={};
+                // Default-heap texture plus its own upload buffer, then
+                // CopyTextureRegion: the pattern the rest of the engine uses for
+                // uploads. A texture created straight on an upload heap failed here
+                // with hr=0x80070002 on this device.
+                D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                desc.Width=next.width;desc.Height=next.height;desc.DepthOrArraySize=1;desc.MipLevels=1;
+                desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.SampleDesc.Count=1;
+                // Layout stays UNKNOWN: ROW_MAJOR is only legal on an upload-heap
+                // resource, and this is a default-heap texture (E_INVALIDARG
+                // otherwise; GetCopyableFootprints below handles the layout).
+                desc.Flags=D3D12_RESOURCE_FLAG_NONE;
+                Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+                HRESULT hr=ctx.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&resource));
+                if(FAILED(hr)){
+                    veyra::log::error("present",std::format("video overlay texture {}x{} failed hr=0x{:X}",next.width,next.height,unsigned(hr)));
+                    break;
+                }
+                resource->SetName(L"Veyra video overlay");
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT placement{};UINT64 totalBytes=0;
+                ctx.device()->GetCopyableFootprints(&desc,0,1,0,&placement,nullptr,nullptr,&totalBytes);
+                D3D12_HEAP_PROPERTIES uploadHeap{};uploadHeap.Type=D3D12_HEAP_TYPE_UPLOAD;
+                D3D12_RESOURCE_DESC bufferDesc{};bufferDesc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+                bufferDesc.Width=totalBytes;bufferDesc.Height=1;bufferDesc.DepthOrArraySize=1;bufferDesc.MipLevels=1;
+                bufferDesc.SampleDesc.Count=1;bufferDesc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+                hr=ctx.device()->CreateCommittedResource(&uploadHeap,D3D12_HEAP_FLAG_NONE,&bufferDesc,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&upload));
+                if(FAILED(hr)){
+                    veyra::log::error("present",std::format("video overlay upload buffer {}x{} failed hr=0x{:X}",next.width,next.height,unsigned(hr)));
+                    break;
+                }
+                upload->SetName(L"Veyra video overlay upload");
+                t.resource=std::move(resource);t.upload=std::move(upload);
+                t.width=next.width;t.height=next.height;t.rowPitch=placement.Footprint.RowPitch;
+                pipeline::makeSrv(ctx.device(),t.resource.Get(),DXGI_FORMAT_B8G8R8A8_UNORM,
+                    {pass_.heap->GetCPUDescriptorHandleForHeapStart().ptr+size_t(kOverlayFirst+index)*pass_.increment});
+            }
+            if(!next.bgra.empty()){
+                void* mapped=nullptr;
+                if(FAILED(t.upload->Map(0,nullptr,&mapped))){veyra::log::error("present","video overlay upload map failed");break;}
+                const size_t rowBytes=size_t(next.width)*4;
+                for(unsigned y=0;y<next.height;++y)
+                    std::memcpy(static_cast<uint8_t*>(mapped)+size_t(y)*t.rowPitch,next.bgra.data()+size_t(y)*rowBytes,rowBytes);
+                t.upload->Unmap(0,nullptr);
+                if(t.readState)transition(t.resource.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+                else transition(t.resource.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION src{};src.pResource=t.upload.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Footprint.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+                src.PlacedFootprint.Footprint.Width=next.width;src.PlacedFootprint.Footprint.Height=next.height;
+                src.PlacedFootprint.Footprint.Depth=1;src.PlacedFootprint.Footprint.RowPitch=t.rowPitch;
+                D3D12_TEXTURE_COPY_LOCATION dst{};dst.pResource=t.resource.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+                transition(t.resource.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                t.readState=true;
+            }
+            overlayNext_=(index+1)%kOverlayTextures;overlayShown_=std::move(next);overlayShownSlot_=int(index);stored=true;
+        }
+        if(!stored&&!next.bgra.empty()){
+            // Every texture still in flight: keep the image for the next present.
+            std::lock_guard lock(overlayMutex_);overlayPending_=std::move(next);++overlayVersion_;
+        }
+    }
+    const bool drawn=overlayShownSlot_>=0&&overlayShown_.show&&!overlayShown_.bgra.empty();
+    if(drawn){
+dims[16]=float(overlayShown_.x);dims[17]=float(overlayShown_.y);
+        dims[18]=float(overlayShown_.width);dims[19]=float(overlayShown_.height);
+        dims[20]=1;
+    }
+    // VEYRA_HUD_PROBE=1: one line per second describing what the blit saw.
+    static const bool hudProbe=GetEnvironmentVariableW(L"VEYRA_HUD_PROBE",nullptr,0)>0;
+    if(hudProbe){
+        static auto lastProbe=std::chrono::steady_clock::time_point{};
+        const auto nowProbe=std::chrono::steady_clock::now();
+        if(nowProbe-lastProbe>=std::chrono::seconds(1)){
+            lastProbe=nowProbe;
+            veyra::log::info("hud-probe",std::format("side=blit fresh={} version={} applied={} slot={} show={} img={}x{} rect={},{} {}x{} draw={} xess={}",
+                fresh?1:0,overlayVersion_,overlayAppliedVersion_,overlayShownSlot_,overlayShown_.show?1:0,
+                overlayShown_.width,overlayShown_.height,dims[16],dims[17],dims[18],dims[19],drawn?1:0,sink_.xess()?1:0));
+        }
+    }
+    return drawn;
+}
+
 void VideoPresenter::close(){
     tearingDetector_.resetWindow();scanoutSampleAt_={};observedDisplayGeneration_=0;
     metadataSent_=false;metadataDirty_=false;lastMetadata_={};sourceMetadata_={};metadataAttempt_={};
     hdrPeakInfo_={};
+    {std::lock_guard lock(overlayMutex_);overlayPending_={};}
+    for(auto& t:overlayTextures_)t={};overlayNext_=0;overlayShown_={};overlayShownSlot_=-1;
     refreshMonitor_=nullptr;refreshHz_=0;vrr_={};refreshQueried_=false;vrrSync_=false;displayStateSerial_=0;vrrConfirmAt_.reset();
     
     retainedFrame_.reset();
@@ -905,7 +1060,7 @@ PresentationSettings VideoPresenter::configurePresentation(gfx::D3D12DeviceConte
     if(vrrSync_){requested.display=DisplaySync::Vsync;effective.display=DisplaySync::Vsync;}
     const bool vsync=presentationVsync(requested),tearing=presentationTearing(requested);
     providerOwnedPresentation_=xessActive();
-    // The interface translates this line piece by piece at " · " and "；"
+    // The interface translates this line piece by piece at " · " and "�?
     // (UiLanguage), so every piece is its own catalog entry without separators.
     const auto join=[](std::initializer_list<std::wstring> pieces){
         std::wstring line;
@@ -992,7 +1147,7 @@ void VideoPresenter::applyHdrMetadata(pipeline::EnhanceGraph& graph,const HdrMet
     md.GreenPrimary[0]=8500;md.GreenPrimary[1]=39850;
     md.BluePrimary[0]=6550;md.BluePrimary[1]=2300;
     md.WhitePoint[0]=15635;md.WhitePoint[1]=16450;
-    // ① Output-aware: describe what the curve actually produces, not the source.
+    // �?Output-aware: describe what the curve actually produces, not the source.
     auto light=resolveHdrMetadataLuminance(m,sourceMetadata_);
     if(resolvedCurve.enabled&&resolvedCurve.peakCapNits){light.cll=std::min(light.cll,resolvedCurve.peakCapNits);light.fall=std::min(light.fall,light.cll);}
     md.MaxMasteringLuminance=light.peak;md.MinMasteringLuminance=light.minX10000;

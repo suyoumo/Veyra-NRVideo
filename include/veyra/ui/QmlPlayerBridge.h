@@ -27,6 +27,7 @@
 #include <QUrl>
 #include <QVariantList>
 #include <QVariantMap>
+#include <QImage>
 
 #include <functional>
 #include <memory>
@@ -171,6 +172,24 @@ class QmlPlayerBridge : public QObject {
     // one, and a one-line state (active with its latency, missing runtime, or why it fell back).
     Q_PROPERTY(bool captureMagewellDevice READ captureMagewellDevice NOTIFY captureChanged)
     Q_PROPERTY(QString captureMagewellStatus READ captureMagewellStatus NOTIFY snapshotChanged)
+    // AVerMedia 低延迟模式（CaptureBuffer.h）：GC573 等 VEN_1461 PCIe 卡可用；连接时把
+    // 视频 pin 的分配器建议压到 1 帧，是 DirectShow 路径上的采集延迟下限。
+    Q_PROPERTY(bool captureAverPcieDevice READ captureAverPcieDevice NOTIFY captureChanged)
+    // 采集卡自身延迟（驱动帧时间戳 → 回调）。和日志 capture-driver-age 同一组数字；
+    // 未测够 600 帧前为 0。界面用它显示「采集延迟」一行。
+    Q_PROPERTY(double captureDriverAgeP50Ms READ captureDriverAgeP50Ms NOTIFY snapshotChanged)
+    Q_PROPERTY(double captureDriverAgeP95Ms READ captureDriverAgeP95Ms NOTIFY snapshotChanged)
+    // 延迟链其余两段（LatencyStats.h）：采集回调→Present、Present→上屏。
+    Q_PROPERTY(double captureToPresentP50Ms READ captureToPresentP50Ms NOTIFY snapshotChanged)
+    Q_PROPERTY(double captureToPresentP95Ms READ captureToPresentP95Ms NOTIFY snapshotChanged)
+    Q_PROPERTY(double displayScanoutP50Ms READ displayScanoutP50Ms NOTIFY snapshotChanged)
+    Q_PROPERTY(double displayScanoutP95Ms READ displayScanoutP95Ms NOTIFY snapshotChanged)
+    // PresentMon 的真实上屏延迟（ETW）：VRR 下唯一可信的口径。PresentMon.exe
+    // 存在时才有效；presentMonKnown=false 时界面回落到内部读数。
+    Q_PROPERTY(bool presentMonKnown READ presentMonKnown NOTIFY snapshotChanged)
+    Q_PROPERTY(double presentMonP50Ms READ presentMonP50Ms NOTIFY snapshotChanged)
+    Q_PROPERTY(double presentMonP95Ms READ presentMonP95Ms NOTIFY snapshotChanged)
+    Q_PROPERTY(double presentMonBetweenMs READ presentMonBetweenMs NOTIFY snapshotChanged)
 
     // --- screen-capture dialog ---------------------------------------------
     Q_PROPERTY(QVariantList screenTargets READ screenTargets NOTIFY captureChanged)
@@ -203,6 +222,14 @@ class QmlPlayerBridge : public QObject {
     // %LOCALAPPDATA%\Veyra\remoteplay, encrypted), discovery, pairing, Account ID lookup,
     // wake, stream profile, decode/sampling, view-only, login PIN, controller
     // forwarding and gyro calibration. `ps5` carries the form state.
+    // 游戏模式 (screen option "passthrough", ui/GamePassthrough.h): gameMode while the
+    // current source is such a capture (opening or live); passthroughActive while the
+    // native side is click-through; gameInputActive while keyboard/mouse reach the game.
+    Q_PROPERTY(bool gameMode READ gameMode NOTIFY gameModeChanged)
+    Q_PROPERTY(bool passthroughActive READ passthroughActive NOTIFY gameModeChanged)
+    Q_PROPERTY(bool gameInputActive READ gameInputActive NOTIFY gameModeChanged)
+    Q_PROPERTY(bool gameScaledPreview READ gameScaledPreview NOTIFY gameModeChanged)
+    Q_PROPERTY(QRectF gameVideoRect READ gameVideoRect NOTIFY gameModeChanged)
     Q_PROPERTY(QVariantMap ps5 READ ps5 NOTIFY ps5Changed)
     Q_PROPERTY(QVariantList ps5Profiles READ ps5Profiles NOTIFY ps5Changed)
     // PS5 手柄控制 (采集卡对话框): a controller-only Remote Play session beside the
@@ -210,6 +237,16 @@ class QmlPlayerBridge : public QObject {
     // enabled, background, state: off|starting|connected|pin|recovering|failed|
     // nopair, message, keepaliveFps (-1 = not yet), pad, gyro, touch}
     Q_PROPERTY(QVariantMap ps5Control READ ps5Control NOTIFY ps5ControlChanged)
+    // 按键映射 (采集卡对话框 → PS5 手柄控制): physical pad button per PS5 button,
+    // the touch-gesture buttons and the controller identity reported to the console.
+    // {map: {cross: "south", …}, touchModifier: "share", touchClick: "options",
+    //  touchPS: "triangle", touchStick: "right"|"left", controllerType: "auto"|"dualsense"|"ds4"}
+    Q_PROPERTY(QVariantMap ps5Pad READ ps5Pad NOTIFY ps5PadChanged)
+    // 键鼠映射 (采集卡对话框): GTA6 preset with default/driving modes, mouse feel
+    // tuning and keyboard->pad mapping. {enabled, sensitivity, curveType,
+    // deadzone, antiDeadzone, smoothing, leftValue, leftRamp, r2Depth, l2Depth,
+    // flick, invertY, mode, modeCount}
+    Q_PROPERTY(QVariantMap ps5Kbm READ ps5Kbm NOTIFY ps5KbmChanged)
     // PC streaming (Moonlight / Sunshine): hosts, pairing, apps and stream settings live in
     // `moonlight` (null when the build has no Moonlight); capture state and the stats overlay here.
     Q_PROPERTY(QObject* moonlight READ moonlightModel CONSTANT)
@@ -241,11 +278,28 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(int recordingFpsLimit READ recordingFpsLimit NOTIFY preferencesChanged)
     Q_PROPERTY(bool recordingHevc READ recordingHevc NOTIFY preferencesChanged)
     Q_PROPERTY(bool recordingAudio READ recordingAudio NOTIFY preferencesChanged)
+    // 录制界面: Veyra's window (picture plus panels) instead of the clean picture.
+    Q_PROPERTY(bool recordingUi READ recordingUi NOTIFY preferencesChanged)
+    // 全屏录制: record the screen and the system sound without a Veyra source.
+    Q_PROPERTY(bool recordingFullscreen READ recordingFullscreen NOTIFY preferencesChanged)
+    // 区域录制: one dragged rectangle of the screen instead of all of it.
+    Q_PROPERTY(bool recordingRegion READ recordingRegion NOTIFY preferencesChanged)
+    Q_PROPERTY(int recordRegionW READ recordRegionW NOTIFY preferencesChanged)
     // Microphone (#101): mixed into the recorded sound, or on a track of its own.
     Q_PROPERTY(bool recordingMicrophone READ recordingMicrophone NOTIFY preferencesChanged)
     Q_PROPERTY(QString recordingMicrophoneId READ recordingMicrophoneId NOTIFY preferencesChanged)
     Q_PROPERTY(bool recordingMicrophoneTrack READ recordingMicrophoneTrack NOTIFY preferencesChanged)
     Q_PROPERTY(QVariantList microphoneDevices READ microphoneDevices NOTIFY microphoneDevicesChanged)
+    // 声音自检: live meters for the sound the player renders and for the
+    // recording endpoint, so the audio options can be checked before a take.
+    Q_PROPERTY(bool audioTestRunning READ audioTestRunning NOTIFY audioTestChanged)
+    Q_PROPERTY(double audioTestGameDb READ audioTestGameDb NOTIFY audioTestChanged)
+    Q_PROPERTY(double audioTestMicDb READ audioTestMicDb NOTIFY audioTestChanged)
+    Q_PROPERTY(bool audioTestMicOpen READ audioTestMicOpen NOTIFY audioTestChanged)
+    Q_PROPERTY(QString audioTestMicStatus READ audioTestMicStatus NOTIFY audioTestChanged)
+    // 录制试听: a short sample of exactly what a recording would take.
+    Q_PROPERTY(bool audioTestRecording READ audioTestRecording NOTIFY audioTestChanged)
+    Q_PROPERTY(QString audioTestSamplePath READ audioTestSamplePath NOTIFY audioTestChanged)
     // Instant replay (#103): while enabled, the last replaySeconds of the
     // presented picture and sound stay in memory; saveReplay() writes them
     // next to the recordings.
@@ -479,6 +533,16 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(bool hudLock READ hudLock WRITE setHudLock NOTIFY settingsChanged)
     Q_PROPERTY(int hudProtect READ hudProtect WRITE setHudProtect NOTIFY settingsChanged)
     Q_PROPERTY(bool dynamicHud READ dynamicHud WRITE setDynamicHud NOTIFY settingsChanged)
+    // 低延迟上屏 (EnhancementSettings::fgLowLatencyPresent): live capture FG phase at the
+    // median readiness of the generated frames; same multiplier and output rate.
+    Q_PROPERTY(bool fgLowLatencyPresent READ fgLowLatencyPresent WRITE setFgLowLatencyPresent NOTIFY settingsChanged)
+    // 重复帧不插帧 (EnhancementSettings::fgSkipRepeats): a captured sample the source
+    // repeated (30 fps content in a 60 Hz transport) is not interpolated; the real frame
+    // is presented. The capture callback compares pictures while this is on.
+    Q_PROPERTY(bool fgSkipRepeats READ fgSkipRepeats WRITE setFgSkipRepeats NOTIFY settingsChanged)
+    // 视频直出: the native video window becomes a separate top-level window so the
+    // display can scan it out directly instead of compositing a child window.
+    Q_PROPERTY(bool directPresent READ directPresent WRITE setDirectPresent NOTIFY settingsChanged)
     Q_PROPERTY(bool dlssgLiteAvailable READ dlssgLiteAvailable CONSTANT)
     Q_PROPERTY(QString dlssgLiteHint READ dlssgLiteHint NOTIFY snapshotChanged)
     Q_PROPERTY(int contentRate READ contentRate WRITE setContentRate NOTIFY settingsChanged)
@@ -667,6 +731,14 @@ class QmlPlayerBridge : public QObject {
 public:
     QObject* playlist() const;
     Q_INVOKABLE void showPlaylist();
+    // 视频直出: the frame-rate HUD as an image the present blit draws over the
+    // picture (engine/VideoOverlay.h). x/y are output pixels; an empty image
+    // takes it off. See Main.qml's hudOverlayTimer.
+    Q_INVOKABLE void updateHudOverlay(const QImage& image, int x, int y);
+    // 视频直出: redraws the frame-rate HUD bitmap the present blit draws over the
+    // picture (hudCorner/hudScale/hudItems/hudOffsetY). Called by hudOverlayTimer.
+    void refreshHudOverlay();
+    bool hudOverlayShown_ = false;
     Q_INVOKABLE void addPlaylistFilesDialog();
     Q_INVOKABLE void addPlaylistFolderDialog();
     Q_INVOKABLE void openDroppedUrls(const QList<QUrl>& urls);
@@ -762,6 +834,17 @@ public:
     bool captureForceSdr() const;
     bool captureMagewellDevice() const;
     QString captureMagewellStatus() const;
+    bool captureAverPcieDevice() const;
+    double captureDriverAgeP50Ms() const;
+    double captureDriverAgeP95Ms() const;
+    double captureToPresentP50Ms() const;
+    double captureToPresentP95Ms() const;
+    double displayScanoutP50Ms() const;
+    double displayScanoutP95Ms() const;
+    bool presentMonKnown() const;
+    double presentMonP50Ms() const;
+    double presentMonP95Ms() const;
+    double presentMonBetweenMs() const;
     void setCaptureForceSdr(bool value);
     bool captureFlipVertical() const;
     void setCaptureFlipVertical(bool value);
@@ -837,9 +920,27 @@ public:
     Q_INVOKABLE void toggleSubtitles();
     Q_INVOKABLE void autoAlignSubtitle();
 
+    // 游戏模式: published state and the geometry the native side watches.
+    bool gameMode() const;
+    bool passthroughActive() const;
+    bool gameInputActive() const;
+    bool gameScaledPreview() const;
+    QRectF gameVideoRect() const;
+    // Window handles the native side watches (game mode, PS5 mouse capture).
+    void attachMainWindow(qulonglong nativeHandle);
+    Q_INVOKABLE void updateGameGeometry();
+    Q_INVOKABLE void setGamePanelOpen(bool open);
+    Q_INVOKABLE int gameModeScreenIndex() const;
+    Q_INVOKABLE void testBlockUi(int ms);
+    // Native game-mode state machine and the hotkey hook installation.
+    void updateGameMode();
+    void applyGameHotkeys();
+
     QVariantMap ps5() const;
     QVariantList ps5Profiles() const;
     QVariantMap ps5Control() const;
+    QVariantMap ps5Pad() const;
+    QVariantMap ps5Kbm() const;
     QObject* moonlightModel() const;
     bool moonlightCaptured() const;
     bool moonlightStatsVisible() const;
@@ -865,6 +966,11 @@ public:
     // key: enabled | background (saved preferences ps5CaptureControl / ps5ControlBackground).
     Q_INVOKABLE void ps5ControlSet(const QString& key, const QVariant& value);
     Q_INVOKABLE void ps5ControlRestart();
+    // `key` is a PS5 button name (cross…ps) with a physical-button source, or one of
+    // touchModifier/touchClick/touchPS/touchStick/controllerType. Empty source = default.
+    Q_INVOKABLE bool ps5PadSet(const QString& key, const QString& value);
+    Q_INVOKABLE void ps5PadReset();
+    Q_INVOKABLE bool ps5KbmSet(const QString& key, const QVariant& value);
     QString remotePlayHost() const;
     void setRemotePlayHost(const QString& value);
     QString remotePlayPin() const;
@@ -1191,6 +1297,12 @@ public:
     void setHudProtect(int value);
     bool dynamicHud() const;
     void setDynamicHud(bool value);
+    bool fgLowLatencyPresent() const;
+    void setFgLowLatencyPresent(bool value);
+    bool fgSkipRepeats() const;
+    void setFgSkipRepeats(bool value);
+    bool directPresent() const;
+    void setDirectPresent(bool value);
     bool dlssgLiteAvailable() const;
     QString dlssgLiteHint() const;
     int contentRate() const;
@@ -1401,6 +1513,7 @@ public:
     Q_INVOKABLE void openScreenCaptureDialog();
     Q_INVOKABLE void openAudioDialog();
     Q_INVOKABLE void openSubtitleDialog();
+    Q_INVOKABLE void openHudDialog();
     Q_INVOKABLE void togglePlayPause();
     Q_INVOKABLE void stopPlayback();
     Q_INVOKABLE void seekTo(double seconds);
@@ -1430,6 +1543,9 @@ public:
     void pollVirtualCamera();
     Q_INVOKABLE void stopRecording(const QString& source = QString());
     Q_INVOKABLE void toggleRecording(const QString& source = QString());
+    // 区域录制: the overlay hands the dragged rectangle back in monitor pixels,
+    // then the take starts with it.
+    Q_INVOKABLE void setRecordRegion(int x,int y,int w,int h);
     Q_INVOKABLE void chooseRecordingDirectory();
     Q_INVOKABLE void openRecordingDirectory();
     // Writes what the replay buffer holds now (source as for recording).
@@ -1443,10 +1559,29 @@ public:
     int recordingFpsLimit() const;
     bool recordingHevc() const;
     bool recordingAudio() const;
+    bool recordingUi() const;
+    bool recordingFullscreen() const;
+    bool recordingRegion() const;
+    int recordRegionW() const;
     bool recordingMicrophone() const;
     QString recordingMicrophoneId() const;
     bool recordingMicrophoneTrack() const;
     QVariantList microphoneDevices() const;
+    // 声音自检: start/stop the meters; the values above are refreshed while it runs.
+    Q_INVOKABLE void startAudioTest();
+    Q_INVOKABLE void stopAudioTest();
+    // Records five seconds of the rendered sound mixed with the microphone and
+    // plays it back with the system player, so the audio settings can be heard
+    // rather than guessed from a meter.
+    Q_INVOKABLE void recordAudioSample();
+    Q_INVOKABLE void playAudioSample();
+    bool audioTestRecording() const;
+    QString audioTestSamplePath() const;
+    bool audioTestRunning() const;
+    double audioTestGameDb() const;
+    double audioTestMicDb() const;
+    bool audioTestMicOpen() const;
+    QString audioTestMicStatus() const;
     bool replayEnabled() const;
     int replaySeconds() const;
     QVariantMap replayState() const;
@@ -1531,7 +1666,12 @@ signals:
     void playlistRequested();
     void nodeAnchorsChanged();
     void ps5Changed();
+    void gameModeChanged();
+    void gameHotkey(int which);
+    void gameModeStopped(const QString& reason);
     void ps5ControlChanged();
+    void ps5PadChanged();
+    void ps5KbmChanged();
     void moonlightUiChanged();
     void imageBatchChanged();
     void audioDevicesChanged();
@@ -1539,6 +1679,10 @@ signals:
     void subtitleTextChanged();
     void preferencesChanged();
     void recordingChanged();
+    // 区域录制: the interface shows its selection overlay, then calls
+    // setRecordRegion() and startRecording() again.
+    void requestRegionSelection();
+    void audioTestChanged();
     void virtualCameraChanged();
     void replayChanged();
     void microphoneDevicesChanged();
@@ -1639,6 +1783,8 @@ private:
     void tickCapture();
     void tickPs5();
     void tickPs5Control(bool force = false);
+    void applyPadMap();
+    void applyKbmPrefs();
     // restart: replace a running session (another pairing, or the user asked).
     void startPs5Control(bool restart);
     void stopPs5Control();

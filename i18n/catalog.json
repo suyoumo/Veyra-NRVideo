@@ -1821,6 +1821,19 @@
    "ru": "AV1 нужен хост GPU, который может кодировать его, и локальный GPU, который может декодировать его."
   },
   {
+   "zh": "AVerMedia 低延迟模式",
+   "src": "qml/CaptureSourceDialog.qml",
+   "zh-TW": "AVerMedia 低延遲模式",
+   "en": "AVerMedia low-latency mode",
+   "ja": "AVerMedia 低遅延モード",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "Apex Neural Rendering · 2X～6X · 视频估算输入，效果与速度以实际运行结果为准",
    "src": "src/ui/bridge/FrameGeneration.cpp",
    "zh-TW": "Apex Neural Rendering · 2X～6X · 影片估算輸入，效果與速度以實際執行結果為準",
@@ -3093,6 +3106,19 @@
    "de": "Auto HUD Sperre · konnte nicht starten",
    "pt-BR": "Auto bloqueio HUD · não foi possível iniciar",
    "ru": "Auto HUD-блокировка не может быть запущена"
+  },
+  {
+   "zh": "HUD 贴顶时会挡住游戏自己的界面；往下挪一截，数值仍然实时刷新",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "HUD 貼頂時會擋住遊戲自己的介面；往下挪一截，數值仍然即時刷新",
+   "en": "Against the top edge the HUD covers the game's own interface; move it down a little, the numbers still refresh live",
+   "ja": "上端に貼り付くとゲーム自身の UI を隠します。少し下げても数値はリアルタイムに更新されます",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "IP 或主机名，端口不是 47989 时写成 192.168.1.20:47989",
@@ -5552,6 +5578,19 @@
    "ru": "Xbox Восстановление"
   },
   {
+   "zh": "Xbox 手柄没有触控板：打开后按住 Share，推右摇杆＝触控板滑动，按 Options＝触控板点击，按 Y＝PS 键（手柄自带的 Xbox 键也能当 PS 键，但会唤起电脑上的 Game Bar 并短暂占用手柄）。手势期间 Share 不会传给游戏；接真 DualSense 时自动用真实触控板",
+   "src": "qml/CaptureSourceDialog.qml",
+   "zh-TW": "Xbox 手把沒有觸控板：開啟後按住 Share，推右搖桿＝觸控板滑動，按 Options＝觸控板點擊，按 Y＝PS 鍵（手把自帶的 Xbox 鍵也能當 PS 鍵，但會喚起電腦上的 Game Bar 並短暫佔用手把）。手勢期間 Share 不會傳給遊戲；接真 DualSense 時自動用真實觸控板",
+   "en": "Xbox pads have no touchpad: when on, hold Share and move the right stick as the touch surface, press Options for a touchpad click, press Y for the PS button (the pad's own Xbox button works as PS too, but it wakes Xbox Game Bar on the PC, which takes the pad for a moment). Share is not forwarded while a gesture runs; a real DualSense always uses its own touchpad",
+   "ja": "Xbox コントローラーにはタッチパッドがありません。オンにすると、Share を押しながら右スティックでタッチ操作、Options でタッチパッドクリック、Y で PS ボタンになります（コントローラー自身の Xbox ボタンも PS として使えますが、PC の Xbox Game Bar が起動して一瞬コントローラーを奪われます）。ジェスチャー中は Share はゲームに送られません。本物の DualSense 接続時は実機のタッチパッドを使用します",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "Xbox 服务结束了串流（",
    "src": "src/source/XboxSessionSource.cpp",
    "zh-TW": "Xbox 服務結束了串流（",
@@ -6135,6 +6174,32 @@
    "de": "Vorheriger Eintrag",
    "pt-BR": "Item anterior",
    "ru": "Предыдущий элемент"
+  },
+  {
+   "zh": "上屏总延迟",
+   "src": "qml/Main.qml",
+   "zh-TW": "上屏總延遲",
+   "en": "Total on-screen latency",
+   "ja": "画面表示までの合計遅延",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "上屏等待",
+   "src": "qml/Main.qml",
+   "zh-TW": "上屏等待",
+   "en": "On-screen wait",
+   "ja": "表示待ち",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "上次",
@@ -7918,6 +7983,19 @@
    "ru": "Обнаружение лица · общие для всех узлов красоты"
   },
   {
+   "zh": "仅 AVerMedia PCIe 卡（GC573/Live Gamer 4K 等）可用",
+   "src": "qml/CaptureSourceDialog.qml",
+   "zh-TW": "僅 AVerMedia PCIe 卡（GC573/Live Gamer 4K 等）可用",
+   "en": "AVerMedia PCIe cards only (GC573/Live Gamer 4K and similar)",
+   "ja": "AVerMedia PCIe カード専用（GC573/Live Gamer 4K など）",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "仅为当前软件路径配置窗口和全屏 G-SYNC，可恢复原设置；显示器和驱动的 G-SYNC 总开关仍需开启。",
    "src": "src/ui/NvidiaVrrProfileController.cpp",
    "zh-TW": "僅為目前軟體路徑設定視窗和全螢幕 G-SYNC，可還原原設定；顯示器和驅動程式的 G-SYNC 總開關仍需開啟。",
@@ -9180,7 +9258,7 @@
   },
   {
    "zh": "全屏",
-   "src": "qml/SettingsPage.qml",
+   "src": "qml/ProPage.qml",
    "zh-TW": "全螢幕",
    "en": "Fullscreen",
    "ja": "全画面",
@@ -11050,6 +11128,17 @@
    "de": "Oberer Rand des Bereichs",
    "pt-BR": "Borda superior da área",
    "ru": "Верхний край области"
+   "zh": "区域",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "區域",
+   "en": "Region",
+   "ja": "範囲",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "区域内恢复原始画面与帧率",
@@ -11232,6 +11321,19 @@
    "de": "Ins Bild klicken",
    "pt-BR": "Clique na imagem",
    "ru": "Щёлкните по изображению"
+  },
+  {
+   "zh": "单声道",
+   "src": "src/ui/QmlPlayerBridge.cpp",
+   "zh-TW": "單聲道",
+   "en": "Mono",
+   "ja": "モノラル",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "单层",
@@ -12807,6 +12909,19 @@
    "ru": "Нет"
   },
   {
+   "zh": "含界面",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "含介面",
+   "en": "With interface",
+   "ja": "インターフェース込み",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "启动与窗口",
    "src": "qml/SettingsPage.qml",
    "zh-TW": "啟動與視窗",
@@ -14159,6 +14274,19 @@
    "ru": "Аудиосинхронизация, объем и выходное устройство."
   },
   {
+   "zh": "声音自检",
+   "src": "qml/Main.qml",
+   "zh-TW": "聲音自檢",
+   "en": "Sound check",
+   "ja": "サウンドチェック",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "处理 CPU P95: %1 ms",
    "src": "src/ui/bridge/Export.cpp",
    "zh-TW": "處理 CPU P95: %1 ms",
@@ -14199,7 +14327,7 @@
   },
   {
    "zh": "处理耗时",
-   "src": "qml/ProPerfOrbs.qml",
+   "src": "qml/Main.qml",
    "zh-TW": "處理耗時",
    "en": "Processing time",
    "ja": "処理時間",
@@ -17669,6 +17797,19 @@
    "ru": "VB-CABLE уже установлен"
   },
   {
+   "zh": "已检测到带触控板的手柄，直接使用真实触控板；此开关只在没有触控板的手柄上生效",
+   "src": "qml/CaptureSourceDialog.qml",
+   "zh-TW": "已偵測到帶觸控板的手柄，直接使用真實觸控板；此開關只在沒有觸控板的手柄上生效",
+   "en": "A controller with a touchpad is connected; its real touchpad is used. This switch only applies to pads without one",
+   "ja": "タッチパッド付きのコントローラーを検出したため、実機のタッチパッドを使用します。このスイッチはタッチパッドのないコントローラーにのみ有効です",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "已添加 %1 项 · 列表共 %2 项",
    "src": "src/ui/PlaylistModel.cpp",
    "zh-TW": "已新增 %1 項 · 清單共 %2 項",
@@ -18150,6 +18291,32 @@
    "ru": "Ограничение частоты кадров"
   },
   {
+   "zh": "帧率与延迟 HUD 下移",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "幀率與延遲 HUD 下移",
+   "en": "Frame rate and latency HUD offset",
+   "ja": "フレームレートと遅延 HUD の下げ幅",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "帧率与延迟 HUD：关 / 左上 / 右上",
+   "src": "qml/CineBar.qml",
+   "zh-TW": "幀率與延遲 HUD：關 / 左上 / 右上",
+   "en": "Frame rate and latency HUD: off / top left / top right",
+   "ja": "フレームレートと遅延 HUD：オフ / 左上 / 右上",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "帧率与节奏",
    "src": "qml/ProPage.qml",
    "zh-TW": "幀率與節奏",
@@ -18475,6 +18642,19 @@
    "ru": "Новая модель B. Off: унаследованная модель A. Переключение перестраивает NR и может изменить картину."
   },
   {
+   "zh": "开启后录制整个 Veyra 窗口（画面 + 顶栏、右侧面板、HUD）；关闭只录处理后的干净画面",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "開啟後錄製整個 Veyra 視窗（畫面 + 頂欄、右側面板、HUD）；關閉只錄處理後的乾淨畫面",
+   "en": "Record the whole Veyra window (picture plus top bar, right panel and HUD); off records only the clean processed picture",
+   "ja": "Veyra のウィンドウ全体（映像＋上部バー、右パネル、HUD）を録画します。オフのときは処理後のクリーンな映像だけを録画します",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "开启后麦克风在第 2 条音轨，剪辑时可单独调整；普通播放器通常只播放第 1 条",
    "src": "qml/SettingsPage.qml",
    "zh-TW": "開啟後麥克風在第 2 條音軌，剪輯時可單獨調整；一般播放器通常只播放第 1 條",
@@ -18642,6 +18822,19 @@
    "de": "Einschalten",
    "pt-BR": "Energia ligada",
    "ru": "Включи питание"
+  },
+  {
+   "zh": "引擎延迟",
+   "src": "qml/Main.qml",
+   "zh-TW": "引擎延遲",
+   "en": "Engine latency",
+   "ja": "エンジン遅延",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "引擎异常，请查看诊断",
@@ -19515,6 +19708,19 @@
    "ru": "Не адаптер NVIDIA: NR, супер разрешение NVIDIA и DLSS отключены; XeSS предварительный просмотр и оптический поток AMD доступны"
   },
   {
+   "zh": "录 5 秒",
+   "src": "qml/Main.qml",
+   "zh-TW": "錄 5 秒",
+   "en": "Record 5 s",
+   "ja": "5 秒録音",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "录入所选音频输入，不受音量、静音和本机音频监听开关影响；采集卡需选择音频输入",
    "src": "qml/SettingsPage.qml",
    "zh-TW": "錄入所選音訊輸入，不受音量、靜音和本機音訊監聽開關影響；擷取卡需選擇音訊輸入",
@@ -19552,6 +19758,19 @@
    "de": "Datensatz in %1 s",
    "pt-BR": "Registo em %1 s",
    "ru": "Запись в %1 с"
+  },
+  {
+   "zh": "录制中…",
+   "src": "qml/Main.qml",
+   "zh-TW": "錄製中…",
+   "en": "Recording…",
+   "ja": "録音中…",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "录制保存位置",
@@ -19630,6 +19849,19 @@
    "de": "Aufzeichnung gespeichert: %1 (%2)",
    "pt-BR": "Gravação gravada: %1 (%2)",
    "ru": "Запись сохранена: %1 (%2)"
+  },
+  {
+   "zh": "录制已停止",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "錄製已停止",
+   "en": "Recording stopped",
+   "ja": "録画は停止しました",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "录制已在进行中",
@@ -19721,6 +19953,32 @@
    "de": "Aufzeichnungsrahmen-Rücklesezeit abgelaufen",
    "pt-BR": "A gravação do frame readback cronometrado",
    "ru": "Запись кадров с обратным зачетом времени"
+  },
+  {
+   "zh": "录制界面",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "錄製介面",
+   "en": "Record interface",
+   "ja": "インターフェースも録画",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "录制界面需要 Veyra 的主窗口",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "錄製介面需要 Veyra 的主視窗",
+   "en": "Recording the interface needs Veyra's main window",
+   "ja": "インターフェース録画には Veyra のメインウィンドウが必要です",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "录制目录不存在：%1",
@@ -21257,6 +21515,19 @@
    "ru": "Перетащите края или переместите рамку обрезки · %1 × %2"
   },
   {
+   "zh": "拖动鼠标选择录制区域（Esc 取消）",
+   "src": "qml/RegionSelect.qml",
+   "zh-TW": "拖曳滑鼠選擇錄製區域（Esc 取消）",
+   "en": "Drag the mouse to choose the recording area (Esc to cancel)",
+   "ja": "マウスをドラッグして録画範囲を選択（Esc でキャンセル）",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "按下新按键…",
    "src": "qml/SettingsPage.qml",
    "zh-TW": "按下新按鍵…",
@@ -21934,6 +22205,19 @@
    "ru": "Воспроизведение закончилось, запись сохранена"
   },
   {
+   "zh": "播放录音",
+   "src": "qml/Main.qml",
+   "zh-TW": "播放錄音",
+   "en": "Play it back",
+   "ja": "録音を再生",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "播放或连接片源后开始翻译",
    "src": "src/ui/LiveAsr.cpp",
    "zh-TW": "播放或連接片源後開始翻譯",
@@ -21997,6 +22281,32 @@
    "de": "Wiedergabeleiste ausgeblendet · Zeiger nach oben bewegen und auf das Auge im Dock klicken, um sie zurückzuholen",
    "pt-BR": "Barra de reprodução oculta · leve o ponteiro ao topo e clique no olho do dock para trazê-la de volta",
    "ru": "Панель воспроизведения скрыта · наведите указатель наверх и нажмите на глаз в доке, чтобы вернуть её"
+  },
+  {
+   "zh": "播放游戏声音并说话，点「录 5 秒」；录完点「播放录音」听到的就是实际录制的内容。麦克风打不开时上面会写原因。",
+   "src": "qml/Main.qml",
+   "zh-TW": "播放遊戲聲音並說話，點「錄 5 秒」；錄完點「播放錄音」聽到的就是實際錄製的內容。麥克風打不開時上面會寫原因。",
+   "en": "Play the game and talk, then press record; what you hear on playback is exactly what a take would contain. A microphone that cannot be opened says why above.",
+   "ja": "ゲーム音を鳴らして話しながら録音してください。再生で聴こえる内容がそのまま実際の録画に入ります。マイクを開けない場合は上に理由が出ます。",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "播放设备的格式不支持系统声音回环",
+   "src": "src/engine/SystemAudioLoopback.cpp",
+   "zh-TW": "播放裝置的格式不支援系統聲音回環",
+   "en": "The playback device's format does not support system-audio loopback",
+   "ja": "再生デバイスの形式がシステム音のループバックに対応していません",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "播放速度",
@@ -23479,6 +23789,19 @@
    "de": "Fahrereinstellungen können nicht geöffnet werden. Trennen Sie die Erfassung und schließen Sie Anwendungen zuerst mit dem Gerät.",
    "pt-BR": "Não foi possível abrir as configurações do driver. Desconecte primeiro a captura e feche as aplicações usando o dispositivo.",
    "ru": "Невозможно открыть настройки драйвера. Сначала отключите захват и закройте приложения с помощью устройства."
+  },
+  {
+   "zh": "无法播放录音：%1",
+   "src": "src/ui/bridge/Recording.cpp",
+   "zh-TW": "無法播放錄音：%1",
+   "en": "Cannot play the sample: %1",
+   "ja": "録音を再生できません：%1",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "无法映射导出通信资源",
@@ -26224,6 +26547,32 @@
    "ru": "Не удалось проверить обновления. Проверьте свою связь и попробуйте еще раз."
   },
   {
+   "zh": "检测",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "檢測",
+   "en": "Check",
+   "ja": "チェック",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "检测中",
+   "src": "qml/Main.qml",
+   "zh-TW": "檢測中",
+   "en": "Checking",
+   "ja": "チェック中",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "检测到 %1",
    "src": "qml/Main.qml",
    "zh-TW": "偵測到 %1",
@@ -26586,6 +26935,19 @@
    "de": "Konfiguration im ungültigen Modus; nicht geschaltet",
    "pt-BR": "Configuração do modo inválida; não comutada",
    "ru": "Недействительная конфигурация режима; не переключается"
+  },
+  {
+   "zh": "模拟触控板",
+   "src": "qml/CaptureSourceDialog.qml",
+   "zh-TW": "模擬觸控板",
+   "en": "Emulated touchpad",
+   "ja": "タッチパッドを模擬",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "橙色",
@@ -27067,6 +27429,19 @@
    "de": "Aufnahmegerät wird geöffnet…",
    "pt-BR": "Abrindo o dispositivo de captura…",
    "ru": "Открытие устройства захвата…"
+  },
+  {
+   "zh": "正在打开麦克风…",
+   "src": "src/ui/bridge/Recording.cpp",
+   "zh-TW": "正在開啟麥克風…",
+   "en": "Opening the microphone…",
+   "ja": "マイクを開いています…",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "正在扫描文件夹…",
@@ -27927,6 +28302,19 @@
    "ru": "Содержание субтитров отсутствует"
   },
   {
+   "zh": "没有可用的播放设备，无法录制系统声音",
+   "src": "src/engine/SystemAudioLoopback.cpp",
+   "zh-TW": "沒有可用的播放裝置，無法錄製系統聲音",
+   "en": "No playback device is available, so the system sound cannot be recorded",
+   "ja": "再生デバイスがないため、システム音を録音できません",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "没有可用的美乐威运行库（",
    "src": "src/source/MagewellCapture.cpp",
    "zh-TW": "沒有可用的美樂威執行庫（",
@@ -27951,6 +28339,19 @@
    "de": "Kein Video-Encoder verfügbar",
    "pt-BR": "Nenhum codificador de vídeo disponível",
    "ru": "Видеокодер недоступен"
+  },
+  {
+   "zh": "没有录到声音：请确认正在播放并且麦克风已打开",
+   "src": "src/ui/bridge/Recording.cpp",
+   "zh-TW": "沒有錄到聲音：請確認正在播放並且麥克風已開啟",
+   "en": "Nothing was captured: make sure something is playing and the microphone is on",
+   "ja": "音が録れていません：再生中か、マイクが有効か確認してください",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "没有录到画面，未保存文件",
@@ -28445,6 +28846,123 @@
    "de": "GamePP",
    "pt-BR": "GamePP",
    "ru": "Игровой автомат"
+  },
+  {
+   "zh": "游戏声音",
+   "src": "qml/Main.qml",
+   "zh-TW": "遊戲聲音",
+   "en": "Game sound",
+   "ja": "ゲーム音",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "游戏模式",
+   "src": "qml/ScreenSourceDialog.qml",
+   "zh-TW": "遊戲模式",
+   "en": "Game mode",
+   "ja": "ゲームモード",
+   "ko": "게임 모드",
+   "es": "Modo juego",
+   "fr": "Mode jeu",
+   "de": "Spielmodus",
+   "pt-BR": "Modo jogo",
+   "ru": "Игровой режим"
+  },
+  {
+   "zh": "游戏模式下在游戏里也能用",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "遊戲模式下在遊戲裡也能用",
+   "en": "Also works inside the game in game mode",
+   "ja": "ゲームモード中はゲーム内でも使えます",
+   "ko": "게임 모드의 게임 내부에서도 작동합니다.",
+   "es": "También funciona dentro del juego en modo de juego",
+   "fr": "Fonctionne également dans le jeu en mode jeu",
+   "de": "Funktioniert auch im Spielmodus",
+   "pt-BR": "Também funciona dentro do jogo em modo de jogo",
+   "ru": "Также работает внутри игры в игровом режиме"
+  },
+  {
+   "zh": "游戏模式不裁剪；贴合原窗口时画面与鼠标位置一一对应",
+   "src": "qml/ScreenSourceDialog.qml",
+   "zh-TW": "遊戲模式不裁剪；貼合原視窗時畫面與滑鼠位置一一對應",
+   "en": "Game mode does not crop the source. Original-window alignment preserves exact mouse positions.",
+   "ja": "ゲームモードではソースを切り抜きません。元のウィンドウに合わせると映像とマウス位置が一致します。",
+   "ko": "게임 모드에서는 영상을 자르지 않습니다. 원본 창 정렬을 사용하면 마우스 위치를 정확히 전달할 수 있습니다.",
+   "es": "El modo de juego no recorta la fuente. La alineación de la ventana original preserva las posiciones exactas del ratón.",
+   "fr": "Le mode jeu ne recoupe pas la source. L'alignement original de la fenêtre préserve les positions exactes de la souris.",
+   "de": "Der Spielmodus beschneidet die Quelle nicht. Original-Fenster-Ausrichtung behält genaue Mauspositionen.",
+   "pt-BR": "O modo de jogo não corta a fonte. O alinhamento da janela original preserva as posições exatas do mouse.",
+   "ru": "Режим игры не обрабатывает источник. Оригинальное выравнивание окон сохраняет точные положения мыши."
+  },
+  {
+   "zh": "游戏模式用真实指针，画面里不再画一个",
+   "src": "qml/ScreenSourceDialog.qml",
+   "zh-TW": "遊戲模式使用真實指標，畫面裡不再畫一個",
+   "en": "Game mode uses the real pointer, so the picture does not draw a second one",
+   "ja": "ゲームモードでは実際のポインターを使い、映像には描きません",
+   "ko": "게임 모드는 실제 마우스 포인터를 사용하므로 영상 안에 포인터를 따로 그리지 않습니다.",
+   "es": "El modo de juego utiliza el puntero real, por lo que la imagen no dibuja un segundo",
+   "fr": "Mode jeu utilise le pointeur réel, de sorte que l'image ne dessine pas un second",
+   "de": "Der Spielmodus verwendet den echten Zeiger, so dass das Bild keinen zweiten zeichnet",
+   "pt-BR": "O modo de jogo usa o ponteiro real, para que a imagem não desenhe uma segunda",
+   "ru": "Режим игры использует реальный указатель, поэтому картинка не рисует второй"
+  },
+  {
+   "zh": "游戏模式键盘监听不可用，已退出鼠标穿透；请退出全屏后重试",
+   "src": "src/ui/QmlPlayerBridge.cpp",
+   "zh-TW": "遊戲模式鍵盤監聽無法使用，已退出滑鼠穿透；請退出全螢幕後重試",
+   "en": "Game-mode keyboard listener is unavailable. Mouse passthrough has been released; leave fullscreen and retry.",
+   "ja": "ゲームモードのキーボード監視を利用できません。マウス透過を解除しました。全画面を終了して再試行してください。",
+   "ko": "게임 모드의 키보드 입력 처리를 사용할 수 없어 마우스 전달을 해제했습니다. 전체 화면을 종료한 뒤 다시 시도하세요.",
+   "es": "El oyente del teclado de modo de juego no está disponible. Mouse passthrough ha sido liberado; dejar pantalla completa y reingresar.",
+   "fr": "L'auditeur du clavier en mode jeu n'est pas disponible. La transmission de la souris a été relâchée; laissez l'écran complet et réessayer.",
+   "de": "Der Keyboard-Hörer im Spielmodus ist nicht verfügbar. Mausdurchgang wurde freigegeben; lassen Sie Vollbild und versuchen Sie es erneut.",
+   "pt-BR": "O ouvinte de teclado em modo de jogo está indisponível. A passagem do mouse foi liberada; deixe a tela cheia e tente novamente.",
+   "ru": "Прослушиватель клавиатуры в игровом режиме недоступен. Пропуск мыши был выпущен; оставьте полный экран и повторите."
+  },
+  {
+   "zh": "游戏模式需要窗口和 Veyra 在同一个虚拟桌面：请把窗口移到当前桌面，或关闭游戏模式后直接捕获",
+   "src": "qml/ScreenSourceDialog.qml",
+   "zh-TW": "遊戲模式需要視窗和 Veyra 在同一個虛擬桌面：請把視窗移到目前桌面，或關閉遊戲模式後直接擷取",
+   "en": "Game mode needs the window on the same virtual desktop as Veyra: move the window to the current desktop, or turn game mode off and capture it directly",
+   "ja": "ゲームモードではウィンドウと Veyra が同じ仮想デスクトップにある必要があります。ウィンドウを現在のデスクトップに移すか、ゲームモードをオフにしてそのままキャプチャーしてください",
+   "ko": "게임 모드를 사용하려면 창과 Veyra가 같은 가상 데스크톱에 있어야 합니다. 창을 현재 데스크톱으로 옮기거나, 게임 모드를 끄고 바로 캡처하세요.",
+   "es": "El modo de juego necesita la ventana en el mismo escritorio virtual que Veyra: mover la ventana al escritorio actual, o apagar el modo de juego y capturarlo directamente",
+   "fr": "Le mode de jeu a besoin de la fenêtre sur le même bureau virtuel que Veyra : déplacez la fenêtre sur le bureau actuel, ou éteignez le mode de jeu et capturez-le directement",
+   "de": "Der Spielmodus benötigt das Fenster auf dem gleichen virtuellen Desktop wie Veyra: Bewegen Sie das Fenster auf den aktuellen Desktop oder schalten Sie den Spielmodus aus und erfassen Sie es direkt",
+   "pt-BR": "O modo de jogo precisa da janela na mesma área de trabalho virtual que o Veyra: mova a janela para a área de trabalho actual ou desligue o modo de jogo e capture- a directamente",
+   "ru": "Игровой режим нуждается в окне на том же виртуальном рабочем столе, что и Veyra: переместите окно на текущий рабочий стол или выключите игровой режим и захватите его напрямую."
+  },
+  {
+   "zh": "游戏模式：调整画面",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "遊戲模式：調整畫面",
+   "en": "Game mode: adjust picture",
+   "ja": "ゲームモード：画面調整",
+   "ko": "게임 모드: 화면 조절",
+   "es": "Modo juego: ajustar imagen",
+   "fr": "Mode jeu : ajuster l'image",
+   "de": "Spielmodus: Bild anpassen",
+   "pt-BR": "Modo jogo: ajustar imagem",
+   "ru": "Игровой режим: настройка изображения"
+  },
+  {
+   "zh": "游戏模式：退出鼠标穿透",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "遊戲模式：退出滑鼠穿透",
+   "en": "Game mode: exit mouse passthrough",
+   "ja": "ゲームモード：マウス透過を解除",
+   "ko": "게임 모드: 마우스 전달 해제",
+   "es": "Modo de juego: paso del ratón de salida",
+   "fr": "Mode jeu: sortie de la souris passthrough",
+   "de": "Spielmodus: Exit Maus Passthrough",
+   "pt-BR": "Modo de jogo: saída da passagem do rato",
+   "ru": "Режим игры: exit mouse passthrough"
   },
   {
    "zh": "源 %1 fps",
@@ -29396,6 +29914,110 @@
    "ru": "Интерфейс всегда опирается на GPU; РТСС OSD не показан в Veyra; с NVIDIAвнутриигровая оверлей или работа GamePP, Veyra может замерзнуть"
   },
   {
+   "zh": "界面录制启动超时",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "介面錄製啟動逾時",
+   "en": "Interface recording did not start in time",
+   "ja": "インターフェース録画の開始がタイムアウトしました",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "界面录制失败 0x{:08X}：{}",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "介面錄製失敗 0x{:08X}：{}",
+   "en": "Interface recording failed 0x{:08X}: {}",
+   "ja": "インターフェース録画に失敗しました 0x{:08X}：{}",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "界面录制失败：资源分配错误",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "介面錄製失敗：資源配置錯誤",
+   "en": "Interface recording failed: could not allocate its resources",
+   "ja": "インターフェース録画に失敗しました：リソースを確保できません",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "界面录制已停止",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "介面錄製已停止",
+   "en": "Interface recording stopped",
+   "ja": "インターフェース録画は停止しました",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "界面录制已在进行中",
+   "src": "src/engine/EngineController.cpp",
+   "zh-TW": "介面錄製已在進行中",
+   "en": "Interface recording is already running",
+   "ja": "インターフェース録画はすでに実行中です",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "界面录制无法建立共享纹理",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "介面錄製無法建立共享紋理",
+   "en": "Interface recording could not create its shared texture",
+   "ja": "インターフェース録画の共有テクスチャを作成できません",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "界面录制无法建立同步事件",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "介面錄製無法建立同步事件",
+   "en": "Interface recording could not create its sync event",
+   "ja": "インターフェース録画の同期イベントを作成できません",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
+   "zh": "界面录制无法建立抓屏",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "介面錄製無法建立抓屏",
+   "en": "Interface recording could not open the screen capture",
+   "ja": "インターフェース録画の画面キャプチャを開けません",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "界面状态写入失败",
    "src": "src/ui/PlayerUiFacade.cpp",
    "zh-TW": "介面狀態寫入失敗",
@@ -29852,7 +30474,7 @@
   },
   {
    "zh": "直播",
-   "src": "src/ui/bridge/Playback.cpp",
+   "src": "qml/ProPage.qml",
    "zh-TW": "直播",
    "en": "Live",
    "ja": "ライブ",
@@ -29862,6 +30484,19 @@
    "de": "Live",
    "pt-BR": "Ao vivo",
    "ru": "Прямой эфир"
+  },
+  {
+   "zh": "直播中",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "直播中",
+   "en": "Live now",
+   "ja": "配信中",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "直播兼容模式未能启用，已恢复",
@@ -29901,6 +30536,19 @@
    "de": "Zeitversetzte Wiedergabe",
    "pt-BR": "Controle de tempo da transmissão",
    "ru": "Отложенный просмотр эфира"
+  },
+  {
+   "zh": "直播模式：全屏干净画面，界面不再出现；Esc 退出",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "直播模式：全屏乾淨畫面，介面不再出現；Esc 退出",
+   "en": "Live mode: fullscreen clean picture with the interface hidden; Esc leaves it",
+   "ja": "ライブモード：全画面のクリーンな映像のみ、インターフェースは表示されません。Esc で終了",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "直播画面节奏",
@@ -30345,6 +30993,19 @@
    "ru": "Окно находится на другом виртуальном рабочем столе и пока не имеет новой картинки: некоторые программы (такие как Chrome и Edge) перестают рисовать, пока их рабочий стол не показан."
   },
   {
+   "zh": "窗口太小，无法录制界面",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "視窗太小，無法錄製介面",
+   "en": "The window is too small to record the interface",
+   "ja": "ウィンドウが小さすぎるためインターフェースを録画できません",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "窗口小于裁剪范围，等待尺寸恢复",
    "src": "src/source/ScreenCaptureSource.cpp",
    "zh-TW": "視窗小於裁剪範圍，等待尺寸恢復",
@@ -30369,6 +31030,19 @@
    "de": "Das Fenster war geschlossen oder gehört Veyra",
    "pt-BR": "A janela foi fechada ou pertence a Veyra",
    "ru": "Окно было закрыто или принадлежит Veyra"
+  },
+  {
+   "zh": "窗口已关闭，界面录制已停止",
+   "src": "src/engine/WindowCaptureFeeder.cpp",
+   "zh-TW": "視窗已關閉，介面錄製已停止",
+   "en": "The window was closed; interface recording stopped",
+   "ja": "ウィンドウが閉じられたため、インターフェース録画を停止しました",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "窗口已最小化，等待恢复",
@@ -30826,6 +31500,19 @@
    "ru": "GPU Корректировка приоритета недоступна"
   },
   {
+   "zh": "系统声音回环无法打开（0x{:08X}）",
+   "src": "src/engine/SystemAudioLoopback.cpp",
+   "zh-TW": "系統聲音回環無法開啟（0x{:08X}）",
+   "en": "System-audio loopback could not be opened (0x{:08X})",
+   "ja": "システム音のループバックを開けません（0x{:08X}）",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "系统报告：峰值 %1、全屏 %2、黑位 %3 nit",
    "src": "qml/ProDisplayPanel.qml",
    "zh-TW": "系統報告：峰值 %1、全螢幕 %2、黑位 %3 nit",
@@ -31110,6 +31797,19 @@
    "de": "Über %1 (Video) %2 Mbps × %3, Audio extra",
    "pt-BR": "Sobre %1 (vídeo %2 Mbps × %3, áudio extra)",
    "ru": "%1 (видео) %2 Mbps × %3, аудио дополнительно"
+  },
+  {
+   "zh": "纯画面",
+   "src": "qml/ProPage.qml",
+   "zh-TW": "純畫面",
+   "en": "Clean picture",
+   "ja": "クリーン映像",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "纹理",
@@ -33528,6 +34228,19 @@
    "de": "Blau-Primärfarbe",
    "pt-BR": "Primária azul",
    "ru": "Синий основной цвет"
+  },
+  {
+   "zh": "蓝牙耳麦常常比游戏声音低十几 dB，录出来几乎听不见；调高这里让说话声听得清，失真了就调低",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "藍牙耳麥常常比遊戲聲音低十幾 dB，錄出來幾乎聽不見；調高這裡讓說話聲聽得清，失真了就調低",
+   "en": "A Bluetooth headset microphone often sits 15 dB below the game sound and is barely audible in a recording; raise this until your voice is clear, lower it if it distorts",
+   "ja": "Bluetooth ヘッドセットのマイクはゲーム音より 15 dB ほど小さく、録画でほとんど聞こえません。聞き取れるまで上げ、歪む場合は下げてください",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "蓝色",
@@ -37820,6 +38533,19 @@
    "ru": "Пока нечего продолжать"
   },
   {
+   "zh": "还没有录音：先点「录 5 秒」",
+   "src": "src/ui/bridge/Recording.cpp",
+   "zh-TW": "還沒有錄音：先點「錄 5 秒」",
+   "en": "No sample yet: press record first",
+   "ja": "まだ録音がありません：先に録音してください",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "还没有配对的 PS5，先在「PS5 串流」里配对一次",
    "src": "qml/CaptureSourceDialog.qml",
    "zh-TW": "還沒有配對的 PS5，先在「PS5 串流」裡配對一次",
@@ -38351,6 +39077,19 @@
    "de": "Verbinden und Aufnahme starten",
    "pt-BR": "Conecte a fonte e inicie a captura",
    "ru": "Подключите источник и начните захват"
+  },
+  {
+   "zh": "连接时把驱动排队压到 1 帧：输出缓冲建议与接收端要求同时压到 1（覆盖「设备缓冲」设置），砍掉 DMA 完成后到回调之间的在途帧；单缓冲在系统卡顿时可能丢帧。开关后点「连接并开始」重新连接生效；实际效果看日志 capture-buffer 的 actual buffers 与 capture-driver-age",
+   "src": "qml/CaptureSourceDialog.qml",
+   "zh-TW": "連接時把驅動排隊壓到 1 幀：輸出緩衝建議與接收端要求同時壓到 1（覆蓋「設備緩衝」設定），砍掉 DMA 完成後到回調之間的在途幀；單緩衝在系統卡頓時可能丟幀。開關後點「連接並開始」重新連接生效；實際效果看日誌 capture-buffer 的 actual buffers 與 capture-driver-age",
+   "en": "At connect, squeeze the driver queue to one frame: output buffers and the sink request both go to 1 (overriding the device-buffer setting), removing the frames in flight between DMA completion and the callback; a single buffer can drop frames when the system stalls. Toggle it, then press connect-and-start to reconnect; the effect shows in the log lines capture-buffer (actual buffers) and capture-driver-age",
+   "ja": "接続時にドライバーのキューを 1 フレームに絞ります：出力バッファーと受け側の要求を同時に 1 にし（デバイスバッファー設定を上書き）、DMA 完了からコールバックまでの滞留フレームを削ります。単一バッファーではシステムが詰まるとフレームを落とすことがあります。切り替えたあと「接続して開始」で再接続すると有効になります。効果はログの capture-buffer（actual buffers）と capture-driver-age で確認してください",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "连接服务器超时（40 秒内没有完成），请检查地址和网络",
@@ -39274,6 +40013,19 @@
    "de": "Enter eine Capture-Frame-Rate von 1 bis 1000 (Dezimalstellen erlaubt) oder 0 für den Gerätestandard",
    "pt-BR": "Enter uma taxa de captura de 1 a 1000 (decimais permitidos), ou 0 para o dispositivo predefinido",
    "ru": "Enter частота кадров захвата от 1 до 1000 (числа разрешены) или 0 для устройства по умолчанию"
+  },
+  {
+   "zh": "采集延迟",
+   "src": "qml/Main.qml",
+   "zh-TW": "擷取延遲",
+   "en": "Capture latency",
+   "ja": "キャプチャ遅延",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "采集恢复时GPU排空失败",
@@ -42539,6 +43291,19 @@
    "ru": "Более высокое качество занимает больше времени. Смешанные ярусы: средний кадр каждой пары источников использует первую модель, остальные — вторую."
   },
   {
+   "zh": "麦克风",
+   "src": "qml/Main.qml",
+   "zh-TW": "麥克風",
+   "en": "Microphone",
+   "ja": "マイク",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
+  },
+  {
    "zh": "麦克风单独音轨",
    "src": "qml/SettingsPage.qml",
    "zh-TW": "麥克風單獨音軌",
@@ -42550,6 +43315,19 @@
    "de": "Mikrofon auf eigener Spur",
    "pt-BR": "Microfone em faixa própria",
    "ru": "Микрофон на отдельной дорожке"
+  },
+  {
+   "zh": "麦克风增益",
+   "src": "qml/SettingsPage.qml",
+   "zh-TW": "麥克風增益",
+   "en": "Microphone gain",
+   "ja": "マイクゲイン",
+   "ko": "",
+   "es": "",
+   "fr": "",
+   "de": "",
+   "pt-BR": "",
+   "ru": ""
   },
   {
    "zh": "麦克风无法录音（0x{:08X}）",

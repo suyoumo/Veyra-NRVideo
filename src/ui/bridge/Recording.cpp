@@ -1,6 +1,12 @@
 // QML bridge: Recording responsibilities.
 #include "../QmlPlayerBridge_p.h"
+#include "../AudioProbe.h"
 #include "veyra/engine/MicrophoneCapture.h"
+#include <QDesktopServices>
+#include <QDir>
+#include <QStandardPaths>
+#include <QTimer>
+#include <QUrl>
 
 namespace veyra::ui {
 // --- live recording of the processed picture --------------------------------
@@ -18,6 +24,16 @@ int QmlPlayerBridge::recordingBitrateMbps() const { return std::clamp(impl_->pre
 int QmlPlayerBridge::recordingFpsLimit() const { return std::clamp(impl_->prefInt("recordFps", 0), 0, 240); }
 bool QmlPlayerBridge::recordingHevc() const { return impl_->prefBool("recordHevc", false); }
 bool QmlPlayerBridge::recordingAudio() const { return impl_->prefBool("recordAudio", true); }
+// 录制界面: the window as shown (picture plus panels) rather than the clean
+// picture. On by default: clicking 录制 records what is on screen - the panels
+// while the window is open, the picture plus HUD when it is fullscreen.
+bool QmlPlayerBridge::recordingUi() const { return impl_->prefBool("recordUi", true); }
+// 全屏录制: the screen and the system sound, with no Veyra source - for a PC
+// game Veyra does not play itself.
+bool QmlPlayerBridge::recordingFullscreen() const { return impl_->prefBool("recordFullscreen", false); }
+// 区域录制: only the dragged rectangle of the screen.
+bool QmlPlayerBridge::recordingRegion() const { return impl_->prefBool("recordRegion", false); }
+int QmlPlayerBridge::recordRegionW() const { return impl_->prefInt("recordRegionW", 0); }
 bool QmlPlayerBridge::recording() const { return impl_->recordingState.value("active").toBool(); }
 QVariantMap QmlPlayerBridge::recordingState() const { return impl_->recordingState; }
 
@@ -37,6 +53,17 @@ engine::RecordingSettings QmlPlayerBridge::recordingOptions() const {
     options.hevc = recordingHevc();
     options.fpsLimit = uint32_t(std::max(0, recordingFpsLimit()));
     options.audio = recordingAudio();
+    options.ui = recordingUi() || recordingFullscreen() || recordingRegion();
+    // 全屏/区域录制 take the sound from the system loopback: Veyra is not the
+    // one playing, so its renderer tap would stay silent.
+    options.systemAudio = recordingFullscreen() || recordingRegion();
+    if (recordingRegion()) {
+        options.regionX = impl_->prefInt("recordRegionX", 0);
+        options.regionY = impl_->prefInt("recordRegionY", 0);
+        options.regionW = uint32_t(std::max(0, impl_->prefInt("recordRegionW", 0)));
+        options.regionH = uint32_t(std::max(0, impl_->prefInt("recordRegionH", 0)));
+    }
+    if (options.ui && impl_->gameWindow) options.window = uint64_t(impl_->gameWindow->winId());
     options.microphone = recordingMicrophone();
     options.microphoneId = recordingMicrophoneId().toStdWString();
     options.microphoneTrack = recordingMicrophoneTrack();
@@ -73,7 +100,15 @@ static void logRecordingRequest(const char* what, const QString& source, const Q
 void QmlPlayerBridge::startRecording(const QString& source) {
     const QString binding=source==QLatin1String("shortcut")?shortcuts().value("record").toString():QString();
     if (recording()) { logRecordingRequest("start", source, binding, impl_->lastShortcutKey, "refused=already-recording"); emit notice(tr("录制已在进行中"), true); return; }
-    if (!hasSource()) { logRecordingRequest("start", source, binding, impl_->lastShortcutKey, "refused=no-source"); emit notice(tr("没有正在播放的画面，无法录制"), true); return; }
+    // 全屏/区域录制 need no Veyra source: the game behind is the picture.
+    if (!hasSource() && !recordingFullscreen() && !recordingRegion()) { logRecordingRequest("start", source, binding, impl_->lastShortcutKey, "refused=no-source"); emit notice(tr("没有正在播放的画面，无法录制"), true); return; }
+    // 区域录制: ask for the rectangle first; the overlay calls back with it and
+    // starts the take.
+    if (recordingRegion() && recordRegionW() <= 0) {
+        logRecordingRequest("start", source, binding, impl_->lastShortcutKey, "requesting-region");
+        emit requestRegionSelection();
+        return;
+    }
     logRecordingRequest("start", source, binding, impl_->lastShortcutKey, "requested");
     std::wstring error;
     if (!impl_->engine.requestRecording(recordingOptions(), error)) { emit notice(uiText(error), true); return; }
@@ -147,13 +182,84 @@ void QmlPlayerBridge::pollReplay() {
     const QString error = state.value("error").toString();
     if (live.failed && !error.isEmpty() && error != previous.value("error").toString()) emit notice(error, true);
 }
-void QmlPlayerBridge::refreshMicrophones() {
-    QVariantList list;
+void QmlPlayerBridge::refreshMicrophones() {    QVariantList list;
     for (const auto& device : engine::microphoneDevices())
         list.push_back(QVariantMap{{"id", QString::fromStdWString(device.id)}, {"label", QString::fromStdWString(device.name)}});
     impl_->microphones = list;
     veyra::log::info("ui-record", std::format("microphones listed={}", list.size()));
     emit microphoneDevicesChanged();
+}
+
+// --- 声音自检 (AudioProbe.h) -------------------------------------------------
+// The meters listen through the same taps a recording uses, so a moving level
+// here means the file would have sound; a device that cannot be opened reports
+// its reason instead of leaving a silent file to be discovered later.
+void QmlPlayerBridge::startAudioTest() {
+    const QString endpoint = recordingMicrophoneId();
+    if (!startAudioProbe(endpoint.toStdWString(), recordingFullscreen() || recordingRegion())) return;
+    impl_->audioTest = QVariantMap{{QStringLiteral("running"), true},
+                                   {QStringLiteral("gameDb"), -120.0},
+                                   {QStringLiteral("micDb"), -120.0},
+                                   {QStringLiteral("micOpen"), false},
+                                   {QStringLiteral("micStatus"), tr("正在打开麦克风…")}};
+    veyra::log::info("ui-audio-test", std::format("probe started microphone={}", endpoint.isEmpty() ? std::string("default") : endpoint.toStdString()));
+    emit audioTestChanged();
+}
+void QmlPlayerBridge::stopAudioTest() {
+    if (!audioProbeRunning()) return;
+    stopAudioProbe();
+    impl_->audioTest.clear();
+    veyra::log::info("ui-audio-test", "probe stopped");
+    emit audioTestChanged();
+}
+bool QmlPlayerBridge::audioTestRunning() const { return impl_->audioTest.value(QStringLiteral("running")).toBool(); }
+double QmlPlayerBridge::audioTestGameDb() const { return impl_->audioTest.value(QStringLiteral("gameDb"), -120.0).toDouble(); }
+double QmlPlayerBridge::audioTestMicDb() const { return impl_->audioTest.value(QStringLiteral("micDb"), -120.0).toDouble(); }
+bool QmlPlayerBridge::audioTestMicOpen() const { return impl_->audioTest.value(QStringLiteral("micOpen")).toBool(); }
+QString QmlPlayerBridge::audioTestMicStatus() const { return impl_->audioTest.value(QStringLiteral("micStatus")).toString(); }
+bool QmlPlayerBridge::audioTestRecording() const { return impl_->audioTest.value(QStringLiteral("recording")).toBool(); }
+QString QmlPlayerBridge::audioTestSamplePath() const { return impl_->audioTest.value(QStringLiteral("samplePath")).toString(); }
+
+// 录制试听: five seconds of the mix a recording would write, then the system
+// player - hearing the result is faster than reading a meter.
+void QmlPlayerBridge::recordAudioSample() {
+    if (!audioTestRunning()) startAudioTest();
+    if (!audioTestRunning()) return;
+    if (audioTestRecording()) return;
+    startSampleCapture();
+    impl_->audioTest[QStringLiteral("recording")] = true;
+    emit audioTestChanged();
+    veyra::log::info("ui-audio-test", "sample capture started (5 s)");
+    QTimer::singleShot(5000, this, [this] {
+        QString folder = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+        if (folder.isEmpty()) folder = QDir::tempPath();
+        QDir().mkpath(folder);
+        const QString path = QDir(folder).filePath(QStringLiteral("veyra-audio-test.wav"));
+        const bool saved = finishSampleCapture(path.toStdWString());
+        impl_->audioTest[QStringLiteral("recording")] = false;
+        impl_->audioTest[QStringLiteral("samplePath")] = saved ? path : QString();
+        emit audioTestChanged();
+        veyra::log::info("ui-audio-test", std::format("sample {} path={}", saved ? "saved" : "failed", path.toStdString()));
+        if (!saved) emit notice(tr("没有录到声音：请确认正在播放并且麦克风已打开"), true);
+    });
+}
+void QmlPlayerBridge::playAudioSample() {
+    const QString path = audioTestSamplePath();
+    if (path.isEmpty() || !QFileInfo::exists(path)) {
+        emit notice(tr("还没有录音：先点「录 5 秒」"), true);
+        return;
+    }
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(path))) emit notice(tr("无法播放录音：%1").arg(path), true);
+}
+
+// 区域录制: the overlay passes the dragged rectangle in monitor pixels; the
+// next start uses it.
+void QmlPlayerBridge::setRecordRegion(int x,int y,int w,int h) {
+    setPreference(QStringLiteral("recordRegionX"), x);
+    setPreference(QStringLiteral("recordRegionY"), y);
+    setPreference(QStringLiteral("recordRegionW"), w);
+    setPreference(QStringLiteral("recordRegionH"), h);
+    veyra::log::info("ui-record", std::format("region x={} y={} {}x{}", x, y, w, h));
 }
 
 void QmlPlayerBridge::chooseRecordingDirectory() {
@@ -242,6 +348,7 @@ void QmlPlayerBridge::openPs5Dialog() { emit navigate(QStringLiteral("ps5")); }
 void QmlPlayerBridge::openScreenCaptureDialog() { emit navigate(QStringLiteral("screen")); }
 void QmlPlayerBridge::openAudioDialog() { emit navigate(QStringLiteral("audio")); }
 void QmlPlayerBridge::openSubtitleDialog() { emit navigate(QStringLiteral("subtitle")); }
+void QmlPlayerBridge::openHudDialog() { emit navigate(QStringLiteral("hud")); }
 
 
 } // namespace veyra::ui

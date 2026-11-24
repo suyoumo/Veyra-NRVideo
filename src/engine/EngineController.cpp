@@ -1,4 +1,5 @@
 #include "veyra/engine/EngineController.h"
+#include "veyra/engine/LatencyStats.h"
 #include "veyra/sink/AudioGain.h"
 #include "veyra/engine/BufferingGate.h"
 #include "veyra/engine/PlaybackRate.h"
@@ -76,6 +77,18 @@ extern "C" {
 namespace veyra::engine {
 using Clock=std::chrono::steady_clock;
 namespace {
+// Capture callback -> Present window shared with the interface (LatencyStats.h).
+// Real frames only. A generated frame is scheduled half a transport interval
+// before the real frame of its pair, so from the same callback it always reads
+// about interval/2 shorter; with 2X half the window was generated and the
+// median jumped between the two clusters (4K60 VFG 2X, 2026-11-24: real
+// 23.5 ms, generated 15.1 ms). The generated frames keep their own window for
+// the log.
+constexpr size_t kCaptureToPresentWindow=128;
+std::mutex g_c2pMutex;
+std::array<double,kCaptureToPresentWindow> g_c2pSamples{},g_c2pGeneratedSamples{};
+size_t g_c2pCount=0,g_c2pNext=0,g_c2pGeneratedCount=0,g_c2pGeneratedNext=0;
+uint64_t g_c2pLastPublish=0;
 double elapsedMs(Clock::time_point from){return std::chrono::duration<double,std::milli>(Clock::now()-from).count();}
 int64_t monotonic100ns(){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()/100;}
 struct OnExit {std::function<void()> action;~OnExit(){action();}};
@@ -110,6 +123,8 @@ EngineController::EngineController()
     worker_=std::thread(&EngineController::dispatch,this);
 }
 EngineController::~EngineController(){
+    // 录制界面 stops first: the frame source goes before the file it fed.
+    if(uiFeeder_.running()){uiFeeder_.stop();uiRecorder_->stop();}
 #ifdef VEYRA_ENABLE_REMOTEPLAY
     // The PS5 手柄控制 thread starts closing its session now; joined below.
     controlThread_.request_stop();
@@ -203,6 +218,9 @@ bool EngineController::setPlaybackRate(double rate){
 void EngineController::setFullscreenMemoryProtection(bool enabled){
     fullscreenMemoryProtection_=enabled;
     if(!enabled){std::lock_guard lock(mutex_);snapshot_.vramFullscreenUnsafe=false;}
+}
+void EngineController::setVideoOverlay(VideoOverlay overlay){
+    std::lock_guard lock(overlayMutex_);overlayPending_=std::move(overlay);overlayVersion_.fetch_add(1,std::memory_order_release);
 }
 void EngineController::open(HWND video,const std::wstring& path,PlayerOptions opts){
     const bool captureReplay=opts.captureReplayForTest;
@@ -411,9 +429,30 @@ bool EngineController::requestSettings(EnhancementSettings s,std::optional<Chain
     if(acceptedRevision)*acceptedRevision=s.revision;return true;
 }
 void EngineController::saveFrame(const std::wstring& path){std::lock_guard lock(mutex_);savePath_=path;snapshot_.savedFramePath.clear();}
-bool EngineController::requestRecording(const RecordingSettings& options,std::wstring& error){return recorder_->start(options,error);}
-void EngineController::stopRecording(){recorder_->stop();}
-RecordingStatus EngineController::recordingSnapshot()const{return recorder_->status();}
+bool EngineController::requestRecording(const RecordingSettings& options,std::wstring& error){
+    error.clear();
+    if(!options.ui){activeRecorder_=recorder_.get();return recorder_->start(options,error);}
+    // 录制界面: Veyra's window is the picture; the presenter keeps presenting
+    // untouched and the replay buffer keeps its own clean frames.
+    if(uiFeeder_.running()){error=L"界面录制已在进行中";return false;}
+    if(!uiRecorder_->start(options,error))return false;
+    CaptureRegion region;
+    region.x=options.regionX;region.y=options.regionY;
+    region.width=long(options.regionW);region.height=long(options.regionH);
+    if(!uiFeeder_.start(reinterpret_cast<void*>(uintptr_t(options.window)),*uiRecorder_,options.fpsLimit,error,region)){
+        uiFeeder_.stop();uiRecorder_->stop();activeRecorder_=recorder_.get();
+        return false;
+    }
+    activeRecorder_=uiRecorder_.get();
+    return true;
+}
+void EngineController::stopRecording(){
+    if(activeRecorder_==uiRecorder_.get()){uiFeeder_.stop();uiRecorder_->stop();}
+    else recorder_->stop();
+}
+RecordingStatus EngineController::recordingSnapshot()const{
+    return activeRecorder_==uiRecorder_.get()?uiRecorder_->status():recorder_->status();
+}
 bool EngineController::setVirtualCamera(bool enabled,uint32_t fps,std::wstring& error){
     if(!enabled){virtualCamera_->stop();return true;}return virtualCamera_->start(fps,error);
 }
@@ -570,6 +609,15 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
     HWND provisionalCaptureSurface=nullptr;
     auto presenter=std::make_unique<VideoPresenter>();
     presenter->setCapture(&captures_);presenter->setDisplayStates(&displayStates_);
+    // The overlay (VideoOverlay.h) is set from any thread; the owner thread hands
+    // a new version to the presenter before the frame that shows it is processed.
+    auto forwardVideoOverlay=[&]{
+        const auto version=overlayVersion_.load(std::memory_order_acquire);
+        if(version==overlayForwarded_)return;
+        overlayForwarded_=version;
+        VideoOverlay overlay;{std::lock_guard lock(overlayMutex_);overlay=overlayPending_;}
+        presenter->setVideoOverlay(std::move(overlay));
+    };
     auto& coreCache=gpu->core;auto& recentGraphCache=gpu->recent;auto& graph=gpu->graph;
     CaptureGraphPreparation capturePreparation;
     auto& graphBytes=gpu->graphBytes;auto cacheBudgetPolledAt=Clock::now();
@@ -1407,6 +1455,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             bool capturePacerActive=false;
             FgCostSettling vfgCostSettling;
             double vfgChosenFgMs=0,vfgFastFgMs=0;uint64_t vfgFastPairs=0,vfgFastBudgetPairs=0,vfgChosenPairs=0;int64_t vfgChosenAt=0,nextVfgFastLog=0;
+            uint64_t fgRepeatSkips=0;int64_t nextFgRepeatSkipLog=0;
             uint64_t generatedDropDeadline=0,generatedDropCapacity=0,generatedDropCap=0;
             LivePairLatency pairLatency;
             // Capture-card FG pairs: automatic deadline margin (0-1 ms) on top of the phase.
@@ -1618,12 +1667,24 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     // B held 33 ms) and re-converge for ~1 s once motion resumed.
                     // VEYRA_TEST_PAIR_PHASE_VALID_ONLY=1 restores the old rule for A/B.
                     static const bool phaseValidOnly=GetEnvironmentVariableW(L"VEYRA_TEST_PAIR_PHASE_VALID_ONLY",nullptr,0)>0;
+                    // A pair that ran with the faster model is evidence of when its frames
+                    // were ready just the same. Leaving those out meant that, whenever the
+                    // chosen model did not fit and nearly every pair ran fast (VFG High 2X
+                    // at 4K60, RTX 5070 Ti: 1619 of 1643 pairs), fewer than eight samples a
+                    // second were left and the phase fell back to interval + base cost
+                    // (23.3 ms) while the generated frames were ready 11.1 ms after the
+                    // callback: real frames waited 15 ms after their own readiness
+                    // (2026-11-24, capture-present-sample, 2440 frames). Pairs the budget
+                    // switched to fast now close the gap; where the chosen model runs on
+                    // most pairs they change nothing. VEYRA_TEST_PAIR_PHASE_CHOSEN_ONLY=1
+                    // restores the old rule for A/B.
+                    static const bool phaseChosenOnly=[]{wchar_t v[8]{};return GetEnvironmentVariableW(L"VEYRA_TEST_PAIR_PHASE_CHOSEN_ONLY",v,8)&&_wtoi(v)>0;}();
                     // resolveGeneration clears hasGenerated when no frame stayed valid,
                     // so the evaluated group is recognised by its generated frames.
                     const bool phaseSample=phaseValidOnly?valid==batch.fgCandidates&&batch.hasGenerated:
                         batch.fgCandidates>0&&valid+invalid==batch.fgCandidates&&!failed;
                     if(adaptiveCapturePhase&&watch.phaseAnchor>0&&phaseSample&&
-                       !batch.historyReset&&!batch.fgRecovery&&!costSettling&&!batch.fgFast&&
+                       !batch.historyReset&&!batch.fgRecovery&&!costSettling&&(!batch.fgFast||!phaseChosenOnly)&&
                        batch.batch.identity.settingsRevision==fgBudgetRevision&&watch.presentationGeneration==presentationGeneration.load()){
                         int64_t requiredDelay=0;
                         const auto observed=host100ns();
@@ -2886,8 +2947,34 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     veyra::log::info("capture-rate",std::format("revision={} mode={} samplerReset=1",
                         options.settings.revision,halfRateMode));
                 const bool dedupActive=isCapture&&!isImage&&!legacyCadence&&dedupContent(options.settings.content);
-                // The callback compares whole pictures only while dedup or the 60->30 phase needs them.
-                if(physicalCapture)captureSource.setPictureCompare(dedupActive||halfRate);
+                // The callback compares whole pictures only while dedup, the 60->30 phase
+                // or the repeat-pair bypass needs them. The bypass keeps every sample, so
+                // the comparison costs are the only thing it adds.
+                if(physicalCapture)captureSource.setPictureCompare(dedupActive||halfRate||options.settings.fgSkipRepeats);
+                // Repeat-pair bypass (EnhancementSettings::fgSkipRepeats): a sample the
+                // source repeated is a duplicate of the last picture, so its frame
+                // generation midpoint would cost a whole model run and show nothing.
+                // With content dedup active the sample is dropped instead and never
+                // reaches this point.
+                bool captureSampleRepeat=false;
+                if(options.settings.fgSkipRepeats&&cardTiming&&!dedupActive&&!halfRate&&!rereadCached){
+                    // Pick up the number the capture callback already computed. No frame is
+                    // dropped and no timestamp is rewritten: the pair keeps its transport
+                    // cadence, only its frame generation is skipped. File replay and any
+                    // source without the callback's comparison compare here instead.
+                    const auto* upload=pipeline::captureUploadFrame(frame);
+                    if(upload&&upload->pictureValid)captureSampleRepeat=upload->pictureRepeat;
+                    else{
+                        pipeline::PictureReference::Result picture;
+                        if(pipeline::captureFramePicture(frame,enginePictures,gd.packedInput==6||gd.packedInput==7,picture))
+                            captureSampleRepeat=picture.repeat;
+                    }
+                    // Regression harness only (never set by the product): a source without
+                    // duplicate pictures (variable-rate recording, hardware decode) cannot
+                    // exercise the decision path, so this marks every Nth sample as a repeat.
+                    static const int forceRepeatEvery=[]{wchar_t v[16]{};return GetEnvironmentVariableW(L"VEYRA_TEST_FORCE_REPEAT_EVERY",v,16)?_wtoi(v):0;}();
+                    if(forceRepeatEvery>0&&pkt.sequence%uint64_t(forceRepeatEvery)==0)captureSampleRepeat=true;
+                }
                 const int64_t driverPts100ns=pkt.pts.isUnknown()?0:pkt.pts.to100ns();
                 const auto capturePeriod=liveSourceInterval100ns(pipeline::Rational::unknown(),activeSource->info().averageFps);
                 bool captureClockCorrected=false;
@@ -3232,6 +3319,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     liveSourceInterval100ns(pipeline::Rational::unknown(),activeSource->info().averageFps):0;
                 const bool marginPair=adaptiveCapturePhase&&options.fg&&!presentSinkFrameGeneration(options.settings.frameGenerationBackend);
                 const int64_t pairExtra=marginPair?deadlineMargin.extra():0;
+                // 低延迟上屏: read each pair, so the switch applies without a rebuild;
+                // the learned phase restarts because its percentile changed.
+                if(pairLatency.lowLatency()!=options.settings.fgLowLatencyPresent){
+                    pairLatency.setLowLatency(options.settings.fgLowLatencyPresent,0);
+                    pairLatency.reset();
+                    veyra::log::info("fg-low-latency",std::format("revision={} lowLatency={} (capture FG phase at the median readiness of the generated frames instead of the 95th percentile)",options.settings.revision,options.settings.fgLowLatencyPresent));
+                }
                 // Room for the generated frames' own interpolation past interval + base cost.
                 // Deduplicated pairs keep only their content-clock allowance: it already
                 // covered the FG cost (auto + VFG high/high+low, 2026-11-13: no GPU-late
@@ -3304,6 +3398,17 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 nextVfgFastLog=now+10000000;
                                 veyra::log::info("vfg-fast",std::format("revision={} refreshPairs={} budgetPairs={} chosenPairs={} chosenFgMs={:.2f} fastFgMs={:.2f} latchMs={:.2f} (session totals: pairs run with the next faster model because the chosen one would miss the refresh or the budget, and pairs run with the chosen one)",options.settings.revision,vfgFastPairs,vfgFastBudgetPairs,vfgChosenPairs,vfgChosenFgMs,vfgFastFgMs,presenter->refreshGrid().latch100ns/10000));
                             }
+                        }
+                        if(captureSampleRepeat&&options.settings.fgSkipRepeats){
+                            // A repeat of the last picture has no midpoint worth a model run:
+                            // the generated frame would duplicate both endpoints. Skip this
+                            // pair so the model time and the GPU queue go to real changes.
+                            // The pair keeps its admitted timeline, so presentation timing
+                            // and the following pair are unaffected.
+                            decision=pipeline::EnhanceGraph::FgDecision::Skip;
+                            ++fgRepeatSkips;
+                            if(now>=nextFgRepeatSkipLog){nextFgRepeatSkipLog=now+10000000;
+                                veyra::log::info("fg-repeat-skip",std::format("revision={} source={} skips={} (source repeated the last picture; real frame presented, transport cadence unchanged)",options.settings.revision,batch.identity.sourceFrameId,fgRepeatSkips));}
                         }
                         capturePairDecision=decision;
                         return decision;
@@ -3490,6 +3595,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 // moves the highlight curve, and only when the follow switch is
                 // on; an invalid value leaves the static curve untouched.
                 presenter->setFrameDovi(pkt.dovi);
+                forwardVideoOverlay();
                 presenter->sourceProcessed(out.batch.identity);
                 if(out.fgReduced||previewFgMultiplier!=options.fgMultiplier){std::lock_guard lock(mutex_);snapshot_.previewFgMultiplier=out.fgReduced?2u:previewFgMultiplier;}
                 reset=false;hasOutput=true;
@@ -3811,6 +3917,38 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             const auto presentEndHost=host100ns();
                             const double returnDeviation=deviationValid?nowMs()-itemPtsMs:0;
                             item.lease->consumerFence=presenter->consumerFenceValue(ring.lastSignaledValue());const bool didPresent=presenter->submittedCount()>before;s.blit=presenter->blitTiming(ctx.fence());
+                            // Capture->Present window for the interface (LatencyStats.h):
+                            // source callback arrival through read, graph submit and Present.
+                            // Real B owns captureArrival; a generated frame is dated from the
+                            // same callback but is scheduled interval/2 earlier (g_c2pSamples).
+                            if(didPresent&&isCapture&&captureArrival>0){
+                                const double c2pMs=double(presentEndHost-captureArrival)/10000.0;
+                                if(c2pMs>0&&c2pMs<500){
+                                    std::lock_guard lock(g_c2pMutex);
+                                    auto& samples=generated?g_c2pGeneratedSamples:g_c2pSamples;
+                                    auto& count=generated?g_c2pGeneratedCount:g_c2pCount;
+                                    auto& next=generated?g_c2pGeneratedNext:g_c2pNext;
+                                    samples[next]=c2pMs;next=(next+1)%kCaptureToPresentWindow;if(count<kCaptureToPresentWindow)++count;
+                                    const uint64_t tick=GetTickCount64();
+                                    if(g_c2pCount>=16&&tick-g_c2pLastPublish>=1000){
+                                        g_c2pLastPublish=tick;
+                                        std::array<double,kCaptureToPresentWindow> sorted{},sortedGenerated{};
+                                        std::copy(g_c2pSamples.data(),g_c2pSamples.data()+g_c2pCount,sorted.begin());
+                                        std::sort(sorted.begin(),sorted.begin()+g_c2pCount);
+                                        engine::publishCaptureToPresent(sorted[(g_c2pCount-1)/2],sorted[std::min<size_t>(g_c2pCount-1,g_c2pCount*95/100)]);
+                                        const auto percentile=[](const std::array<double,kCaptureToPresentWindow>& values,size_t n,size_t p){
+                                            return n?values[std::min<size_t>(n-1,(n*p+99)/100-1)]:0.0;};
+                                        std::string generatedText;
+                                        if(g_c2pGeneratedCount){
+                                            std::copy(g_c2pGeneratedSamples.data(),g_c2pGeneratedSamples.data()+g_c2pGeneratedCount,sortedGenerated.begin());
+                                            std::sort(sortedGenerated.begin(),sortedGenerated.begin()+g_c2pGeneratedCount);
+                                            generatedText=std::format(" generatedP50Ms={:.3f} generatedP95Ms={:.3f} generatedSamples={}",percentile(sortedGenerated,g_c2pGeneratedCount,50),percentile(sortedGenerated,g_c2pGeneratedCount,95),g_c2pGeneratedCount);
+                                        }
+                                        veyra::log::info("capture-latency",std::format("realP50Ms={:.3f} realP95Ms={:.3f} realSamples={}{} (capture callback -> Present returned; the interface shows the real frames; a generated frame is presented half a transport interval before the real frame of its pair)",
+                                            percentile(sorted,g_c2pCount,50),percentile(sorted,g_c2pCount,95),g_c2pCount,generatedText));
+                                    }
+                                }
+                            }
                             const auto elapsed=elapsedMs(begin);s.presentMs+=elapsed;flow->cpu(diagnostics::CpuStage::Present,elapsed,host100ns());
                             // A soft history reset retains this metrics window. Older
                             // session/revision windows must not update its admission cost.

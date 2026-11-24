@@ -561,6 +561,21 @@ struct EnhancementSettings {
     bool hudLock=false;
     HudProtectMode hudProtect=HudProtectMode::Off;
     bool dynamicHud=false;
+    // UI "低延迟上屏": live capture FG pairs place the presentation phase at the
+    // median readiness of the generated frames instead of their 95th percentile
+    // (LivePairLatency). The multiplier and the output rate are unchanged; a
+    // generated frame that is then late expires and the next real frame follows,
+    // so the whole picture sits a few ms closer to capture. Read by the engine loop
+    // each pair; no graph update or history reset, like fgAdaptive.
+    bool fgLowLatencyPresent=false;
+    // UI "重复帧不插帧": the capture callback compares each driver sample with the last
+    // new picture (PictureCompare.h); a sample the source repeated (30 fps content in a
+    // 60 Hz transport) is a duplicate of the last picture, so its midpoint costs a whole
+    // model run and shows nothing new. Such a pair is skipped and the real frame is
+    // presented. Unlike content dedup it never drops samples, so the transport cadence
+    // and the capture pair interval stay exactly as they are. Read by the engine loop
+    // each pair; no graph update or history reset, like fgAdaptive.
+    bool fgSkipRepeats=false;
     ContentRate content=ContentRate::Transport;
     AudioSyncMode audioSync=AudioSyncMode::Automatic;
     int32_t audioOffsetMs=0;
@@ -640,6 +655,8 @@ struct EnhancementSettings {
         if(!(multiplier>1&&frameGenerationBackend==FrameGenerationBackend::Vfg))active.vfgAutoRegulate=defaults.vfgAutoRegulate;
         if(!(multiplier>2))active.fgAdaptive=defaults.fgAdaptive;
         if(!(multiplier>1))active.pacingRepair=defaults.pacingRepair;
+        if(!(multiplier>1))active.fgLowLatencyPresent=defaults.fgLowLatencyPresent;
+        if(!(multiplier>1))active.fgSkipRepeats=defaults.fgSkipRepeats;
         // XeSS generates inside its own presenter; HUD Lock works on graph frame generation.
         if(!(multiplier>1&&frameGenerationBackend!=FrameGenerationBackend::XeSS)){
             active.hudLock=defaults.hudLock;
@@ -654,6 +671,8 @@ struct EnhancementSettings {
         active.captureFlipVertical=target.captureFlipVertical;active.exportBitrateMbps=target.exportBitrateMbps;
         // Read by the engine loop each pair; no graph update or NR history reset.
         active.fgAdaptive=target.fgAdaptive;active.pacingRepair=target.pacingRepair;
+        active.fgLowLatencyPresent=target.fgLowLatencyPresent;
+        active.fgSkipRepeats=target.fgSkipRepeats;
         if(isCaptureHalfRate(active.content)&&isCaptureHalfRate(target.content))active.content=target.content;
         return active==target;
     }
@@ -673,6 +692,8 @@ struct EnhancementSettings {
         video.pacingRepair=target.pacingRepair;
         // Half-rate variants use the same graph and differ only at sample admission.
         if(isCaptureHalfRate(video.content)&&isCaptureHalfRate(target.content))video.content=target.content;
+        video.fgLowLatencyPresent=target.fgLowLatencyPresent;
+        video.fgSkipRepeats=target.fgSkipRepeats;
         // Colour grade: parameters are uniform-only (never a rebuild), but the
         // master switch changes the graph shape, so it stays in the comparison.
         const auto oldColor=video.color;const auto oldAdditional=video.additionalColors;

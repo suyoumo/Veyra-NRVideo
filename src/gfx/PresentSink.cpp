@@ -386,7 +386,12 @@ bool PresentSink::present(Status& status)
     if(!beforeOk){xessFailed_=true;status=Status::WindowFailure;return false;}
     // Vsync and Automatic Present(0,0) frames are shown at a vblank; a torn
     // frame has no single vblank to date it by.
-    const bool trackScanout=displayLatencyEnabled_&&!xess_&&!(flags&DXGI_PRESENT_ALLOW_TEARING);
+    // Sample in every pacing mode. Under tearing the grid figure is meaningless,
+    // but sampleDisplayLatency also keeps a grid-free latch sample and
+    // takeDisplayLatency publishes that one there; without this the HUD read
+    // "-" whenever the interface ran in 自动.
+    const bool trackScanout=displayLatencyEnabled_&&!xess_;
+    lastPresentTore_=(flags&DXGI_PRESENT_ALLOW_TEARING)!=0;
     if(trackScanout)sampleDisplayLatency();
     LARGE_INTEGER presentQpc{};QueryPerformanceCounter(&presentQpc);
     const HRESULT hr = swapChain_->Present(syncInterval, flags);
@@ -513,6 +518,13 @@ void PresentSink::sampleDisplayLatency(){
     // the statistics trailed by one (two) presents (2026-10-14).
     double newestQpc=0;
     for(const auto& pending:pendingPresents_)if(pending.qpc&&pending.id==stats.PresentCount)newestQpc=double(pending.qpc);
+    // Grid-free sample: the display consumed this present, and SyncQPCTime dates
+    // that scanout, so the difference needs no refresh-grid assumption. This is
+    // the only figure that stays meaningful with VRR engaged.
+    if(newestQpc){
+        const double latchMs=(double(stats.SyncQPCTime.QuadPart)-newestQpc)*1000.0/frequency;
+        if(latchMs>=0&&latchMs<1000&&latchLatencyMs_.size()<4096)latchLatencyMs_.push_back(latchMs);
+    }
     for(const auto& pending:pendingPresents_){
         if(!pending.qpc||pending.id>stats.PresentCount||(previous&&pending.id<=previous)||stats.PresentCount-pending.id>=pendingPresents_.size())continue;
         if(pending.replaceable&&pending.id!=stats.PresentCount)continue;
@@ -533,6 +545,14 @@ PresentSink::RefreshGrid PresentSink::refreshGrid()const{
 PresentSink::DisplayLatencySummary PresentSink::takeDisplayLatency(){
     DisplayLatencySummary summary;
     summary.replacedAtLeast=replacedPresents_;replacedPresents_=0;
+    // A torn present is not on the vblank grid, so the grid figure is wrong
+    // there; publish the grid-free latch instead. Without tearing, the grid
+    // figure is the better one and the latch only steps in when it is empty
+    // (VRR, or a stretch with no usable grid sample).
+    const bool useLatch=lastPresentTore_? !latchLatencyMs_.empty()
+                                        : (displayLatencyMs_.empty()&&!latchLatencyMs_.empty());
+    if(useLatch)displayLatencyMs_.swap(latchLatencyMs_);
+    else latchLatencyMs_.clear();
     auto& values=displayLatencyMs_;
     if(!values.empty()){
         std::sort(values.begin(),values.end());

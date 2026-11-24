@@ -8,9 +8,145 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 namespace veyra::source {
 using Microsoft::WRL::ComPtr;
+namespace {
+// --- Zero-copy slot allocator ------------------------------------------------
+// The pin hands the driver these samples instead of CLSID_MemoryAllocator, so
+// the driver writes each frame straight into Veyra's D3D12 upload memory. The
+// buffers are supplied by the capture source and live as long as the graph, so
+// the allocator never owns or frees pixel memory.
+struct SlotSample final : IMediaSample {
+    std::atomic<ULONG> refs_{1};
+    uint8_t* data_=nullptr;long size_=0,actual_=0;
+    REFERENCE_TIME start_=0,end_=0;bool hasTime_=false,sync_=true,preroll_=false,disc_=false;
+    // Returns the slot to the allocator (which owns the free flag and its lock).
+    std::function<void()> onRelease_;
+    SlotSample(uint8_t* data,long size):data_(data),size_(size){}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** p)override{
+        if(!p)return E_POINTER;*p=nullptr;
+        if(id==IID_IUnknown||id==IID_IMediaSample||id==__uuidof(IMediaSample)){*p=static_cast<IMediaSample*>(this);AddRef();return S_OK;}
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()override{return ++refs_;}
+    ULONG STDMETHODCALLTYPE Release()override{
+        const auto n=--refs_;
+        if(n==0){if(onRelease_)onRelease_();delete this;}
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE GetPointer(BYTE** p)override{if(!p)return E_POINTER;*p=data_;return S_OK;}
+    long STDMETHODCALLTYPE GetSize()override{return size_;}
+    HRESULT STDMETHODCALLTYPE GetTime(REFERENCE_TIME* s,REFERENCE_TIME* e)override{
+        if(s)*s=start_;if(e)*e=end_;
+        return hasTime_?S_OK:VFW_E_SAMPLE_TIME_NOT_SET;
+    }
+    HRESULT STDMETHODCALLTYPE SetTime(REFERENCE_TIME* s,REFERENCE_TIME* e)override{
+        if(s){start_=*s;hasTime_=true;}if(e)end_=*e;return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE IsSyncPoint()override{return sync_?S_OK:S_FALSE;}
+    HRESULT STDMETHODCALLTYPE SetSyncPoint(BOOL v)override{sync_=v!=FALSE;return S_OK;}
+    HRESULT STDMETHODCALLTYPE IsPreroll()override{return preroll_?S_OK:S_FALSE;}
+    HRESULT STDMETHODCALLTYPE SetPreroll(BOOL v)override{preroll_=v!=FALSE;return S_OK;}
+    HRESULT STDMETHODCALLTYPE GetActualDataLength()override{return actual_;}
+    HRESULT STDMETHODCALLTYPE SetActualDataLength(long v)override{actual_=v;return S_OK;}
+    HRESULT STDMETHODCALLTYPE GetMediaType(AM_MEDIA_TYPE** p)override{if(p)*p=nullptr;return S_FALSE;}
+    HRESULT STDMETHODCALLTYPE SetMediaType(AM_MEDIA_TYPE*)override{return S_OK;}
+    HRESULT STDMETHODCALLTYPE IsDiscontinuity()override{return disc_?S_OK:S_FALSE;}
+    HRESULT STDMETHODCALLTYPE SetDiscontinuity(BOOL v)override{disc_=v!=FALSE;return S_OK;}
+    HRESULT STDMETHODCALLTYPE GetMediaTime(LONGLONG*,LONGLONG*)override{return VFW_E_MEDIA_TIME_NOT_SET;}
+    HRESULT STDMETHODCALLTYPE SetMediaTime(LONGLONG*,LONGLONG*)override{return S_OK;}
+};
+struct Slot { uint8_t* data; long size; bool free; };
+class SlotAllocator final : public IMemAllocator {
+    std::atomic<ULONG> refs_{1};
+    std::mutex mutex_;
+    std::vector<Slot> slots_;
+    std::function<bool(const uint8_t*)> usable_;
+    long count_=0,size_=0;
+    bool committed_=false;
+public:
+    explicit SlotAllocator(std::vector<std::pair<uint8_t*,long>> given,std::function<bool(const uint8_t*)> usable)
+        :usable_(std::move(usable)){
+        slots_.reserve(given.size());
+        for(auto& s:given)slots_.push_back({s.first,s.second,true});
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** p)override{
+        if(!p)return E_POINTER;*p=nullptr;
+        if(id==IID_IUnknown||id==IID_IMemAllocator){*p=static_cast<IMemAllocator*>(this);AddRef();return S_OK;}
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()override{return ++refs_;}
+    ULONG STDMETHODCALLTYPE Release()override{const auto n=--refs_;if(!n)delete this;return n;}
+    HRESULT STDMETHODCALLTYPE SetProperties(ALLOCATOR_PROPERTIES* wanted,ALLOCATOR_PROPERTIES* actual)override{
+        if(!wanted)return E_POINTER;
+        std::lock_guard lock(mutex_);
+        if(slots_.empty())return E_FAIL;
+        // Never report more buffers than we have slots: the driver then cycles
+        // exactly the memory the graph already owns.
+        const long maxBuffers=long(slots_.size());
+        count_=wanted->cBuffers>0?std::min<long>(wanted->cBuffers,maxBuffers):maxBuffers;
+        size_=slots_[0].size;
+        if(actual)*actual={count_,size_,1,0};
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetProperties(ALLOCATOR_PROPERTIES* p)override{
+        if(!p)return E_POINTER;std::lock_guard lock(mutex_);
+        *p={count_,size_,1,0};return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Commit()override{std::lock_guard lock(mutex_);committed_=true;return S_OK;}
+    HRESULT STDMETHODCALLTYPE Decommit()override{
+        std::lock_guard lock(mutex_);committed_=false;
+        for(auto& s:slots_)s.free=true;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetFreeSampleCount(long* p){
+        if(!p)return E_POINTER;std::lock_guard lock(mutex_);
+        long n=0;for(auto& s:slots_)if(s.free)++n;
+        *p=n;return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetBuffer(IMediaSample** out,REFERENCE_TIME*,REFERENCE_TIME*,DWORD)override{
+        if(!out)return E_POINTER;*out=nullptr;
+        std::lock_guard lock(mutex_);
+        if(!committed_)return VFW_E_NOT_COMMITTED;
+        const long limit=count_>0?count_:long(slots_.size());
+        for(long i=0;i<limit&&i<long(slots_.size());++i){
+            if(!slots_[i].free)continue;
+            // The capture source owns the mailbox roles: skip a slot whose
+            // frame the reader is still presenting.
+            if(usable_&&!usable_(slots_[i].data))continue;
+            slots_[i].free=false;
+            auto* sample=new(std::nothrow) SlotSample(slots_[i].data,slots_[i].size);
+            if(!sample){slots_[i].free=true;return E_OUTOFMEMORY;}
+            sample->SetActualDataLength(slots_[i].size);
+            SlotAllocator* self=this;const long index=i;
+            sample->onRelease_=[self,index]{
+                std::lock_guard lock(self->mutex_);
+                if(index>=0&&index<long(self->slots_.size()))self->slots_[index].free=true;
+            };
+            *out=sample;
+            return S_OK;
+        }
+        // Every slot is still in flight: the consumer is behind. Report it so
+        // the driver's own retry policy applies instead of blocking this thread.
+        return VFW_E_NOT_COMMITTED;
+    }
+    HRESULT STDMETHODCALLTYPE ReleaseBuffer(IMediaSample* sample)override{
+        if(sample)sample->Release();   // SlotSample::Release marks the slot free
+        return S_OK;
+    }
+};
+} // namespace
+HRESULT createCaptureSlotAllocator(std::vector<std::pair<uint8_t*,long>> slots,std::function<bool(const uint8_t*)> usable,IMemAllocator** out){
+    if(!out)return E_POINTER;*out=nullptr;
+    if(slots.empty())return E_INVALIDARG;
+    auto* allocator=new(std::nothrow) SlotAllocator(std::move(slots),std::move(usable));
+    if(!allocator)return E_OUTOFMEMORY;
+    *out=static_cast<IMemAllocator*>(allocator);
+    return S_OK;
+}
 std::function<HRESULT(IMediaSample*)> timedCaptureDelivery(std::function<HRESULT(double,IMediaSample*)> deliver){
     return [deliver=std::move(deliver),untimed=uint64_t{0},pending=uint64_t{0},recoveries=uint64_t{0}](IMediaSample* sample) mutable -> HRESULT {
         if(!sample)return E_POINTER;
@@ -97,8 +233,16 @@ class NativeSink final:public IBaseFilter,public IPin,public IMemInputPin,public
     bool compressed_=false;
     uint64_t videoSamples_=0;
     CaptureAllocatorMode allocatorMode_=CaptureAllocatorMode::SinkDefault;
+    // Direct video only: when >0, GetAllocatorRequirements asks for this many
+    // buffers instead of the stock 3, so a low-latency allocator suggestion on
+    // the output pin is not pulled back up by our own downstream requirement
+    // during negotiation (DirectShow merges requirements upward).
+    long videoBufferRequirement_=0;
+    // Zero-copy: the capture source's slot allocator (backed by its upload
+    // frames). Handed to the driver instead of CLSID_MemoryAllocator.
+    Microsoft::WRL::ComPtr<IMemAllocator> slotAllocator_;
 public:
-    NativeSink(const AM_MEDIA_TYPE& type,std::function<HRESULT(IMediaSample*)> cb,bool compressed=false,CaptureAllocatorMode allocatorMode=CaptureAllocatorMode::SinkDefault):callback_(std::move(cb)),allocatorMode_(allocatorMode){
+    NativeSink(const AM_MEDIA_TYPE& type,std::function<HRESULT(IMediaSample*)> cb,bool compressed=false,CaptureAllocatorMode allocatorMode=CaptureAllocatorMode::SinkDefault,long videoBufferRequirement=0,IMemAllocator* slotAllocator=nullptr):callback_(std::move(cb)),allocatorMode_(allocatorMode),videoBufferRequirement_(videoBufferRequirement),slotAllocator_(slotAllocator){
         compressed_=compressed;audio_=!compressed&&audioType(type);
         if(compressed_){
             if(FAILED(copyType(desired_,type)))throw std::bad_alloc();
@@ -157,6 +301,7 @@ public:
     // diagnostics. Never replace a driver pool with the generic allocator.
     HRESULT STDMETHODCALLTYPE GetAllocator(IMemAllocator** p)override{
         if(!p)return E_POINTER;*p=nullptr;std::lock_guard lock(mutex_);
+        if(slotAllocator_)return slotAllocator_.CopyTo(p);   // zero-copy: our upload memory
         if(!allocator_){
             if(allocatorMode_==CaptureAllocatorMode::Upstream)return VFW_E_NO_ALLOCATOR;
             const auto hr=CoCreateInstance(CLSID_MemoryAllocator,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&allocator_));if(FAILED(hr))return hr;
@@ -179,7 +324,8 @@ public:
     HRESULT STDMETHODCALLTYPE GetAllocatorRequirements(ALLOCATOR_PROPERTIES* p)override{
         if(!p)return E_POINTER;std::lock_guard lock(mutex_);
         if(allocatorMode_==CaptureAllocatorMode::Upstream){*p={};return E_NOTIMPL;}
-        *p={compressed_?4:3,compressed_?LONG(512*1024):audio_?audioBlockBytes(*reinterpret_cast<const WAVEFORMATEX*>(desired_.pbFormat)):LONG(layout_.sampleBytes),1,0};return S_OK;
+        const long videoBuffers=(!compressed_&&!audio_&&videoBufferRequirement_>0)?videoBufferRequirement_:3;
+        *p={compressed_?4:videoBuffers,compressed_?LONG(512*1024):audio_?audioBlockBytes(*reinterpret_cast<const WAVEFORMATEX*>(desired_.pbFormat)):LONG(layout_.sampleBytes),1,0};return S_OK;
     }
     // Receive holds the pin mutex across the callback (DirectShow requires
     // Stop()/GetState() to observe a quiescent pin). The callback itself now
@@ -269,6 +415,15 @@ HRESULT createNativeCaptureSink(const AM_MEDIA_TYPE& type,std::function<HRESULT(
 HRESULT createNativeCaptureSink(const AM_MEDIA_TYPE& type,std::function<HRESULT(IMediaSample*)> callback,ComPtr<IBaseFilter>& filter,ComPtr<IPin>& pin,CaptureAllocatorMode allocatorMode){
     filter.Reset();pin.Reset();CaptureMediaLayout layout;if(!captureMediaLayout(type,layout))return VFW_E_INVALIDMEDIATYPE;
     try{filter.Attach(new NativeSink(type,std::move(callback),false,allocatorMode));return filter.As(&pin);}catch(...){return E_OUTOFMEMORY;}
+}
+HRESULT createNativeCaptureSink(const AM_MEDIA_TYPE& type,std::function<HRESULT(IMediaSample*)> callback,ComPtr<IBaseFilter>& filter,ComPtr<IPin>& pin,long desiredVideoBuffers){
+    filter.Reset();pin.Reset();CaptureMediaLayout layout;if(!captureMediaLayout(type,layout))return VFW_E_INVALIDMEDIATYPE;
+    try{filter.Attach(new NativeSink(type,std::move(callback),false,CaptureAllocatorMode::SinkDefault,desiredVideoBuffers));return filter.As(&pin);}catch(...){return E_OUTOFMEMORY;}
+}
+HRESULT createNativeCaptureSink(const AM_MEDIA_TYPE& type,std::function<HRESULT(IMediaSample*)> callback,ComPtr<IBaseFilter>& filter,ComPtr<IPin>& pin,IMemAllocator* slotAllocator){
+    filter.Reset();pin.Reset();CaptureMediaLayout layout;if(!captureMediaLayout(type,layout))return VFW_E_INVALIDMEDIATYPE;
+    if(!slotAllocator)return E_INVALIDARG;
+    try{filter.Attach(new NativeSink(type,std::move(callback),false,CaptureAllocatorMode::SinkDefault,long(0),slotAllocator));return filter.As(&pin);}catch(...){return E_OUTOFMEMORY;}
 }
 HRESULT createNativeAudioSink(const AM_MEDIA_TYPE& type,std::function<HRESULT(IMediaSample*)> callback,ComPtr<IBaseFilter>& filter,ComPtr<IPin>& pin){
     filter.Reset();pin.Reset();if(!audioType(type))return VFW_E_INVALIDMEDIATYPE;

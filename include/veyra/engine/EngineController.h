@@ -29,9 +29,11 @@
 #include "veyra/sink/VideoEncoder.h"
 #include "veyra/engine/ExportOptions.h"
 #include "veyra/engine/LiveRecorder.h"
+#include "veyra/engine/WindowCaptureFeeder.h"
 #include "veyra/engine/VirtualCamera.h"
 #include "veyra/engine/ScreenTextCapture.h"
 #include "veyra/engine/DisplayStateService.h"
+#include "veyra/engine/VideoOverlay.h"
 namespace veyra::source { struct RemotePlayConnectDesc; class RemotePlaySessionSource; struct MoonlightConnectDesc; class MoonlightSessionSource; struct XboxConnectDesc; class XboxSessionSource; }
 namespace veyra::remoteplay { struct ControllerState;struct ControllerFeedback; }
 namespace veyra::sink { struct RgbaImage; }
@@ -302,6 +304,9 @@ public:
     bool rotatePreviewClockwise(uint64_t session){std::lock_guard lock(mutex_);if(session!=snapshot_.sessionId||(!snapshot_.running&&!snapshot_.image))return false;previewView_.rotateClockwise();return true;}
     PreviewView previewView()const{std::lock_guard lock(mutex_);return previewView_;}
     void setVolume(float gain,bool mute);
+    // VideoOverlay.h: an image the present blit draws over the picture. Any
+    // thread; it reaches the next presented frame.
+    void setVideoOverlay(VideoOverlay overlay);
     // Local capture monitoring only. Recording takes PCM before this gain.
     void setCaptureAudioMonitoring(bool enabled);
     bool selectAudioTrack(uint64_t sessionId,int streamIndex);
@@ -368,6 +373,13 @@ private:
     // Live recorder: every session's presenter records into it; it owns its
     // encoder and writer threads. Created before the engine thread starts.
     std::unique_ptr<LiveRecorder> recorder_=std::make_unique<LiveRecorder>();
+    // 录制界面: a recorder of its own, fed by WindowCaptureFeeder from Veyra's
+    // window instead of the presenter, so the picture's latency is untouched.
+    std::unique_ptr<LiveRecorder> uiRecorder_=std::make_unique<LiveRecorder>();
+    // Declared after uiRecorder_ so the feeder thread stops before it goes.
+    WindowCaptureFeeder uiFeeder_;
+    // The recorder the last start used: the interface polls and stops that one.
+    LiveRecorder* activeRecorder_=recorder_.get();
     // The instant replay buffer, a second recorder; both take the presented
     // frame through captures_.
     std::unique_ptr<LiveRecorder> replay_=std::make_unique<LiveRecorder>(true);
@@ -392,6 +404,7 @@ private:
     std::atomic<bool> captureAudioMonitoring_{true};
     std::shared_ptr<sink::HdmiBitstreamOutput> hdmiBitstream_;
     std::atomic<float> volume_{1};uint64_t sessionId_=0;
+    std::mutex overlayMutex_;VideoOverlay overlayPending_;std::atomic<uint64_t> overlayVersion_{0};uint64_t overlayForwarded_=0; // owner thread
     std::atomic<double> seekSeconds_{-1};
     std::atomic<double> requestedPlaybackRate_{1};
     std::atomic<bool> fullscreenMemoryProtection_{false};

@@ -1716,6 +1716,24 @@ VPage {
                     VSwitch { objectName: "node-vfg-auto-regulate"; checked: veyra.vfgAutoRegulate; onToggled: checked => veyra.vfgAutoRegulate = checked }
                 }
                 VRow {
+                    label: qsTr("低延迟上屏")
+                    visible: veyra.fgBackendName !== "xess"
+                    hint: qsTr("补帧画面按「一半的生成帧刚好来得及」来排期，而不是等 95% 都来得及；倍率和输出帧率不变，偶尔来不及的那一帧跳过、由下一张真实帧接上，整体画面更贴近采集 · 默认关闭")
+                    VSwitch { objectName: "node-fg-low-latency-present"; checked: veyra.fgLowLatencyPresent; onToggled: checked => veyra.fgLowLatencyPresent = checked }
+                }
+                VRow {
+                    label: qsTr("视频直出")
+                    visible: veyra.hasSource
+                    hint: qsTr("画面空闲时视频窗口保持完整矩形，由显卡直接扫描上屏，不再经过系统合成：实测上屏等待从约 10ms 降到约 1.5ms。控制条、菜单、对话框出现时会恢复叠加（这几秒走合成），收起后自动回到直出；HUD 只在界面出现时可见 · 默认关闭，改了要重新打开片源")
+                    VSwitch { objectName: "node-direct-present"; checked: veyra.directPresent; onToggled: checked => veyra.directPresent = checked }
+                }
+                VRow {
+                    label: qsTr("重复帧不插帧")
+                    visible: veyra.fgBackendName !== "xess"
+                    hint: qsTr("源画面重复上一张时（例如 30 帧游戏经 60Hz 输出，约一半是重复帧）不跑补帧模型，直接显示真实帧。它省的是 GPU：GPU 有余量时不降低延迟，反而因为要在采集回调里比对画面而增加约 0.3 ms——只有 GPU 吃满、补帧开始排队降档时才可能腾出预算。重复帧插出来的本来就是同一张画面，观感不受影响 · 默认关闭")
+                    VSwitch { objectName: "node-fg-skip-repeats"; checked: veyra.fgSkipRepeats; onToggled: checked => veyra.fgSkipRepeats = checked }
+                }
+                VRow {
                     label: qsTr("自适应倍率")
                     visible: veyra.fgMultiplier > 2 && (veyra.fgBackendName === "dlss" || veyra.fgBackendName === "anr" || veyra.fgBackendName === "vfg")
                     hint: qsTr("把所选倍率当上限，按游戏实时帧率逐对选用最接近目标帧率（输出上限或屏幕刷新率）的倍率，游戏掉帧时输出仍保持平稳；不重建补帧 · 默认关闭")

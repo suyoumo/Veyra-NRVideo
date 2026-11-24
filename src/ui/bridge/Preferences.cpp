@@ -1,6 +1,7 @@
 // QML bridge: Preferences responsibilities.
 #include "../QmlPlayerBridge_p.h"
 #include <QColor>
+#include "veyra/engine/MicrophoneCapture.h"
 #include "veyra/ngx/AnrProvider.h"
 #include "veyra/gfx/AmfFrcBackend.h"
 #include "veyra/gfx/RifeDmlBackend.h"
@@ -211,15 +212,32 @@ bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
         // cap (0 keeps the presented rate).
         {"recordBitrateMbps", {0, 400}},
         {"recordFps", {0, 240}},
+        // 麦克风增益 (dB): a Bluetooth headset microphone sits far below the
+        // game sound, so the voice needs a lift before it is mixed.
+        {"recordMicGain", {0, 24}},
         {"recordSplitSeconds", {0, 86400}},
         {"recordSplitMiB", {0, 1048576}},
         {"virtualCameraFps", {0, 120}},
         {"fullscreenFrameStatsCorner", {0, 3}},
         // Instant replay (#103): seconds the buffer keeps.
-        {"replaySeconds", {15, 600}}};
-    static const QStringList flags{"recordHevc", "recordAudio", "recordMic", "recordMicTrack", "replayEnabled", "subtitleEnabled", "subtitleBackground", "subtitleFit",
-                                   "subtitleSecondLanguage", "audioForceStereo", "captureAudioMonitor", "captureHdmiPassthrough", "holdCompare",
-                                   "magewellLowLatency", "blackmagicNativeCapture", "captureShowAllFrameRates", "cinePillHidden", "exportStopsPlayback", "obsGameCapture", "autoResume", "fullscreenMemoryProtection", "prewarmEnhancement", "hdrFgCompatibility", "computeOnMonitorGpu", "deinterlace", "networkAutoReconnect",
+        {"replaySeconds", {15, 600}},
+        // 简要画面 HUD 位置：0 关，1 左上，2 右上，3 左下，4 右下，5 左上置顶，6 右上置顶。
+        {"hudCorner", {0, 6}},
+        // 帧率与延迟 HUD 的下移量 (px): keeps it clear of the game's own UI.
+        {"hudOffsetY", {0, 400}},
+        // HUD 字号缩放百分比 (100 = 原大小)；串流到 1080p 时调到 150–200。
+        {"hudScale", {80, 200}},
+        // 哪几行显示：bit0 帧率, 1 1% low, 2 采集延迟, 3 引擎延迟,
+        // 4 上屏等待, 5 上屏总延迟, 6 处理耗时. 127 = 全部.
+        {"hudItems", {0, 127}},
+        // 区域录制: the dragged rectangle, in monitor pixels.
+        {"recordRegionX", {0, 16384}},
+        {"recordRegionY", {0, 16384}},
+        {"recordRegionW", {0, 16384}},
+        {"recordRegionH", {0, 16384}}};
+    static const QStringList flags{"recordHevc", "recordAudio", "recordUi", "recordFullscreen", "recordRegion", "recordMic", "recordMicTrack", "replayEnabled", "subtitleEnabled", "subtitleBackground", "subtitleFit",
+                                   "subtitleSecondLanguage", "audioForceStereo", "captureAudioMonitor", "holdCompare",
+                                   "magewellLowLatency", "averLowLatency", "blackmagicNativeCapture", "captureShowAllFrameRates", "cinePillHidden", "exportStopsPlayback", "obsGameCapture", "autoResume", "fullscreenMemoryProtection", "prewarmEnhancement", "hdrFgCompatibility", "computeOnMonitorGpu", "deinterlace", "networkAutoReconnect", "ps5CaptureControl", "ps5ControlBackground", "ps5ControlTouchpad",
                                    // 设置 → 外观 → 启动动画 / 启动音乐 / 剔除遮罩（2.1.9）
                                    "introAnimation", "introMusic", "exclusionOverlay", "fullscreenFrameStats"};
     QVariant stored;
@@ -387,6 +405,8 @@ void QmlPlayerBridge::applyPreference(const QString& key) {
     }
     if(key==QLatin1String("captureShowAllFrameRates"))emit captureChanged();
     else if (key == QLatin1String("magewellLowLatency")) source::magewell::setLowLatencyPreference(impl_->prefBool("magewellLowLatency", false));
+    else if (key == QLatin1String("averLowLatency")) source::setAverLowLatencyPreference(impl_->prefBool("averLowLatency", false));
+    else if (key == QLatin1String("recordMicGain")) engine::setMicrophoneGainDb(float(impl_->prefInt("recordMicGain", 8)));
     else if (key == QLatin1String("blackmagicNativeCapture")) { if(impl_->captureListed)refreshCaptureDevices();emit captureChanged(); }
     else if (key == QLatin1String("language")) {
         const QString code = i18n::resolve(impl_->prefString("language"));

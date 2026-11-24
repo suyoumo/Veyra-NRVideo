@@ -25,6 +25,9 @@ namespace veyra::remoteplay {
 static_assert(CHIAKI_PSN_ACCOUNT_ID_SIZE == 8);
 static_assert(CHIAKI_SESSION_AUTH_SIZE == 16);
 namespace {
+// 0 auto (DualSense unless view-only), 1 DualSense, 2 DualShock 4. The console
+// accepts both; some games show different prompts and haptics per identity.
+std::atomic<int> g_controller_identity{0};
 void wipe(void* ptr,std::size_t n) noexcept {
     auto* p=static_cast<volatile unsigned char*>(ptr);
     while(n--) *p++=0;
@@ -208,7 +211,9 @@ BackendResult ChiakiBackend::start(const NativeConnectRequest& request,SessionIn
         request.video.fps==30?CHIAKI_VIDEO_FPS_PRESET_30:CHIAKI_VIDEO_FPS_PRESET_60);
     info.video_profile.codec=request.video.codec==Codec::H264?CHIAKI_CODEC_H264:request.video.codec==Codec::H265Hdr?CHIAKI_CODEC_H265_HDR:CHIAKI_CODEC_H265;
     info.video_profile.bitrate=request.video.bitrateKbps;
-    info.video_profile_auto_downgrade=false;info.enable_keyboard=false;info.enable_dualsense=!request.viewOnly||discardMedia;
+    const int identity=g_controller_identity.load();
+    info.video_profile_auto_downgrade=false;info.enable_keyboard=false;
+    info.enable_dualsense=identity==1?true:identity==2?false:(!request.viewOnly||discardMedia);
     info.auto_regist=false;info.packet_loss_max=0.05;info.enable_idr_on_fec_failure=true;
     const auto code=chiaki_session_init(&s.session,&info,&s.log);
     wipe(info.regist_key,sizeof(info.regist_key));wipe(info.morning,sizeof(info.morning));wipe(info.psn_account_id,sizeof(info.psn_account_id));
@@ -343,5 +348,8 @@ NativeSnapshot ChiakiBackend::snapshot()const{
     out.automaticRetryAllowed=out.lastQuitReason==CHIAKI_QUIT_REASON_NONE||out.lastQuitReason==CHIAKI_QUIT_REASON_CTRL_UNKNOWN||out.lastQuitReason==CHIAKI_QUIT_REASON_CTRL_CONNECT_FAILED||out.lastQuitReason==CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN||out.lastQuitReason==CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE;
     out.startupRetryAllowed=out.lastQuitReason==CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE;
     return out;
+}
+void setControllerIdentity(int mode){
+    g_controller_identity.store(std::clamp(mode,0,2));
 }
 } // namespace veyra::remoteplay

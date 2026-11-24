@@ -39,5 +39,10 @@ std::vector<MicrophoneDevice> microphoneDevices();
 void attachMicrophone(std::shared_ptr<MicrophoneSink> sink,const std::wstring& endpointId);
 void detachMicrophone(const MicrophoneSink* sink);
 MicrophoneStatus microphoneStatus();
+// Voice level handed to every listener, in dB (0 = untouched). A Bluetooth
+// headset microphone is often 15-20 dB below the game sound, which buries the
+// voice in a recording; this lifts it before mixing.
+void setMicrophoneGainDb(float db);
+float microphoneGainDb();
 
 } // namespace veyra::engine

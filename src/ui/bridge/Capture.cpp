@@ -1,10 +1,14 @@
 // QML bridge: Capture responsibilities.
 #include "../QmlPlayerBridge_p.h"
+#include "veyra/engine/LatencyStats.h"
+#include "veyra/source/VirtualDesktop.h"
 #include "veyra/source/WasapiAudioInput.h"
 #include "VirtualCaptureAudioSetup.h"
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <map>
+#include <algorithm>
+#include <cwctype>
 
 namespace veyra::ui {
 // --- capture dialog ----------------------------------------------------------
@@ -268,7 +272,9 @@ bool QmlPlayerBridge::openCaptureDriverSettings(bool inputSelector) {
     auto& i = *impl_;
     if (captureQueryBusy() || i.captureDevice.empty()) { emit notice(tr("请先选择设备并等待查询完成"), true); return false; }
     if (i.openingSource || (i.snapshot.capture && !i.engine.idle())) { emit notice(tr("请等待连接结束并断开采集，再打开驱动设置"), true); return false; }
-    HWND owner = i.videoWindow ? GetAncestor(i.videoWindow, GA_ROOT) : nullptr;
+    // GA_ROOTOWNER: the video window is either the Qt window's child or (视频直出)
+    // an own top-level window owned by it; both resolve to the Qt window here.
+    HWND owner = i.videoWindow ? GetAncestor(i.videoWindow, GA_ROOTOWNER) : nullptr;
     if (!owner) if (auto* window = QGuiApplication::focusWindow()) owner = reinterpret_cast<HWND>(window->winId());
     i.captureDriverSettingsOpen = true; emit captureChanged();
     std::wstring error;
@@ -287,6 +293,21 @@ QString QmlPlayerBridge::captureMagewellStatus() const {
         return tr("找不到美乐威运行库 LibMWCapture.dll（应在软件的 runtime\\magewell 文件夹里，或装美乐威驱动/SDK）");
     return veyra::ui::i18n::text(source::magewell::statusText());
 }
+// AVerMedia PCIe 卡（GC573 等）的设备路径含厂商 ID VEN_1461。Moniker DevicePath 实际
+// 为小写，但与 magewell::isProCaptureDevicePath 一致先归一再匹配。
+bool QmlPlayerBridge::captureAverPcieDevice() const {
+    std::wstring lower(impl_->captureDevice);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+    return lower.find(L"ven_1461") != std::wstring::npos;
+}
+// 采集卡自身延迟：驱动帧时间戳到回调，和 capture-driver-age 日志同源。
+double QmlPlayerBridge::captureDriverAgeP50Ms() const { return source::captureDriverAgeP50Ms(); }
+double QmlPlayerBridge::captureDriverAgeP95Ms() const { return source::captureDriverAgeP95Ms(); }
+// 引擎段与上屏段（LatencyStats.h）。三段相加就是「上屏总延迟」。
+double QmlPlayerBridge::captureToPresentP50Ms() const { return engine::captureToPresentP50Ms(); }
+double QmlPlayerBridge::captureToPresentP95Ms() const { return engine::captureToPresentP95Ms(); }
+double QmlPlayerBridge::displayScanoutP50Ms() const { return engine::displayScanoutP50Ms(); }
+double QmlPlayerBridge::displayScanoutP95Ms() const { return engine::displayScanoutP95Ms(); }
 bool QmlPlayerBridge::captureVirtualAudioInstalled() const { return impl_->captureVirtualAudioInstalled; }
 static bool captureVirtualAudioRemovalBlockedBy(const engine::PlayerSnapshot& snapshot) {
     return snapshot.transport == engine::TransportState::Opening ||
@@ -696,6 +717,103 @@ bool QmlPlayerBridge::applyScreenCrop(int left,int top,int right,int bottom) {
     impl_->savePrefs();
     emit captureChanged();
     return true;
+}
+bool QmlPlayerBridge::gameMode() const { return impl_->gameModeSessionId != 0; }
+bool QmlPlayerBridge::passthroughActive() const { return impl_->passthroughShown; }
+bool QmlPlayerBridge::gameInputActive() const { return impl_->gameInputShown; }
+bool QmlPlayerBridge::gameScaledPreview() const {
+    return gameMode() && (ui::gameViewportScaled(impl_->screenFillActive, impl_->aspectMode) || previewRotation()!=0);
+}
+QRectF QmlPlayerBridge::gameVideoRect() const { return impl_->gameVideoRect; }
+void QmlPlayerBridge::attachMainWindow(qulonglong nativeHandle) {
+    impl_->game.attach(reinterpret_cast<HWND>(nativeHandle));
+    impl_->ps5Mouse.setWindow(reinterpret_cast<HWND>(nativeHandle));
+    for (auto* window:QGuiApplication::allWindows())
+        if (qulonglong(window->winId())==nativeHandle) { impl_->gameWindow=window; break; }
+}
+void QmlPlayerBridge::updateGameGeometry() {
+    if (!gameMode() || !impl_->presentation.fullscreen || !impl_->gameWindow) return;
+    RECT r=impl_->game.pictureBounds();
+    if (gameScaledPreview()) {
+        const HWND main = reinterpret_cast<HWND>(impl_->gameWindow->winId());
+        POINT origin{};
+        MONITORINFO info{sizeof(info)};
+        if (!GetMonitorInfoW(impl_->gameMonitor, &info) || !ClientToScreen(main, &origin)) return;
+        r=info.rcMonitor; OffsetRect(&r,-origin.x,-origin.y);
+    }
+    const qreal scale=impl_->gameWindow->devicePixelRatio();
+    if (scale<=0) return;
+    const QRectF rect(r.left/scale,r.top/scale,(r.right-r.left)/scale,(r.bottom-r.top)/scale);
+    if (!rect.isEmpty() && rect!=impl_->gameVideoRect) {
+        impl_->gameVideoRect=rect; emit gameModeChanged();
+    }
+}
+void QmlPlayerBridge::setGamePanelOpen(bool open) {
+    if (impl_->gamePanelOpen == open) return;
+    impl_->gamePanelOpen = open;
+    updateGameMode();
+}
+int QmlPlayerBridge::gameModeScreenIndex() const {
+    if (!impl_->gameMonitor) return -1;
+    const auto screens = QGuiApplication::screens();
+    for (int i = 0; i < screens.size(); ++i) {
+        const auto* native = screens[i]->nativeInterface<QNativeInterface::QWindowsScreen>();
+        if (native && native->handle() == impl_->gameMonitor) return i;
+    }
+    return -1;
+}
+void QmlPlayerBridge::testBlockUi(int ms) {
+    if (GetEnvironmentVariableW(L"VEYRA_TEST_UI_BLOCK", nullptr, 0) == 0) return;
+    veyra::log::warn("game-mode", std::format("test: GUI thread blocked for {} ms", ms));
+    Sleep(DWORD(std::clamp(ms, 0, 20000)));
+}
+// 游戏模式 state: click-through while the game-mode capture is live and the picture
+// is fullscreen, the panel while the Home panel is open, otherwise a normal window.
+void QmlPlayerBridge::updateGameMode() {
+    using Mode = ui::GamePassthrough::Mode;
+    auto& i = *impl_;
+    const auto& s = i.snapshot;
+    if (i.gameModeSessionId) {
+        const bool same = s.sessionId == i.gameModeSessionId;
+        if (same && s.running && !s.failed) i.gameModeLive = true;
+        const bool ended = (same && (s.failed || s.transport == engine::TransportState::Stopping ||
+            s.transport == engine::TransportState::Empty || (i.gameModeLive && !s.running))) || s.sessionId > i.gameModeSessionId;
+        if (ended) {
+            const bool shown = i.game.mode() != Mode::Off;
+            veyra::log::info("game-mode", std::format("capture session {} ended failed={} pictureInFront={}", i.gameModeSessionId, s.failed, shown));
+            i.gameModeSessionId = 0; i.gameModeLive = false;
+            if (shown) {
+                i.gameInputShown = i.passthroughShown = false;
+                emit gameModeChanged();
+                i.game.apply(Mode::Off);
+                const QString why = s.failed ? uiText(s.status) : QString();
+                emit gameModeStopped(why.isEmpty() ? tr("捕获已结束，已退出游戏模式") : why);
+            }
+        }
+    }
+    if (!i.presentation.fullscreen) i.gameRefused = false;
+    Mode want = ui::gameInputMode(i.gameModeSessionId != 0, i.presentation.fullscreen,
+                                  i.gameRefused, i.gamePanelOpen, gameScaledPreview());
+    if (want!=Mode::Off && i.gameVideoRect.isEmpty()) updateGameGeometry();
+    // A listener failure holds until fullscreen is left.
+    if (want != Mode::Off && i.game.mode() == Mode::Off && !i.game.arm()) { i.gameRefused = true; want = Mode::Off; }
+    if (want != i.game.mode()) {
+        // QML binds the window's click-through flags to passthroughActive: publish
+        // first, so Qt has changed the window before the foreground moves.
+        const bool through = want == Mode::Through;
+        const bool input = through || want == Mode::Scaled;
+        if (through != i.passthroughShown || input != i.gameInputShown) {
+            i.passthroughShown = through; i.gameInputShown = input; emit gameModeChanged();
+        }
+        if (want == Mode::Scaled && i.game.mode() != Mode::Panel)
+            emit notice(tr("全屏缩放已启用：键盘和手柄控制源窗口，鼠标点击已拦截以免错位；需要鼠标穿透时切回贴合原窗口"), false);
+        i.game.apply(want);
+    }
+    const bool mode = i.gameModeSessionId != 0;
+    if ((!mode || !i.presentation.fullscreen) && !i.gameVideoRect.isEmpty()) {
+        i.gameVideoRect={}; emit gameModeChanged();
+    }
+    if (mode != i.gameModeShown) { i.gameModeShown = mode; emit gameModeChanged(); }
 }
 QString QmlPlayerBridge::screenTargetId() const { return impl_->screenTarget; }
 void QmlPlayerBridge::setScreenTargetId(const QString& value) {

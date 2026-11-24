@@ -6,6 +6,12 @@
 #include "HdrColor.hlsli"
 #include "PresentationRotation.hlsli"
 Texture2D<float4> sourceTex : register(t0);
+// PresentBlitOverlay.hlsl defines VEYRA_PRESENT_OVERLAY for VideoPresenter. The
+// plain shader keeps its 16 constants and one texture: tests and tools build
+// their own pipelines around it.
+#ifdef VEYRA_PRESENT_OVERLAY
+Texture2D<float4> overlayTex : register(t1);
+#endif
 
 cbuffer PresentBlitConstants : register(b0)
 {
@@ -19,6 +25,18 @@ cbuffer PresentBlitConstants : register(b0)
     // a no-op at its default (lift 0, mid 203, start 0, cap 0).
     float4 curve0;  // x=shadow lift EV, y=shadow range nits, z=mid-gray nits, w=highlight start nits
     float4 curve1;  // x=roll-off scale nits, y=peak cap nits (0 = off)
+#ifdef VEYRA_PRESENT_OVERLAY
+    // Video overlay (engine/VideoOverlay.h): a small straight-alpha BGRA8 image,
+    // the frame-rate HUD, drawn by this pass instead of a window over the
+    // picture. The video window then stays a whole rectangle, which is what lets
+    // the display scan it out directly; any hole or overlay window makes DWM
+    // composite every frame.
+    // overlayRect: x, y, w, h in output pixels. overlayParams: x = show (0/1),
+    // y = output encoding (0 sRGB code values, 1 linear scRGB with 1.0 = 80 nits,
+    // 2 PQ).
+    float4 overlayRect;
+    float4 overlayParams;
+#endif
 };
 
 // Lift the shadows without touching the highlights, move the mid-gray reference
@@ -239,9 +257,40 @@ float4 MagnifySample(float2 p,int2 last)
 // domain, so the dither never moves a value by more than half a step either way.
 float DitherOffset(uint2 pixel)
 {
-    float noise = frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711056, 0.00583715))));
+    float noise = frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711018, 0.00583715))));
     return (noise - 0.5) / 1023.0;
 }
+
+#ifdef VEYRA_PRESENT_OVERLAY
+// The sRGB transfer of flag 1 (above), inverted: the overlay is ordinary sRGB
+// graphics whatever the picture's encoding.
+float3 SrgbToLinear(float3 c)
+{
+    c=max(c,0);
+    return select(c<=0.0031308,c/12.92,pow((c+0.055)/1.055,2.4));
+}
+
+// Draw the overlay under the output transfer. SDR output blends in sRGB code
+// values like any 2D toolkit. HDR output blends in linear scRGB with the
+// overlay's white at the 203 nit SDR reference (flag 8's scaling), and a PQ
+// output is decoded and re-encoded for it.
+float3 ApplyOverlay(float3 color,int2 pixel,uint flags)
+{
+    if(overlayParams.x<0.5)return color;
+    const int2 rel=pixel-int2(overlayRect.xy);
+    const int2 size=int2(max(overlayRect.zw,0));
+    if(any(rel<0)||any(rel>=size))return color;
+    const float4 o=overlayTex.Load(int3(rel,0));
+    if(o.a<=0.0)return color;
+    const int enc=int(overlayParams.y+0.5);
+    if(enc==0)return lerp(color,o.rgb,saturate(o.a));
+    if(enc==2)color=HdrDecodePq(color);
+    color=lerp(color,SrgbToLinear(o.rgb)*(203.0/80.0),saturate(o.a));
+    return enc==2?HdrEncodePq(color):color;
+}
+#else
+float3 ApplyOverlay(float3 color,int2 pixel,uint flags){return color;}
+#endif
 
 float4 psMain(VSOut input) : SV_Target
 {
@@ -262,7 +311,9 @@ float4 psMain(VSOut input) : SV_Target
     const float2 size=float2(width,height);
     const float2 p=uv*size-0.5;
     const float2 dx=ddx(p),dy=ddy(p);
-    if(outside)return float4(0,0,0,(flags&256)?0:1);
+    const int2 pixel=int2(input.pos.xy);
+    // The letterbox is black, but the overlay still belongs over it.
+    if(outside)return float4(ApplyOverlay(float3(0,0,0),pixel,flags),(flags&256)?0:1);
     float4 color;
     if(flags&2){
         // Source texels per output pixel along each source axis (a quarter turn
@@ -280,11 +331,11 @@ float4 psMain(VSOut input) : SV_Target
     if(flags&1){float3 c=max(color.rgb,0);color.rgb=lerp(1.055*pow(c,1.0/2.4)-0.055,c*12.92,step(c,0.0031308));}
     if(flags&4)color.rgb=HdrEncodePq(color.rgb);
     if(flags&256)color.rgb*=color.a;
+    color.rgb=ApplyOverlay(color.rgb,pixel,flags);
     // Custom dither (moved off 256, which now carries the alpha round trip): the
     // offset belongs after the transfer encode, where one 10-bit step is exact.
     if(flags&512){
-        const int2 p=int2(input.pos.xy);
-        color.rgb=saturate(color.rgb+DitherOffset(uint2(p)));
+        color.rgb=saturate(color.rgb+DitherOffset(uint2(pixel)));
     }
     return color;
 }
