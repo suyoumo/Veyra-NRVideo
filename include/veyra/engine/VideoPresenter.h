@@ -1,0 +1,252 @@
+#pragma once
+#include "veyra/diagnostics/GpuTimer.h"
+#include "veyra/gfx/PresentSink.h"
+#include <dxgi1_6.h> // DXGI_HDR_METADATA_HDR10 (custom: HDR static metadata)
+#include "veyra/pipeline/GpuPassUtils.h"
+#include "veyra/pipeline/FramePacket.h" // custom: pipeline::DoviFrameInfo
+#include "veyra/engine/PreviewView.h"
+#include "veyra/engine/HdrOutputTuning.h"
+#include "veyra/gfx/CommandSlotRing.h"
+#include "veyra/gfx/ReflexSession.h"
+#include "veyra/gfx/NvidiaVrr.h"
+#include "veyra/engine/PresentationSettings.h"
+#include "veyra/engine/PresentCapture.h"
+#include "veyra/engine/VideoOverlay.h"
+#include "veyra/engine/DisplayStateService.h"
+#include <chrono>
+#include <array>
+#include <mutex>
+#include <optional>
+namespace veyra::gfx { class D3D12DeviceContext; class CommandSlotRing; }
+namespace veyra::pipeline { class EnhanceGraph; }
+namespace veyra::sink { struct RgbaImage; }
+namespace veyra::engine {
+class VideoPresenter {
+public:
+    // Live recording hook; the object must outlive every present() call.
+    void setCapture(PresentCapture* capture){capture_=capture;}
+    // Shared refresh/VRR states (the engine's); must outlive the presenter.
+    void setDisplayStates(DisplayStateService* states){displayStates_=states;}
+    ~VideoPresenter(){close();}
+    // mediaClockPaced: the owner already waits on a media clock before each
+    // source (file playback). Retained for diagnostics; XeLL low latency must
+    // stay enabled or the provider refuses generation (result -15).
+    bool open(gfx::D3D12DeviceContext&, HWND, pipeline::EnhanceGraph&, bool captureCompatible=false, bool mediaClockPaced=false);
+    bool present(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,unsigned slot,bool generated,bool referencesValid=true,int comparison=0,bool baseReference=false,float split=.5f,pipeline::FrameIdentity identity={},PreviewView view={},int64_t sourcePts100ns=-1,bool retainUnchanged=false);
+    void close();
+    // Owner-thread graph replacement boundary. Native DXGI remains attached to
+    // its HWND; provider-owned presentation must be shut down before its graph.
+    bool prepareGraphChange();
+    // Explicit lifecycle regression: simulate an overlay retaining the chain.
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChainForTest()const{return sink_.swapChain();}
+    // Present-sink providers (XeSS) block inside Present while pacing
+    // their generated frames. A helper-thread Present was tried on
+    // 2026-09-22 (X3): the provider then estimated its period from the
+    // longer hand-off intervals and the source rate fell 51 -> 24/s at 44%
+    // GPU. The synchronous call stays; see FG_INDEPENDENT_REPAIR_EXECUTION.
+    // stallUs > 0: a live source; a driver low-latency Sleep longer than this,
+    // repeatedly, ends NVIDIA Low Latency for the session (ReflexSession).
+    bool beginSourceInput(uint64_t stallUs=0);
+    bool beginSourceProcessing();
+    void sourceProcessed(pipeline::FrameIdentity);
+    // Custom: Dolby Vision level-1 brightness of the source frame that is about
+    // to be presented. The owner thread sets it after the frame leaves the
+    // graph and before present(); an invalid value means "no RPU", which keeps
+    // the follow path from changing anything.
+    void setFrameDovi(const pipeline::DoviFrameInfo& d){latestDovi_=d;}
+    const pipeline::DoviFrameInfo& frameDovi() const {return latestDovi_;}
+    // VideoOverlay.h. Any thread; the owner thread uploads it before the next
+    // present. An empty image with show=false takes it off again.
+    void setVideoOverlay(VideoOverlay overlay);
+    PresentationSettings configurePresentation(gfx::D3D12DeviceContext&,PresentationSettings,bool fg,std::wstring& status);
+    bool presentationReady(){return sink_.presentationReady();}
+    gfx::PresentSink::RefreshGrid refreshGrid()const{return sink_.refreshGrid();}
+    bool waitPresentationReady(unsigned ms){return sink_.waitPresentationReady(ms);}
+    uint64_t beginReflex(){const auto id=reflexInputFrame_;reflexInputFrame_=0;reflex_.renderStart(id);return id;}
+    void endReflex(uint64_t id){reflex_.renderEnd(id);}
+    void cancelReflexInput(){if(reflexInputFrame_)reflex_.mark(reflexInputFrame_,1);reflexInputFrame_=0;}
+    void reflexFrame(uint64_t id){reflexFrame_=id;}
+    // True while XeSS owns Present: the low-latency queue and the output
+    // cap cannot reach provider-generated frames, so the UI greys them out.
+    bool providerOwnedPresentation()const{return providerOwnedPresentation_;}
+    // Native presentation has its own command ring and a GPU-side producer
+    // fence wait. XeSS shares the graph ring and must not re-enter it.
+    bool independentQueue()const{return presentationQueue_!=nullptr;}
+
+    bool reflexActive()const{return reflex_.active();}
+    bool reflexDisablePending()const{return reflex_.disablePending();}
+    bool reflexFailed()const{return reflex_.failed();}
+    bool reflexStalled()const{return reflex_.stalled();}
+    // Host time (steady clock, 100 ns) of the last swap-chain Present call, taken
+    // just before it as RTSS and PresentMon do: the 1% low counts these, not
+    // returns, whose spacing also carries the call's own 0.2-0.6 ms jitter.
+    int64_t lastPresentCallHost100ns()const{return lastPresentCallHost100ns_;}
+    bool pacingActive()const{return sink_.pacingActive();}
+    uint64_t generation()const{return generation_;}
+    // Explicit integration-test capture only; never called by playback/export.
+    bool readPresentedFrameForTest(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,sink::RgbaImage&);
+    // A visible HDR panel can request sparse GPU statistics. No pixel readback.
+    void observeHdrCoverage(bool on){probeObserved_=on;if(!on)liveCoverage_={};}
+    const HdrCurveCoverage& liveCurveCoverage() const { return liveCoverage_; }
+    // Test-only buffer reference for lossless HDR readback. Drains the private
+    // queue; caller drains the shared queue and releases before resize/close.
+    Microsoft::WRL::ComPtr<ID3D12Resource> presentedResourceForTest();
+    uint64_t submittedCount() const {return sink_.presentCount();}
+    uint64_t consumerFenceValue(uint64_t sharedValue)const{return presentationQueue_?presentationRing_.lastSignaledValue():sharedValue;}
+    double cpuWaitMilliseconds(const gfx::CommandSlotRing& shared)const{return presentationQueue_?presentationRing_.cpuWaitMilliseconds():shared.cpuWaitMilliseconds();}
+    uint64_t xessGeneratedCount() const {return sink_.xess()?sink_.xess()->generatedCount():0;}
+    uint64_t xessPresentedCount() const {return sink_.xess()?sink_.xess()->presentedCount():0;}
+    bool xessActive() const {return sink_.xess()!=nullptr;}
+    bool xessFailed() const {return xessFailed_;}
+    // Sustained under-rate may suppress SDK-owned XeSS-FG generation over a
+    // stable interval (xefgSwapChainSetEnabled); re-enabling goes through the
+    // per-frame history reset, never a per-frame toggle.
+    void setXessGenerationSuppressed(bool v){xessGenerationSuppressed_=v;}
+    bool xessGenerationSuppressed() const {return xessGenerationSuppressed_;}
+    // Monitor refresh for the live output budget and 跟随显示器, from the shared
+    // DisplayStateService. It is read again only on events: a new presentation
+    // chain, the window moving to another monitor, a display change or
+    // 重新检测, and one VRR confirmation (vrrConfirmAt_); never on a timer.
+    // This accessor never waits on QueryDisplayConfig or NVIDIA's driver calls.
+    double displayRefreshHz();
+    // Variable refresh state of that monitor (NVIDIA only), read with it.
+    gfx::VrrState displayVrr()const{return vrr_;}
+    // The 可变刷新 rule: the switch is on, Automatic is selected and VRR is
+    // possible on the monitor, so Automatic presents like explicit Vsync.
+    // vrrSync() is what the last configurePresentation applied.
+    static bool vrrSyncWanted(const PresentationSettings& requested,const gfx::VrrState& vrr){
+        return requested.variableRefresh&&requested.display==DisplaySync::Automatic&&gfx::vrrLevel(vrr)>=3;
+    }
+    bool vrrSync()const{return vrrSync_;}
+    diagnostics::GpuSample blitTiming(ID3D12Fence* f,uint64_t revision=0,uint64_t epoch=0){gpuTimer_.collect(presentationFence_?presentationFence_.Get():f);if((revision&&gpuTimer_.last().identity.settingsRevision!=revision)||(epoch&&gpuTimer_.last().identity.epoch!=epoch)){diagnostics::GpuSample pending;pending.state=diagnostics::SampleState::Pending;return pending;}return gpuTimer_.last().gpu[size_t(diagnostics::GpuStage::Blit)];}
+    // Application-side frame-generation timing for present-sink backends
+    // (XeSS): the copies, barriers and provider prepare work recorded on
+    // our list. collect() is idempotent, so this is safe alongside blitTiming.
+    diagnostics::GpuSample fgTiming(ID3D12Fence* f,uint64_t revision=0,uint64_t epoch=0){gpuTimer_.collect(f);if((revision&&gpuTimer_.last().identity.settingsRevision!=revision)||(epoch&&gpuTimer_.last().identity.epoch!=epoch)){diagnostics::GpuSample pending;pending.state=diagnostics::SampleState::Pending;return pending;}return gpuTimer_.last().gpu[size_t(diagnostics::GpuStage::FgBatch)];}
+std::vector<diagnostics::GpuFrameTiming> takeGpuTimings(ID3D12Fence* fence){gpuTimer_.collect(presentationFence_?presentationFence_.Get():fence);return gpuTimer_.takeCompleted();}
+void recordGpuTimings(){gpuTimer_.recordCompleted();}
+private:
+    // Custom: HDR10 static metadata for the display (MaxCLL / MaxFALL / mastering
+    // peak). Sent only when it changes, and cleared when the HDR10 path stops.
+    void applyHdrMetadata(pipeline::EnhanceGraph& graph,const HdrMetadataSettings& metadata,const HdrCurveSettings& resolvedCurve,pipeline::FrameIdentity identity);
+    bool metadataSent_=false,metadataDirty_=false;
+    // The source's mastering/CLL values are absent on many frames; holding the last
+    // real value keeps the reported metadata steady instead of flapping to the
+    // fallback (which re-sent it on nearly every frame).
+    HdrSourceMetadata sourceMetadata_{};
+    gfx::PresentSink::DisplayPeakInfo hdrPeakInfo_{};
+    std::chrono::steady_clock::time_point metadataAttempt_{};
+    DXGI_HDR_METADATA_HDR10 lastMetadata_{};
+    gfx::ReflexSession reflex_;
+    uint64_t reflexFrame_=0,reflexInputFrame_=0,generation_=0;
+    int64_t lastPresentCallHost100ns_=0;
+    bool providerOwnedPresentation_=false;
+    PresentCapture* capture_=nullptr;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> presentationQueue_;
+    Microsoft::WRL::ComPtr<ID3D12Fence> presentationFence_;
+    HANDLE presentationEvent_=nullptr;
+    gfx::CommandSlotRing presentationRing_;
+    diagnostics::GpuTimer gpuTimer_;
+    gfx::PresentSink sink_;
+    pipeline::GraphicsPass pass_;
+    pipeline::ComputePass presentMotionPass_;
+    // Overlay (VideoOverlay.h): three upload-heap textures in rotation. The GPU
+    // reads one at present time, so a texture is rewritten only after the fence
+    // of the present that last read it has completed; otherwise the upload waits
+    // a frame and the previous image stays on screen.
+    static constexpr unsigned kOverlayTextures=3;
+    // 16 for the blit itself (see PresentBlit.hlsl), 8 for the overlay.
+    static constexpr UINT kPresentBlitConstants=24;
+    std::mutex overlayMutex_;VideoOverlay overlayPending_;uint64_t overlayVersion_=0,overlayAppliedVersion_=0;
+    struct OverlayTexture{
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource, upload;
+        unsigned width=0,height=0,rowPitch=0;
+        uint64_t fenceUsed=0;
+        bool readState=false;  // resource is in PIXEL_SHADER_RESOURCE, not COMMON
+    };
+    std::array<OverlayTexture,kOverlayTextures> overlayTextures_;unsigned overlayNext_=0;
+    VideoOverlay overlayShown_;int overlayShownSlot_=-1;
+    // Fills the eight overlay constants of the present blit; true when an image is up.
+    bool applyVideoOverlay(gfx::D3D12DeviceContext& ctx,ID3D12GraphicsCommandList* list,ID3D12Fence* fence,pipeline::EnhanceGraph& graph,float* dims);
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,2> presentMotion_;
+    PreviewView previousXessView_{};
+    unsigned previousXessWidth_=0,previousXessHeight_=0;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtvs_;
+    // One bounded GPU-only composition surface, shared by sequential lists on
+    // the presentation queue. Recreated only after that queue has drained.
+    Microsoft::WRL::ComPtr<ID3D12Resource> compositeTarget_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> exclusionUiTarget_,exclusionHudlessTarget_;
+    bool exclusionUiEnabled_=false;
+    bool copyBeforePresent_=false,copyEligible_=false;
+    unsigned inc_=0;
+    static constexpr unsigned kProbeWidth=64,kProbeHeight=36,kProbeStatsBytes=5*sizeof(uint32_t);
+    pipeline::ComputePass probePass_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> probeCpuViews_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> probeStats_,probeReadback_;
+    uint64_t probeFenceValue_=0;
+    bool probePending_=false,probeObserved_=false,probeFailed_=false;
+    HdrCurveSettings probeCurve_{};
+    pipeline::FrameIdentity probeIdentity_{};
+    std::chrono::steady_clock::time_point probeNext_{};
+    HdrCurveCoverage liveCoverage_{};
+    // Custom: Dolby Vision level 1 for the frame being presented. Purely
+    // additive: the blit uses it only when the follow switch is on.
+    pipeline::DoviFrameInfo latestDovi_{};
+    // Exponential smoothing for the follow inputs. A sliding window was used here
+    // first and was wrong: halving a running sum and its integer count keeps the
+    // ratio only when the count is even, so on odd counts the average gained a
+    // fraction each time the window overflowed and drifted above every input it had
+    // seen - a peak reading of 1.11 after inputs capped at 1.0. EMA has no such
+    // accumulation and a reset path for scene cuts.
+    double avgEma_=0.0; bool avgEmaSeeded_=false;
+    double peakEma_=0.0; bool peakEmaSeeded_=false;
+    // Custom: the knee also runs through clamp() and min(user); those flatten or
+    // step, so a smoothed input can still reach the blit as a jump. The value that
+    // actually ships is smoothed here too.
+    float smoothedStartNits_=0.0f;
+    bool ensureCoverageProbe(ID3D12Device*);
+    void publishLiveCoverage(const HdrCurveSettings&,pipeline::FrameIdentity);
+    unsigned lastBuffer_=0;bool hasPresented_=false;
+    struct RetainedFrame {
+        ID3D12Fence* producer=nullptr;
+        uint64_t fence=0;
+        unsigned slot=0,width=0,height=0;
+        bool generated=false,referencesValid=false,baseReference=false,visible=false;
+        int comparison=0;float split=.5f;
+        PreviewView view{};
+        pipeline::FrameIdentity identity{};
+        HMONITOR monitor=nullptr;
+        HdrCurveSettings displayCurve{};
+        bool operator==(const RetainedFrame&)const=default;
+    };
+    std::optional<RetainedFrame> retainedFrame_;
+    HWND window_=nullptr;
+    ID3D12Device* presentationDevice_=nullptr;
+    DXGI_FORMAT presentationFormat_=DXGI_FORMAT_UNKNOWN;
+    bool captureCompatible_=false;
+    std::chrono::steady_clock::time_point lastResize_{};
+    unsigned viewWidth_=0,viewHeight_=0;
+    HMONITOR bufferMonitor_=nullptr;
+    unsigned monitorWidth_=0,monitorHeight_=0;
+    std::chrono::steady_clock::time_point nextCostLog_{};
+    std::chrono::steady_clock::time_point lastXessFrame_{};
+    pipeline::FrameIdentity lastXessIdentity_{};
+    int64_t lastXessPts100ns_=-1;
+    bool xessWasEnabled_=false;
+    bool xessFailed_=false;
+    bool xessGenerationSuppressed_=false;
+    HMONITOR refreshMonitor_=nullptr;double refreshHz_=0;gfx::VrrState vrr_{};bool refreshQueried_=false,vrrSync_=false;
+    DisplayStateService* displayStates_=nullptr;
+    uint64_t displayStateSerial_=0,displayGeneration_=0;
+    // VRR presentation may start or stop after it is requested or when the
+    // window enters/leaves fullscreen: one forced query 3 s after that settles.
+    std::optional<std::chrono::steady_clock::time_point> vrrConfirmAt_;
+    void startDisplayState();
+    void applyDisplayState(const DisplayState&);
+    uint32_t xessInputId_=0;
+    struct XessWork {pipeline::FrameIdentity identity{};uint32_t id=0;};
+    std::array<XessWork,4> xessWork_{};
+    size_t xessWorkPosition_=0;
+    bool refresh(ID3D12Device*);
+};
+}

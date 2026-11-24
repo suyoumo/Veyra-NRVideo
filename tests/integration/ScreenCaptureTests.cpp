@@ -1,0 +1,255 @@
+#include "veyra/source/ScreenCaptureSource.h"
+#include "veyra/source/VirtualDesktop.h"
+#include "veyra/gfx/D3D12DeviceContext.h"
+#include "veyra/gfx/CommandSlotRing.h"
+#include "veyra/pipeline/EnhanceGraph.h"
+#include "veyra/sink/ImageExportSink.h"
+#include "veyra/engine/EngineController.h"
+#include <windows.h>
+#include <dwmapi.h>
+#include <shobjidl.h>
+#include <wrl/client.h>
+#include <dxgi1_6.h>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <thread>
+extern "C" {
+#include <libavutil/frame.h>
+}
+using namespace veyra;
+namespace {
+int failures=0;
+GUID homeDesktop{};
+// The test pattern moves itself: Windows only lets a process move its own windows.
+// WM_APP+3 goes to another virtual desktop, WM_APP+4 back; both return 1 on success.
+LRESULT moveDesktop(HWND w,bool away){
+    constexpr CLSID managerClass{0xaa509086,0x5ca9,0x4c25,{0x8f,0x95,0x58,0x9d,0x3c,0x07,0xb4,0x8a}}; // CLSID_VirtualDesktopManager
+    Microsoft::WRL::ComPtr<IVirtualDesktopManager> manager;
+    if(FAILED(CoCreateInstance(managerClass,nullptr,CLSCTX_ALL,IID_PPV_ARGS(&manager))))return 0;
+    if(!away)return SUCCEEDED(manager->MoveWindowToDesktop(w,homeDesktop));
+    if(FAILED(manager->GetWindowDesktopId(w,&homeDesktop)))return 0;
+    for(const auto& desktop:source::vdesk::desktops())
+        if(desktop.id!=homeDesktop&&SUCCEEDED(manager->MoveWindowToDesktop(w,desktop.id)))return 1;
+    return 0;
+}
+void check(bool pass,const char* name){std::cout<<"SCREEN "<<name<<" pass="<<pass<<std::endl;failures+=!pass;}
+void pump(){MSG msg;while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
+LRESULT CALLBACK pattern(HWND w,UINT m,WPARAM wp,LPARAM lp){
+    if(m==WM_TIMER){InvalidateRect(w,nullptr,FALSE);return 0;}
+    if(m==WM_APP+1){KillTimer(w,1);return 0;}
+    if(m==WM_APP+2){SetTimer(w,1,16,nullptr);return 0;}
+    if(m==WM_APP+3||m==WM_APP+4)return moveDesktop(w,m==WM_APP+3);
+    if(m==WM_PAINT){PAINTSTRUCT ps;auto dc=BeginPaint(w,&ps);RECT r;GetClientRect(w,&r);
+        const COLORREF colors[]={RGB(225,30,45),RGB(20,210,70),RGB(25,60,225)};
+        for(int i=0;i<3;++i){RECT band{r.right*i/3,0,r.right*(i+1)/3,r.bottom};auto brush=CreateSolidBrush(colors[i]);FillRect(dc,&band,brush);DeleteObject(brush);}
+        RECT moving{int(GetTickCount64()/10%std::max(1L,r.right-24)),8,0,32};moving.right=moving.left+24;FillRect(dc,&moving,HBRUSH(GetStockObject(WHITE_BRUSH)));EndPaint(w,&ps);return 0;}
+    if(m==WM_CLOSE){DestroyWindow(w);return 0;}if(m==WM_DESTROY){PostQuitMessage(0);return 0;}
+    return DefWindowProcW(w,m,wp,lp);
+}
+bool next(source::ScreenCaptureSource& source,pipeline::FramePacket& p,const AVFrame** f,unsigned timeout=3000){
+    const auto end=GetTickCount64()+timeout;while(GetTickCount64()<end){auto status=source.read(p,f);if(status==source::SourceReadStatus::Frame)return true;if(status==source::SourceReadStatus::Error){std::wcerr<<source.status()<<std::endl;return false;}pump();Sleep(2);}return false;
+}
+bool content(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,source::ScreenCaptureSource& source,pipeline::FramePacket& p,const AVFrame* f){
+    pipeline::EnhanceGraph graph(ctx,ring);pipeline::EnhanceGraphDesc gd;gd.sourceWidth=gd.workWidth=f->width;gd.sourceHeight=gd.workHeight=f->height;gd.rgbInput=true;gd.noFeatures=true;gd.enableNr=gd.enableSr=gd.enableFg=false;gd.hdrInput=p.colorInfo.isHdrPath();
+    pipeline::EnhanceGraph::FrameOutputs out;sink::RgbaImage image;
+    bool ok=graph.initialize(gd)&&graph.createViews()&&graph.process(f,double(p.pts.to100ns())/10000,true,out,1,&p.colorInfo, &p.hardwareSurface);
+    if(ok)ok=sink::readRgba8(ctx,ring,graph.videoFrameResource(out.videoSlot),image);
+    if(ok){const unsigned y=image.height/2;for(unsigned i=0;i<3;++i){unsigned x=image.width*(2*i+1)/6;auto* pixel=&image.pixels[(size_t(y)*image.width+x)*4];std::cout<<"PIXEL "<<i<<" "<<int(pixel[0])<<","<<int(pixel[1])<<","<<int(pixel[2])<<std::endl;ok&=pixel[i]>160&&pixel[(i+1)%3]<110&&pixel[(i+2)%3]<110;}}
+    out={};ring.drainQueue();graph.shutdown();return ok;
+}
+}
+int xessResize(HWND target,unsigned multiplier,bool resizeTarget,unsigned seconds=45){
+    using Clock=std::chrono::steady_clock;
+    HWND host=CreateWindowW(L"STATIC",L"Veyra XeSS capture regression",WS_OVERLAPPEDWINDOW|WS_VISIBLE,900,40,640,400,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    SetWindowDisplayAffinity(host,WDA_EXCLUDEFROMCAPTURE);
+    engine::EngineController controller;engine::PlayerOptions settings;
+    settings.nr=settings.sr=false;settings.fg=true;settings.fgMultiplier=multiplier;settings.settings.frameGenerationBackend=engine::FrameGenerationBackend::XeSS;
+    source::ScreenCaptureOptions options;options.target=uint64_t(target);options.fps=60;options.cursor=false;
+    controller.open(host,options.uri(),settings);
+    const auto end=Clock::now()+std::chrono::seconds(resizeTarget?100:seconds);
+    auto lastProgress=Clock::now(),lastReport=Clock::now();uint64_t lastFrames=0;unsigned dimensions=0,lastW=0,lastH=0,phase=0;bool ok=true;
+    const SIZE sizes[]={{800,451},{1280,720},{800,450},{1280,721},{960,540},{800,451}};
+    auto nextResize=Clock::now()+std::chrono::seconds(3);
+    while(Clock::now()<end){
+        pump();Sleep(10);const auto s=controller.snapshot();
+        if(s.failed){std::wcout<<L"XESS failure "<<s.status<<std::endl;ok=false;break;}
+        if(s.frames>lastFrames){lastFrames=s.frames;lastProgress=Clock::now();}
+        if(s.sourceWidth&&s.sourceHeight&&(s.sourceWidth!=lastW||s.sourceHeight!=lastH)){
+            lastW=s.sourceWidth;lastH=s.sourceHeight;++dimensions;
+            std::cout<<"XESS_DIMENSIONS "<<lastW<<'x'<<lastH<<" frames="<<s.frames<<std::endl;
+        }
+        if(Clock::now()-lastReport>std::chrono::seconds(1)){
+            lastReport=Clock::now();const auto& f=s.metrics.flow;
+            std::cout<<"XESS_PROGRESS multiplier="<<multiplier<<" frames="<<s.frames<<" presented="<<f.counters.xessSdkPresented<<" providerFps="<<f.xessSdkSubmitFps<<std::endl;
+            if(!std::isfinite(f.xessSdkSubmitFps)||f.xessSdkSubmitFps>100000||f.counters.xessSdkPresented>1000000){ok=false;break;}
+        }
+        if(Clock::now()-lastProgress>std::chrono::seconds(12)){ok=false;break;}
+        if(resizeTarget&&Clock::now()>=nextResize&&s.frames>20){
+            if(phase==std::size(sizes)){if(Clock::now()-lastProgress<std::chrono::seconds(1))break;}
+            else{
+                RECT r{0,0,sizes[phase].cx,sizes[phase].cy};AdjustWindowRectEx(&r,DWORD(GetWindowLongPtrW(target,GWL_STYLE)),FALSE,DWORD(GetWindowLongPtrW(target,GWL_EXSTYLE)));
+                SetWindowPos(target,nullptr,40,40,r.right-r.left,r.bottom-r.top,SWP_NOZORDER|SWP_NOACTIVATE);
+                ++phase;nextResize=Clock::now()+std::chrono::seconds(3);
+            }
+        }
+    }
+    const auto s=controller.snapshot();ok=ok&&s.running&&!s.failed&&s.frames>100&&dimensions>=(resizeTarget?6u:2u)&&s.metrics.flow.counters.xessSdkPresented>0;
+    check(ok,resizeTarget?"XeSS real WGC repeated resize continues provider and frame progress":"browser video fullscreen keeps XeSS capture progressing");
+    controller.stop();const auto drain=Clock::now()+std::chrono::seconds(10);while(!controller.idle()&&Clock::now()<drain){pump();Sleep(10);}
+    check(controller.idle(),"XeSS resize engine drains after stop");DestroyWindow(host);return ok&&controller.idle()?0:1;
+}
+int wmain(int argc,wchar_t** argv){
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    if(argc>3&&std::wstring(argv[1])==L"--xess-window")
+        return xessResize(reinterpret_cast<HWND>(_wcstoui64(argv[2],nullptr,0)),unsigned(_wtoi(argv[3])),false,argc>4?unsigned(_wtoi(argv[4])):45);
+    if(argc>1&&std::wstring(argv[1])==L"--target"){
+        WNDCLASSW wc{};wc.lpfnWndProc=pattern;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"VeyraScreenTestPattern";RegisterClassW(&wc);
+        auto window=CreateWindowW(wc.lpszClassName,L"Veyra capture test pattern",WS_OVERLAPPEDWINDOW|WS_VISIBLE,40,40,660,420,nullptr,nullptr,wc.hInstance,nullptr);SetTimer(window,1,16,nullptr);
+        auto end=GetTickCount64()+240000;MSG msg;while(GetTickCount64()<end){if(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){if(msg.message==WM_QUIT)break;TranslateMessage(&msg);DispatchMessageW(&msg);}else Sleep(2);}return 0;
+    }
+    wchar_t path[32768];GetModuleFileNameW(nullptr,path,32768);std::wstring command=L"\""+std::wstring(path)+L"\" --target";
+    STARTUPINFOW si{sizeof(si)};PROCESS_INFORMATION process{};if(!CreateProcessW(path,command.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&si,&process))return 2;
+    struct Child {PROCESS_INFORMATION p;HWND window=nullptr;~Child(){if(window)PostMessageW(window,WM_CLOSE,0,0);if(WaitForSingleObject(p.hProcess,3000)==WAIT_TIMEOUT)TerminateProcess(p.hProcess,1);CloseHandle(p.hThread);CloseHandle(p.hProcess);}} child{process};
+    for(int i=0;i<100&&!child.window;++i){for(auto& t:source::ScreenCaptureSource::targets(source::ScreenTargetKind::Window))if(t.processId==process.dwProcessId)child.window=HWND(t.handle);Sleep(20);}if(!child.window)return 3;
+    if(argc>1&&std::wstring(argv[1])==L"--xess-resize")return xessResize(child.window,argc>2?unsigned(_wtoi(argv[2])):4,true);
+    gfx::D3D12DeviceContext ctx;gfx::CommandSlotRing ring;Status st;gfx::DeviceContextDesc dd;dd.enableDebugLayer=true;
+    if(!ctx.initialize(dd,st)||!ring.initialize(ctx.device(),ctx.directQueue(),ctx.fence(),ctx.fenceEvent(),4,st))return 4;
+    source::ScreenCaptureOptions options;check(options.fps==0,"default follows display refresh");options.target=uint64_t(child.window);options.fps=60;options.cursor=false;
+    source::ScreenCaptureOptions parsed;check(source::ScreenCaptureOptions::parse(options.uri(),parsed)&&parsed.target==options.target,"URI round trip");check(!source::ScreenCaptureOptions::parse(options.uri()+L":3",parsed),"reject malformed URI");
+    {source::ScreenCaptureOptions game=options;game.borderless=true;game.cursor=false;source::ScreenCaptureOptions back;
+     check(source::ScreenCaptureOptions::parse(game.uri(),back)&&back.borderless&&!back.cursor&&back.target==game.target,"borderless URI round trip");
+     game.borderless=false;game.cursor=true;check(source::ScreenCaptureOptions::parse(game.uri(),back)&&!back.borderless&&back.cursor,"old cursor field keeps the border");}
+    source::SourceOpenDesc desc;desc.path=options.uri();desc.d3d12Device=ctx.device();desc.d3d12Queue=ctx.directQueue();source::ScreenCaptureSource source;
+    bool opened=source.open(desc);check(opened,"WGC open");if(!opened){std::wcerr<<source.status()<<std::endl;return 5;}
+    pipeline::FramePacket p;const AVFrame* f=nullptr;bool frame=next(source,p,&f);check(frame,"WGC first real frame");if(!frame)return 6;
+    check(content(ctx,ring,source,p,f),"WGC shared GPU graph RGB stripe content");
+    const auto initialReceived=source.metrics().received,initialDropped=source.metrics().dropped;
+    auto end=GetTickCount64()+4000;unsigned frames=0;int64_t last=0;bool monotonic=true;
+    while(GetTickCount64()<end){if(source.read(p,&f)==source::SourceReadStatus::Frame){monotonic&=p.pts.to100ns()>last;last=p.pts.to100ns();++frames;}pump();Sleep(2);}
+    const auto received=source.metrics().received-initialReceived,dropped=source.metrics().dropped-initialDropped;
+    check(monotonic&&frames>60&&frames<=245&&frames+2>=received-dropped&&dropped<received/10+2,"sustained capture follows producer with monotonic PTS and bounded loss");std::cout<<"RATE fourSecondsFrames="<<frames<<" received="<<received<<" dropped="<<dropped<<std::endl;
+    // Hold every lease: source must stop producing rather than overwrite.
+    std::vector<AVFrame*> held;for(int i=0;i<6;++i)if(next(source,p,&f))held.push_back(av_frame_clone(f));
+    auto before=source.metrics().delivered;end=GetTickCount64()+200;while(GetTickCount64()<end){source.read(p,&f);Sleep(2);}check(held.size()==6&&source.metrics().delivered==before,"bounded pool refuses reuse while all leases held");
+    for(auto* value:held)av_frame_free(&value);held.clear();check(next(source,p,&f),"pool resumes after lease release");
+    ShowWindow(child.window,SW_MINIMIZE);Sleep(100);check(source.read(p,&f)==source::SourceReadStatus::Waiting,"minimized waits");ShowWindow(child.window,SW_RESTORE);check(next(source,p,&f)&&pipeline::breaksHistory(p.flags),"restore resets temporal history");
+    SetWindowPos(child.window,nullptr,40,40,820,510,SWP_NOZORDER);end=GetTickCount64()+3000;bool resized=false;
+    while(GetTickCount64()<end&&next(source,p,&f)){if(f->width>660){resized=true;break;}}
+    check(resized&&unsigned(f->width)==source.info().width,"resize updates dimensions");check(content(ctx,ring,source,p,f),"resize retains RGB content");
+    check(resized&&std::abs(source.info().displayAspect-double(f->width)/f->height)<1e-9,"resize updates source display aspect");
+    SetWindowPos(child.window,nullptr,40,40,460,720,SWP_NOZORDER);end=GetTickCount64()+4000;resized=false;
+    while(GetTickCount64()<end&&next(source,p,&f)){
+        if(f->height>f->width){resized=true;break;}
+    }
+    check(resized&&pipeline::hasFrameFlag(p.flags,pipeline::FrameFlagBits::Resize)&&
+          std::abs(source.info().displayAspect-double(f->width)/f->height)<1e-9,
+          "portrait resize publishes new DAR and temporal reset flag together");
+    check(resized&&content(ctx,ring,source,p,f),"portrait resize retains actual RGB content");
+    // A static window cannot rely on an animation to deliver another frame
+    // after the300ms pool debounce. Exercise that source contract directly,
+    // independently of a QML Timer's render-loop wakeups in an inactive window.
+    PostMessageW(child.window,WM_APP+1,0,0);Sleep(80);
+    SetWindowPos(child.window,nullptr,40,40,700,430,SWP_NOZORDER);
+    end=GetTickCount64()+4000;bool staticResized=false;
+    while(GetTickCount64()<end&&next(source,p,&f)){
+        if(f->width>f->height&&f->width>600){staticResized=true;break;}
+    }
+    check(staticResized&&pipeline::hasFrameFlag(p.flags,pipeline::FrameFlagBits::Resize)&&
+          source.info().width==unsigned(f->width)&&source.info().height==unsigned(f->height)&&
+          std::abs(source.info().displayAspect-double(f->width)/f->height)<1e-9,
+          "static window resize updates real frame metadata without ongoing animation");
+    PostMessageW(child.window,WM_APP+2,0,0);
+    source.close();options.left=30;options.right=30;options.top=20;options.bottom=20;desc.path=options.uri();check(source.open(desc)&&next(source,p,&f)&&f->width<820,"cropped source opens");source.close();
+    options.left=options.right=options.top=options.bottom=0;
+    options.fps=0;check(source::ScreenCaptureOptions::parse(options.uri(),parsed)&&parsed.fps==0,"automatic rate URI round trip");
+    MONITORINFOEXW monitorInfo{};monitorInfo.cbSize=sizeof(monitorInfo);DEVMODEW displayMode{};displayMode.dmSize=sizeof(displayMode);
+    const bool displayKnown=GetMonitorInfoW(MonitorFromWindow(child.window,MONITOR_DEFAULTTONEAREST),&monitorInfo)&&EnumDisplaySettingsW(monitorInfo.szDevice,ENUM_CURRENT_SETTINGS,&displayMode);
+    desc.path=options.uri();const bool autoOpened=source.open(desc)&&next(source,p,&f);
+    check(autoOpened&&displayKnown&&source.info().nominalRateNum>0&&source.info().nominalRateDen>0&&std::abs(source.info().averageFps-displayMode.dmDisplayFrequency)<1.1,"automatic window rate matches target display");
+    check(autoOpened&&p.duration.to100ns()>0&&std::abs(double(p.duration.to100ns())*source.info().averageFps-10000000)<1000,"automatic first frame has valid nominal duration");
+    std::cout<<"AUTO rate="<<source.info().nominalRateNum<<"/"<<source.info().nominalRateDen<<" displayHz="<<displayMode.dmDisplayFrequency<<std::endl;
+    if(autoOpened)check(content(ctx,ring,source,p,f),"automatic window capture actual RGB content");source.close();
+    if(argc>1&&std::wstring(argv[1])==L"--engine"){
+        HWND host=CreateWindowW(L"STATIC",L"Screen engine test",WS_OVERLAPPEDWINDOW|WS_VISIBLE,880,40,720,480,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        SetWindowDisplayAffinity(host,WDA_EXCLUDEFROMCAPTURE);engine::EngineController engine;engine::PlayerOptions settings;settings.nr=true;settings.fg=true;settings.fgMultiplier=4;engine.open(host,options.uri(),settings);
+        end=GetTickCount64()+20000;while(GetTickCount64()<end){pump();Sleep(10);}auto snapshot=engine.snapshot();check(snapshot.running&&!snapshot.failed&&snapshot.frames>100&&snapshot.generated>100&&snapshot.nrEvaluated>100,"screen NR and DLSS4x actual evaluation");std::wcout<<L"ENGINE "<<snapshot.status<<L" frames="<<snapshot.frames<<L" generated="<<snapshot.generated<<L" nr="<<snapshot.nrEvaluated<<std::endl;
+        const auto framesBeforeResize=snapshot.frames;
+        SetWindowPos(child.window,nullptr,40,40,820,510,SWP_NOZORDER);
+        end=GetTickCount64()+10000;bool engineResized=false;
+        while(GetTickCount64()<end){
+            pump();Sleep(10);snapshot=engine.snapshot();
+            if(snapshot.sourceWidth>snapshot.sourceHeight&&snapshot.sourceWidth>700&&snapshot.frames>framesBeforeResize+5){engineResized=true;break;}
+            if(snapshot.failed)break;
+        }
+        check(engineResized&&std::abs(snapshot.sourceDisplayAspect-double(snapshot.sourceWidth)/snapshot.sourceHeight)<1e-9,
+              "engine window resize refreshes UI dimensions and DAR while frames advance");
+        engine.stop();end=GetTickCount64()+10000;while(!engine.idle()&&GetTickCount64()<end){pump();Sleep(10);}check(engine.idle(),"engine stop drains");DestroyWindow(host);
+    }
+    HWND excluded=CreateWindowW(L"STATIC",L"Screen exclusion test",WS_OVERLAPPEDWINDOW|WS_VISIBLE,880,40,200,160,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    DWORD affinity=0;check(GetWindowDisplayAffinity(excluded,&affinity)&&affinity==WDA_NONE,"initial own window remains capturable");
+    auto monitors=source::ScreenCaptureSource::targets(source::ScreenTargetKind::Monitor);check(!monitors.empty(),"enumerate monitors");
+    {   // Issue #107: each monitor names the adapter driving its display path, the
+        // adapter DXGI lists it under; a window target names its monitor's adapter.
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        bool named=!monitors.empty()&&factory;
+        for(const auto& m:monitors){
+            bool listed=false;
+            for(UINT a=0;factory;++a){Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;if(factory->EnumAdapters1(a,&adapter)==DXGI_ERROR_NOT_FOUND)break;
+                DXGI_ADAPTER_DESC1 d{};adapter->GetDesc1(&d);const uint64_t luid=uint64_t(uint32_t(d.AdapterLuid.HighPart))<<32|d.AdapterLuid.LowPart;
+                for(UINT o=0;;++o){Microsoft::WRL::ComPtr<IDXGIOutput> output;if(adapter->EnumOutputs(o,&output)==DXGI_ERROR_NOT_FOUND)break;
+                    DXGI_OUTPUT_DESC od{};if(SUCCEEDED(output->GetDesc(&od))&&uint64_t(od.Monitor)==m.handle&&luid==m.displayAdapter)listed=true;}}
+            std::cout<<"DISPLAY-ADAPTER monitor="<<m.handle<<" luid="<<std::hex<<m.displayAdapter<<std::dec<<" listedByDxgi="<<listed<<std::endl;
+            named=named&&m.displayAdapter&&listed&&m.displayAdapter==source::displayAdapterLuid(reinterpret_cast<void*>(m.handle));
+        }
+        check(named,"monitors name the adapter that drives their display");
+        bool window=false;const auto own=source::displayAdapterLuid(MonitorFromWindow(child.window,MONITOR_DEFAULTTONEAREST));
+        for(const auto& t:source::ScreenCaptureSource::targets(source::ScreenTargetKind::Window))if(t.handle==uint64_t(child.window))window=own&&t.displayAdapter==own;
+        check(window,"window target names its monitor's display adapter");
+        check(!source::displayAdapterLuid(nullptr),"no monitor has no display adapter");
+    }
+    if(!monitors.empty())for(auto method:{source::ScreenCaptureMethod::Wgc,source::ScreenCaptureMethod::Duplication}){
+        const auto monitor=MonitorFromWindow(child.window,MONITOR_DEFAULTTONEAREST);MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(monitor,&mi);
+        RECT client{};GetClientRect(child.window,&client);POINT origin{};ClientToScreen(child.window,&origin);
+        SetWindowPos(child.window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE);Sleep(150);
+        options.kind=source::ScreenTargetKind::Monitor;options.target=uint64_t(monitor);options.method=method;
+        options.left=origin.x-mi.rcMonitor.left;options.top=origin.y-mi.rcMonitor.top;options.right=mi.rcMonitor.right-origin.x-client.right;options.bottom=mi.rcMonitor.bottom-origin.y-client.bottom;
+        desc.path=options.uri();bool ok=source.open(desc)&&next(source,p,&f);check(ok&&content(ctx,ring,source,p,f),method==source::ScreenCaptureMethod::Wgc?"WGC monitor actual RGB content":"DXGI monitor actual RGB content");if(!ok)std::wcerr<<source.status()<<std::endl;
+        check(GetWindowDisplayAffinity(excluded,&affinity)&&affinity==WDA_EXCLUDEFROMCAPTURE,"monitor capture excludes own window");
+        source.close();check(GetWindowDisplayAffinity(excluded,&affinity)&&affinity==WDA_NONE,"stop restores original window affinity");
+    }
+    DestroyWindow(excluded);
+    options.left=options.top=options.right=options.bottom=0;
+    // Windows virtual desktops: a window on a desktop that is not shown is cloaked by
+    // the shell, yet must stay listed and keep being captured with real content.
+    // Needs a second desktop (Win+Ctrl+D); without one the case is reported as skipped.
+    if(source::vdesk::desktops().size()<2)std::cout<<"SCREEN virtual desktop cases skipped: create a second desktop with Win+Ctrl+D"<<std::endl;
+    else{
+        SetWindowPos(child.window,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE);
+        DWORD_PTR moved=0;
+        const bool away=SendMessageTimeoutW(child.window,WM_APP+3,0,0,SMTO_ABORTIFHUNG,5000,&moved)&&moved;
+        check(away,"test window moves to another virtual desktop");
+        if(away){
+            Sleep(300);
+            check(source::vdesk::shellCloaked(child.window),"window on another virtual desktop is cloaked by the shell");
+            bool listed=false;
+            for(const auto& t:source::ScreenCaptureSource::targets(source::ScreenTargetKind::Window))
+                if(t.handle==uint64_t(child.window))listed=t.otherDesktop&&t.desktopNumber>0;
+            check(listed,"window on another virtual desktop stays listed with its desktop number");
+            options.kind=source::ScreenTargetKind::Window;options.target=uint64_t(child.window);options.method=source::ScreenCaptureMethod::Wgc;options.fps=60;options.cursor=false;
+            desc.path=options.uri();const bool ok=source.open(desc)&&next(source,p,&f,5000);
+            check(ok&&content(ctx,ring,source,p,f),"WGC window on another virtual desktop actual RGB content");if(!ok)std::wcerr<<source.status()<<std::endl;
+            const auto before=source.metrics().delivered;end=GetTickCount64()+1000;
+            while(GetTickCount64()<end){source.read(p,&f);pump();Sleep(2);}
+            std::cout<<"VDESK oneSecondFrames="<<source.metrics().delivered-before<<std::endl;
+            check(ok&&source.metrics().delivered>before+20,"window on another virtual desktop keeps delivering frames");
+            source.close();
+            DWORD_PTR back=0;
+            check(SendMessageTimeoutW(child.window,WM_APP+4,0,0,SMTO_ABORTIFHUNG,5000,&back)&&back,"test window returns to the shown desktop");
+            Sleep(300);
+            check(!source::vdesk::shellCloaked(child.window),"window back on the shown desktop is not cloaked");
+        }
+    }
+    options.kind=source::ScreenTargetKind::Window;options.target=uint64_t(child.window);options.method=source::ScreenCaptureMethod::Wgc;desc.path=options.uri();check(source.open(desc),"window reopen");PostMessageW(child.window,WM_CLOSE,0,0);WaitForSingleObject(process.hProcess,3000);check(source.read(p,&f)==source::SourceReadStatus::Error,"closed target reports error");source.close();
+    std::cout<<"SCREEN failures="<<failures<<std::endl;return failures?1:0;
+}

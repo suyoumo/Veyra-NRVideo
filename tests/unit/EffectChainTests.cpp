@@ -1,0 +1,1736 @@
+// EffectChain: conversion fidelity and the ordering rules that both editing
+// modes must obey. These are the guards for the multi-NR and node-mode work.
+#include "veyra/engine/EffectChain.h"
+#include "veyra/engine/GraphDescription.h"
+#include "veyra/engine/BackendRecovery.h"
+#include <type_traits>
+#include <algorithm>
+#include <random>
+#include <memory>
+#include <limits>
+
+#include <cstdio>
+#include <string>
+
+using namespace veyra::engine;
+
+namespace {
+int failures = 0;
+void check(bool ok, const char* label) {
+    std::printf("%s %s\n", ok ? "PASS" : "FAIL", label);
+    if (!ok) ++failures;
+}
+
+EnhancementSettings populated() {
+    EnhancementSettings s;
+    s.revision = 7;
+    s.nr = true; s.sr = true; s.lowLatency = true;
+    s.model = NrSettings{0.8f, 0.7f, 0.6f, 0.2f, 1, 1, 0};
+    s.residual = ResidualSettings{1.4f, 0.8f, 1.1f, 0.9f, 1.2f};
+    s.nrRuntime = NrRuntime::Ampere;
+    s.nrTemporal = true;
+    s.protection.enabled = true;
+    s.protection.featherPixels = 12;
+    s.protection.regions[1] = {0.1f, 0.2f, 0.3f, 0.4f};
+    s.color.enabled = true;
+    s.color.exposure = 0.25f;
+    s.color.setLutName(L"Kodak.cube");
+    s.videoHdr.enabled = true;
+    s.videoHdr.peakNits = 1200;
+    s.multiplier = 4;
+    s.frameGenerationBackend = FrameGenerationBackend::Dlss;
+    s.videoSrQuality = 3;
+    s.srTarget = veyra::pipeline::SrTarget::Uhd4K;
+    // Fields that are not stages: the chain must not disturb them.
+    s.audioOffsetMs = 40;
+    s.audioSync = AudioSyncMode::Manual;
+    s.captureCompatible = true;
+    s.exportBitrateMbps = 90;
+    s.flow = FlowQuality::Quality;
+    return s;
+}
+} // namespace
+
+__declspec(noinline) void testNodeEditorGraph() {
+    auto document = std::make_unique<EffectChain>();
+    document->mode = ChainMode::Node; document->nodeCount = 4;
+    document->nodes[0].type = EffectType::NrEnhance; document->nodes[0].enabled = true;
+    document->nodes[0].nr.model.intensity = 0.73f;
+    document->nodes[0].nr.sizePolicy = veyra::pipeline::NrSizePolicy::Native;
+    document->nodes[1].type = EffectType::Color; document->nodes[1].enabled = true;
+    document->nodes[1].color.exposure = 0.63f;
+    document->nodes[1].color.curves[0].points[1].y = 0.8f;
+    document->nodes[1].color.setLutName(L"unchanged-reference.cube");
+    document->nodes[2].type = EffectType::SuperResolution;
+    document->nodes[3].type = EffectType::FrameGeneration;
+    NodeGraphLayout graph;
+    check(graph.initialize(*document).accepted, "editor: migrate clean legacy linear chain");
+    auto output = std::make_unique<EffectChain>();
+    check(graph.project(*document, *output).accepted && *output == *document,
+          "editor: migration retains exact runtime payload and order");
+    const uint32_t nr = graph.ids[0], color = graph.ids[1], sr = graph.ids[2], fg = graph.ids[3];
+    auto previous = std::make_unique<EffectChain>(*output);
+    uint32_t copy = 999;
+    check(graph.duplicate(*document, nr, copy).accepted && copy != nr && copy != 999,
+          "editor: duplicate uses new independent ID");
+    const int ci = graph.indexOf(*document, copy);
+    check(ci >= 0 && document->nodes[ci].enabled &&
+          document->nodes[ci].nr == document->nodes[0].nr && graph.next[ci] == 0,
+          "editor: NR duplicate keeps all parameters, size and enabled state while detached");
+    check(graph.project(*document, *output).accepted && *output == *previous,
+          "editor: enabled detached duplicate cannot enter runtime chain");
+    document->nodes[ci].nr.model.intensity = 0.17f;
+    check(document->nodes[0].nr.model.intensity == 0.73f, "editor: cloned NR parameters are independent");
+    check(graph.insertAfter(*document, copy, nr).accepted && graph.project(*document, *output).accepted &&
+          output->nodeCount == 5 && output->nodes[1].nr.model.intensity == 0.17f,
+          "editor: explicit insertion alone routes detached node into execution");
+    check(graph.remove(*document, copy).accepted && graph.project(*document, *output).accepted &&
+          *output == *previous && graph.ids[0] == nr && graph.ids[1] == color,
+          "editor: deleting active copy bypasses it and preserves original IDs and payload");
+    uint32_t nextCopy = 0;
+    check(graph.duplicate(*document, color, nextCopy).accepted && nextCopy > copy,
+          "editor: removed IDs are never recycled");
+    const int cc = graph.indexOf(*document, nextCopy);
+    check(document->nodes[cc].color == document->nodes[1].color,
+          "editor: Color clone copies complete curve HSL wheel and LUT payload");
+    document->nodes[cc].color.exposure = -0.5f;
+    check(document->nodes[1].color.exposure == 0.63f, "editor: cloned color is independent");
+    const auto beforeGraph = graph;
+    auto beforeDocument = std::make_unique<EffectChain>(*document);
+    uint32_t untouched = 123;
+    check(!graph.duplicate(*document, sr, untouched).accepted && untouched == 123 && graph == beforeGraph &&
+          *document == *beforeDocument, "editor: disabled singleton duplication rejected atomically");
+    check(!graph.duplicate(*document, fg, untouched).accepted &&
+          !graph.duplicate(*document, NodeGraphLayout::Input, untouched).accepted &&
+          !graph.remove(*document, NodeGraphLayout::Output).accepted, "editor: singleton and fixed endpoints cannot clone");
+    check(!graph.connect(*document, nextCopy, nr).accepted && graph == beforeGraph,
+          "editor: competing incoming edge rejected without mutations");
+    check(!graph.connect(*document, nextCopy, nextCopy).accepted && graph == beforeGraph,
+          "editor: detached self cycle rejected without mutations");
+    check(!graph.connect(*document, nextCopy, 123456).accepted && graph == beforeGraph &&
+          !graph.connect(*document, NodeGraphLayout::Output, nr).accepted &&
+          !graph.connect(*document, nr, NodeGraphLayout::Input).accepted, "editor: invalid endpoint directions rejected");
+    check(!graph.insertAfter(*document, nextCopy, fg).accepted && graph == beforeGraph,
+          "editor: cannot insert behind even disabled FG");
+    check(graph.disconnect(*document, nr).accepted && graph.validate(*document).accepted,
+          "editor: partial wire edit remains a valid document");
+    check(!graph.project(*document, *output).accepted && *output == *previous,
+          "editor: incomplete path retains last runtime output unchanged");
+    check(graph.connect(*document, nr, color).accepted && graph.project(*document, *output).accepted,
+          "editor: reconnect restores valid runtime chain");
+    auto corrupt = graph; corrupt.ids[1] = corrupt.ids[0];
+    check(!corrupt.validate(*document).accepted, "editor: persisted duplicate IDs rejected");
+    corrupt = graph; corrupt.next[cc] = 99999;
+    check(!corrupt.validate(*document).accepted, "editor: persisted dangling edges rejected");
+    corrupt = graph; corrupt.nextId = 2;
+    check(!corrupt.validate(*document).accepted, "editor: persisted regressed ID allocator rejected");
+    check(graph.remove(*document, nextCopy).accepted && graph.project(*document, *output).accepted &&
+          *output == *previous, "editor: deleting detached node leaves runtime unchanged");
+    for (int i = 0; i < 3; ++i) check(graph.duplicate(*document, nr, copy).accepted, "editor: NR detached copies within limit");
+    check(!graph.duplicate(*document, nr, copy).accepted && document->countOf(EffectType::NrEnhance) == 4,
+          "editor: all detached and disabled nodes count towards capacity");
+    check(graph.project(*document, *output).accepted && *output == *previous,
+          "editor: maximum detached copies still consume no runtime slots");
+}
+
+void testExistingChainContracts() {
+    // 1. Round trip through the chain preserves every stage field.
+    {
+        const auto before = populated();
+        auto after = before;
+        fromChain(toChain(before), after);
+        check(after.nr == before.nr && after.sr == before.sr, "round trip keeps the stage switches");
+        check(after.model == before.model, "round trip keeps the NR model parameters");
+        check(after.residual == before.residual, "round trip keeps the residual parameters");
+        check(after.nrRuntime == before.nrRuntime, "round trip keeps the NR runtime");
+        check(after.nrTemporal == before.nrTemporal, "round trip keeps temporal anti-flicker");
+        check(after.lowLatency == before.lowLatency, "round trip keeps the NR-first order");
+        check(after.protection.enabled && after.protection.featherPixels == 12 &&
+              after.protection.regions[1].right == 0.3f && after.protection.regions[1].bottom == 0.4f, "round trip keeps the protection regions");
+        check(after.color.enabled && after.color.lutNameString() == before.color.lutNameString() &&
+              after.color.exposure == before.color.exposure, "round trip keeps the colour grade");
+        check(after.videoHdr.enabled && after.videoHdr.peakNits == 1200, "round trip keeps Video HDR");
+        check(after.multiplier == 4, "round trip keeps the frame-generation multiplier");
+        check(after.videoSrQuality == 3, "round trip keeps the SR quality");
+        // Non-stage fields are the caller's: fromChain must leave them alone.
+        check(after.audioOffsetMs == 40 && after.audioSync == AudioSyncMode::Manual,
+              "round trip does not touch audio settings");
+        check(after.captureCompatible && after.exportBitrateMbps == 90,
+              "round trip does not touch capture or export settings");
+        check(after.flow == FlowQuality::Quality, "round trip does not touch the flow quality");
+    }
+
+    // 2. A disabled stage stays disabled through the round trip.
+    {
+        auto before = populated();
+        before.nr = false; before.sr = false; before.multiplier = 1;
+        before.videoHdr.enabled = false; before.protection.enabled = false;
+        auto after = before;
+        fromChain(toChain(before), after);
+        check(!after.nr && !after.sr && after.multiplier == 1 && !after.videoHdr.enabled &&
+              !after.protection.enabled, "round trip keeps disabled stages disabled");
+    }
+
+    // 3. List order is the product order and NR defaults to exactly one layer.
+    {
+        const auto chain = toChain(populated());
+        check(chain.nodeCount == 6, "list chain has one node per stage");
+        check(chain.nodes[0].type == EffectType::Color &&
+              chain.nodes[1].type == EffectType::SuperResolution &&
+              chain.nodes[2].type == EffectType::NrEnhance &&
+              chain.nodes[3].type == EffectType::Protection &&
+              chain.nodes[4].type == EffectType::VideoHdr &&
+              chain.nodes[5].type == EffectType::FrameGeneration,
+              "list chain is colour, SR, NR, protection, HDR, frame generation");
+        check(chain.countOf(EffectType::NrEnhance) == 1, "list chain has a single NR layer");
+    }
+
+    // 4. Frame generation must be last. This is what stops the UI from moving it.
+    {
+        EffectChain chain;
+        chain.nodeCount = 2;
+        chain.nodes[0] = ChainNode{}; chain.nodes[0].type = EffectType::FrameGeneration; chain.nodes[0].enabled = true;
+        chain.nodes[1] = ChainNode{}; chain.nodes[1].type = EffectType::NrEnhance; chain.nodes[1].enabled = true;
+        const auto verdict = validateChain(chain);
+        check(!verdict.accepted && std::string(verdict.message).find("补帧") != std::string::npos,
+              "frame generation before another enabled stage is rejected");
+
+        EffectChain ok;
+        ok.nodeCount = 2;
+        ok.nodes[0] = ChainNode{}; ok.nodes[0].type = EffectType::NrEnhance; ok.nodes[0].enabled = true;
+        ok.nodes[1] = ChainNode{}; ok.nodes[1].type = EffectType::FrameGeneration; ok.nodes[1].enabled = true;
+        check(validateChain(ok).accepted, "frame generation last is accepted");
+
+        // A disabled trailing node does not push FG out of last place.
+        EffectChain trailing;
+        trailing.nodeCount = 3;
+        trailing.nodes[0] = ChainNode{}; trailing.nodes[0].type = EffectType::NrEnhance; trailing.nodes[0].enabled = true;
+        trailing.nodes[1] = ChainNode{}; trailing.nodes[1].type = EffectType::FrameGeneration; trailing.nodes[1].enabled = true;
+        trailing.nodes[2] = ChainNode{}; trailing.nodes[2].type = EffectType::VideoHdr; trailing.nodes[2].enabled = false;
+        check(validateChain(trailing).accepted, "a disabled node after frame generation is allowed");
+    }
+
+    // 5. Video HDR may only be followed by frame generation.
+    {
+        EffectChain chain;
+        chain.nodeCount = 2;
+        chain.nodes[0] = ChainNode{}; chain.nodes[0].type = EffectType::VideoHdr; chain.nodes[0].enabled = true;
+        chain.nodes[1] = ChainNode{}; chain.nodes[1].type = EffectType::NrEnhance; chain.nodes[1].enabled = true;
+        const auto verdict = validateChain(chain);
+        check(!verdict.accepted && std::string(verdict.message).find("HDR") != std::string::npos,
+              "a stage after Video HDR is rejected");
+
+        EffectChain ok;
+        ok.nodeCount = 3;
+        ok.nodes[0] = ChainNode{}; ok.nodes[0].type = EffectType::VideoHdr; ok.nodes[0].enabled = true;
+        ok.nodes[1] = ChainNode{}; ok.nodes[1].type = EffectType::FrameGeneration; ok.nodes[1].enabled = true;
+        ok.nodes[2] = ChainNode{}; ok.nodes[2].type = EffectType::NrEnhance; ok.nodes[2].enabled = false;
+        check(validateChain(ok).accepted, "a disabled stage after Video HDR is allowed");
+
+        // Video HDR is pinned in front of frame generation: an enabled stage
+        // between them would have to consume HDR, which only FG can do.
+        EffectChain between;
+        between.nodeCount = 3;
+        between.nodes[0] = ChainNode{}; between.nodes[0].type = EffectType::VideoHdr; between.nodes[0].enabled = true;
+        between.nodes[1] = ChainNode{}; between.nodes[1].type = EffectType::Color; between.nodes[1].enabled = true;
+        between.nodes[2] = ChainNode{}; between.nodes[2].type = EffectType::FrameGeneration; between.nodes[2].enabled = true;
+        check(!validateChain(between).accepted, "an enabled stage between Video HDR and frame generation is rejected");
+
+        // Video HDR after frame generation is also refused.
+        EffectChain afterFg;
+        afterFg.nodeCount = 2;
+        afterFg.nodes[0] = ChainNode{}; afterFg.nodes[0].type = EffectType::FrameGeneration; afterFg.nodes[0].enabled = true;
+        afterFg.nodes[1] = ChainNode{}; afterFg.nodes[1].type = EffectType::VideoHdr; afterFg.nodes[1].enabled = true;
+        check(!validateChain(afterFg).accepted, "Video HDR after frame generation is rejected");
+    }
+
+    // 6. Instance limits come from the catalog.
+    {
+        EffectChain chain;
+        chain.nodeCount = kMaxNrInstances + 1;
+        for (uint32_t i = 0; i < chain.nodeCount; ++i) {
+            chain.nodes[i] = ChainNode{};
+            chain.nodes[i].type = EffectType::NrEnhance;
+            chain.nodes[i].enabled = true;
+        }
+        check(!validateChain(chain).accepted, "more NR layers than the catalog allows is rejected");
+        chain.nodeCount = kMaxNrInstances;
+        check(validateChain(chain).accepted, "the NR layer ceiling itself is allowed");
+        check(effectInfo(EffectType::NrEnhance).repeatable &&
+              effectInfo(EffectType::NrEnhance).maxInstances == kMaxNrInstances,
+              "the catalog marks NR as repeatable up to the ceiling");
+        check(effectInfo(EffectType::FrameGeneration).mustBeLast, "the catalog marks frame generation as last");
+        check(effectInfo(EffectType::VideoHdr).justBeforeLast && !effectInfo(EffectType::VideoHdr).mustBeLast,
+              "the catalog pins Video HDR in front of frame generation");
+        check(!effectInfo(EffectType::NrEnhance).mustBeLast && !effectInfo(EffectType::NrEnhance).justBeforeLast,
+              "NR is not pinned to a fixed position");
+    }
+
+    // 7. Rebuild rules: shape changes rebuild, live parameters do not.
+    {
+        const auto base = populated();
+        { auto next = base; next.model.intensity = 0.42f;
+          check(!requiresGraphRebuild(base, next), "an NR slider does not rebuild"); }
+        { auto next = base; next.color.exposure = -0.5f; next.color.saturation = 30;
+          check(!requiresGraphRebuild(base, next), "colour values do not rebuild"); }
+        { auto next = base; next.protection.regions[0] = {0.2f, 0.2f, 0.5f, 0.5f};
+          check(!requiresGraphRebuild(base, next), "protection rectangles do not rebuild"); }
+        { auto next = base; next.audioOffsetMs = -30; next.exportBitrateMbps = 12;
+          check(!requiresGraphRebuild(base, next), "audio and export fields do not rebuild"); }
+        { auto next = base; next.nr = false;
+          check(requiresGraphRebuild(base, next), "turning NR off rebuilds"); }
+        { auto next = base; next.multiplier = 2;
+          check(requiresGraphRebuild(base, next), "changing the multiplier rebuilds"); }
+        { auto next = base; next.nrTemporal = false;
+          check(requiresGraphRebuild(base, next), "toggling temporal anti-flicker rebuilds"); }
+        { auto next = base; next.videoHdr.enabled = false;
+          check(requiresGraphRebuild(base, next), "toggling Video HDR rebuilds"); }
+        { auto next = base; next.lowLatency = false;
+          check(requiresGraphRebuild(base, next), "changing the NR/SR order rebuilds"); }
+        { auto next = base; next.color.setLutName(L"Other.cube");
+          check(requiresGraphRebuild(base, next), "switching the LUT rebuilds"); }
+        { auto next = base; next.nrPolicy = veyra::pipeline::NrSizePolicy::Native;
+          check(requiresGraphRebuild(base, next), "changing the NR size policy rebuilds"); }
+    }
+
+    {
+        static_assert(std::is_trivially_copyable_v<EnhancementSettings>);
+        auto settings=populated();settings.additionalColorCount=kMaxColorInstances-1;
+        for(unsigned i=0;i<settings.additionalColorCount;++i){
+            auto& c=settings.additionalColors[i];c.enabled=i!=2;c.exposure=float(i)*0.2f;
+            c.setLutName(L"grade-"+std::to_wstring(i)+L".cube");
+        }
+        auto chain=toChain(settings);auto roundTrip=settings;fromChain(chain,roundTrip);
+        check(validateChain(chain).accepted&&roundTrip==settings,"six color settings round-trip independently including disabled nodes");
+        auto edited=settings;edited.additionalColors[3].exposure+=0.2f;
+        check(!requiresGraphRebuild(settings,edited)&&settings.sameVideoConfiguration(edited),"extra color uniforms remain live");
+        edited.additionalColors[3].setLutName(L"replacement.cube");
+        check(requiresGraphRebuild(settings,edited)&&!settings.sameVideoConfiguration(edited),"extra LUT changes require a rebuild");
+        edited=settings;edited.additionalColors[2].enabled=true;
+        check(requiresGraphRebuild(settings,edited)&&!settings.sameVideoConfiguration(edited),"extra color bypass changes require a rebuild");
+        edited=settings;edited.additionalColorCount=6;
+        check(!edited.validate().empty(),"a seventh color instance is rejected");
+    }
+    // P2 regression: the QML list uses this exact chain -> settings -> chain
+    // boundary. A disabled first layer must not erase it or its successors.
+    {
+        EffectChain chain; chain.nodeCount=4;
+        for(uint32_t i=0;i<chain.nodeCount;++i){
+            auto& n=chain.nodes[i]; n.type=EffectType::NrEnhance; n.enabled=i!=0;
+            n.nr.model.intensity=0.2f+0.2f*i; n.nr.residual.total=0.5f+0.2f*i;
+            n.nr.temporal=(i%2)!=0;
+        }
+        EnhancementSettings settings; fromChain(chain,settings);
+        settings.protection.enabled=true;settings.protection.regions[0]={0,0,0.3f,0.3f};
+        veyra::pipeline::EnhanceGraphDesc desc;
+        StageRequest request;request.nr=true;request.width=1920;request.height=1080;
+        describeStages(request,settings,desc);
+        check(desc.enableNr&&desc.nrLayersModel.size()==3&&desc.nrLayersModel[0]==chain.nodes[1].nr.model&&
+              desc.nrLayersModel[2]==chain.nodes[3].nr.model,"only enabled NR layers reach graph creation in list order");
+        check(desc.nrLayersTemporal==std::vector<bool>({true,false,true}),"each NR temporal flag reaches the graph");
+        check(!desc.nrLayersProtection[0].enabled&&!desc.nrLayersProtection[1].enabled&&
+              desc.nrLayersProtection[2]==settings.protection,"list protection belongs to the final NR output");
+        auto restored=toChain(settings);
+        check(restored.countOf(EffectType::NrEnhance)==4,"four NR list layers survive the settings boundary");
+        uint32_t index=0;
+        for(uint32_t i=0;i<restored.nodeCount;++i)if(restored.nodes[i].type==EffectType::NrEnhance){
+            check(index<4&&restored.nodes[i].nr==chain.nodes[index].nr&&
+                  restored.nodes[i].enabled==chain.nodes[index].enabled,"NR payload and bypass survive independently");
+            ++index;
+        }
+        auto editedChain=chain; editedChain.nodes[2].nr.model.tone=0.25f;
+        auto edited=settings; fromChain(editedChain,edited);
+        check(edited!=settings,"editing a downstream NR layer reaches settings");
+        check(!requiresGraphRebuild(settings,edited),"downstream NR uniforms stay live");
+        editedChain=chain; editedChain.nodes[2].enabled=false; fromChain(editedChain,edited);
+        check(requiresGraphRebuild(settings,edited),"bypassing an NR layer changes the graph shape");
+        editedChain=chain; editedChain.nodes[2].nr.temporal=true; fromChain(editedChain,edited);
+        check(requiresGraphRebuild(settings,edited),"a downstream temporal toggle rebuilds its resources");
+        editedChain=chain; editedChain.nodes[2].nr.runtime=NrRuntime::Community;
+        check(!validateChain(editedChain).accepted,"mixed active runtimes cannot silently share one adapter");
+        editedChain=chain; editedChain.nodes[2].nr.lowLatencyPairing=true;
+        check(!validateChain(editedChain).accepted,"mixed active NR/SR orders cannot be silently flattened");
+        for(uint32_t i=0;i<chain.nodeCount;++i)chain.nodes[i].enabled=false;
+        fromChain(chain,settings); restored=toChain(settings);
+        check(!settings.nr&&restored.countOf(EffectType::NrEnhance)==4,"all-bypassed list retains four editable layers");
+        describeStages(request,settings,desc);
+        check(!desc.enableNr&&desc.nrLayersModel.empty(),"all-bypassed list clears the reused descriptor");
+        settings.nrLayerCount=kMaxNrInstances+1;
+        check(!settings.validate().empty(),"oversized settings are rejected before allocation");
+    }
+    {
+        using namespace veyra::pipeline;
+        check(ChainNrParams{}.sizePolicy==NrSizePolicy::Realtime,"new NR instances default to 1080p");
+        const NrSizePolicy policies[]={NrSizePolicy::Realtime,NrSizePolicy::Native,NrSizePolicy::P480,
+            NrSizePolicy::P720,NrSizePolicy::P900,NrSizePolicy::P1440,NrSizePolicy::Auto};
+        const unsigned heights[]={1080,2160,480,720,900,1440,1080};
+        // Video export follows the fixed preset; Auto is fixed at 1440p offline.
+        const unsigned exportHeights[]={1080,2160,480,720,900,1440,1440};
+        for(unsigned i=0;i<7;++i){
+            EnhancementSettings s;s.nr=true;s.nrPolicy=policies[i];
+            auto c=toChain(s);EnhancementSettings restored;fromChain(c,restored);
+            check(restored.nrPolicy==policies[i],"legacy flat policy survives chain conversion");
+            StageRequest request;request.nr=true;request.width=3840;request.height=2160;
+            EnhanceGraphDesc d;describeStages(request,restored,d);
+            check(d.nrLayersExtent.size()==1&&d.nrLayersExtent[0].height==heights[i]&&
+                  d.workWidth==3840&&d.workHeight==2160,"fixed and Auto fallback policies preserve full output extent");
+            request.exportJob=true;describeStages(request,restored,d);
+            check(d.nrLayersExtent[0].height==exportHeights[i]&&d.workWidth==3840&&d.workHeight==2160&&
+                  d.validateFixedExecutionPlan().empty()&&!d.nrAutoPoolLayer,"export follows the NR size preset at full output extent without the Auto pool");
+            request.exportJob=false;request.stillImage=true;describeStages(request,restored,d);
+            check(d.nrLayersExtent[0]==Extent{3840,2160}&&!d.nrAutoPoolLayer,"image ignores preview policies and Auto pool");
+        }
+        {
+            // 8K export with a 1080p preset: NR runs at 1920x1080, output stays 7680x4320.
+            struct Case{Extent source;NrSizePolicy policy;Extent nr;};
+            const Case cases[]={{{7680,4320},NrSizePolicy::Realtime,{1920,1080}},{{7680,4320},NrSizePolicy::P1440,{2560,1440}},
+                {{7680,4320},NrSizePolicy::Auto,{2560,1440}},{{7680,4320},NrSizePolicy::Native,{7680,4320}},
+                {{3840,1600},NrSizePolicy::Realtime,{1920,800}},{{1280,720},NrSizePolicy::P1440,{1280,720}}};
+            for(const auto& k:cases){
+                EnhancementSettings e;e.nr=true;e.nrPolicy=k.policy;
+                StageRequest r;r.nr=true;r.exportJob=true;r.width=k.source.width;r.height=k.source.height;
+                EnhanceGraphDesc d;describeStages(r,e,d);
+                check(d.enableNr&&d.nrLayersExtent==std::vector<Extent>{k.nr}&&d.workWidth==k.source.width&&d.workHeight==k.source.height&&
+                      d.flowWidth==k.source.width&&d.flowHeight==k.source.height&&
+                      d.validateFixedExecutionPlan().empty()&&e.nrPolicy==k.policy,"video export NR preset extent, output size and saved preset");
+            }
+            EnhancementSettings amd;amd.nr=true;amd.nrRuntime=NrRuntime::LmxxfAmd;amd.nrPolicy=NrSizePolicy::P720;
+            check(freezeExportSettings(amd).nrPolicy==NrSizePolicy::P720,"AMD export keeps presets within its 1080p budget");
+            amd.nrPolicy=NrSizePolicy::Auto;
+            check(freezeExportSettings(amd).nrPolicy==NrSizePolicy::Realtime,"AMD export bounds Auto at 1080p");
+        }
+        EffectChain c;c.nodeCount=4;
+        for(unsigned i=0;i<4;++i){c.nodes[i].type=EffectType::NrEnhance;c.nodes[i].enabled=true;
+            c.nodes[i].nr.sizePolicy=policies[i+2];}
+        EnhancementSettings s;fromChain(c,s);
+        StageRequest request;request.nr=true;request.sr=true;request.width=1920;request.height=1080;
+        EnhanceGraphDesc d;describeStages(request,s,d);
+        check(d.nrLayersExtent==std::vector<Extent>({{852,480},{1280,720},{1600,900},{2560,1440}}),
+              "four post-SR instances have distinct internal sizes");
+        auto changed=s;changed.nrLayers[3].sizePolicy=NrSizePolicy::Native;
+        check(requiresGraphRebuild(s,changed),"downstream resolution change rebuilds resources");
+        for(auto& node:c.nodes)node.nr.lowLatencyPairing=true;fromChain(c,s);describeStages(request,s,d);
+        check(d.nrLayersExtent.back()==Extent{1920,1080},"NR-first policy never enlarges source input");
+        request.exportJob=true;describeStages(request,s,d);
+        check(d.nrLayersExtent==std::vector<Extent>({{852,480},{1280,720},{1600,900},{2560,1440}})&&
+              d.workWidth==3840&&d.workHeight==2160&&!d.nrBeforeSr&&d.validateFixedExecutionPlan().empty(),
+              "export keeps each instance's preset size after SR at full output extent");
+        request.exportJob=false;request.stillImage=true;describeStages(request,s,d);
+        check(d.nrLayersExtent.front()==Extent{3840,2160},"still images preserve full processing extent");
+        c.nodes[1].nr.sizePolicy=static_cast<NrSizePolicy>(99);c.nodes[1].enabled=false;
+        check(!validateChain(c).accepted,"even bypassed layers reject invalid resolution policies");
+    }
+    {
+        auto s = populated();
+        auto session = ChainSession::initial(s);
+        check(session.valid(), "initial editor session is valid");
+        const auto list = session.configurations[0];
+        check(session.select(ChainMode::Node), "first node activation clones the list");
+        auto& node = session.configurations[1];
+        node.videoSrQuality = 3;
+        node.chain.firstOf(EffectType::NrEnhance)->nr.model.tone = .123f;
+        node.chain.firstOf(EffectType::Color)->color.exposure = 1.25f;
+        node.chain.nodes[0].viewX = 321;
+        const auto edited = node;
+        bool restored = true;
+        for (int i = 0; i < 50; ++i) {
+            restored = restored && session.select(ChainMode::List) && session.configurations[0] == list;
+            restored = restored && session.select(ChainMode::Node) && session.configurations[1] == edited;
+        }
+        check(restored, "50 mode switches preserve independent chain parameters and layout");
+        EnhancementSettings live;
+        live.captureCompatible = true; live.captureFlipVertical = true;
+        live.audioOffsetMs = 73; live.exportBitrateMbps = 81; live.forceSdrPreview = true;
+        edited.apply(live);
+        check(live.videoSrQuality == 3 && live.model.tone == .123f && live.color.exposure == 1.25f,
+              "configuration restores chain and non-payload SR parameters");
+        check(live.captureCompatible && live.captureFlipVertical && live.audioOffsetMs == 73 &&
+              live.exportBitrateMbps == 81 && live.forceSdrPreview, "mode change preserves global settings");
+        const auto before = session;
+        check(!session.select(ChainMode(2)) && session == before, "invalid mode leaves session untouched");
+        node.selectedNr = 999;
+        check(!session.valid(), "invalid instance selection is rejected");
+    }
+}
+
+void testExecutionPlans() {
+    // Ordered execution planning is a preflight contract, not a GPU test.
+    {
+        const ChainExecutionRequest request{{1280, 720}, veyra::pipeline::SrTarget::Uhd4K};
+        auto s = populated(); s.lowLatency = false;
+        const auto fixed = toChain(s);
+        ChainExecutionPlan plan;
+        check(compileChainExecutionPlan(fixed, request, plan).accepted, "compile default fixed list plan");
+        check(plan.stepCount == 6 && plan.steps[0].type == EffectType::Color &&
+              plan.steps[1].type == EffectType::SuperResolution &&
+              plan.steps[2].type == EffectType::NrEnhance &&
+              plan.steps[3].type == EffectType::Protection &&
+              plan.steps[4].type == EffectType::VideoHdr &&
+              plan.steps[5].type == EffectType::FrameGeneration, "default list order stays Color SR NR Protection HDR FG");
+        auto first = fixed; first.firstOf(EffectType::NrEnhance)->nr.lowLatencyPairing = true;
+        check(compileChainExecutionPlan(first, request, plan).accepted &&
+              plan.steps[1].type == EffectType::NrEnhance && plan.steps[2].type == EffectType::Protection &&
+              plan.steps[3].type == EffectType::SuperResolution &&
+              plan.steps[1].input == request.source, "preview NR-first list puts NR and protection before SR");
+        auto offline = request; offline.exportJob = true;
+        check(compileChainExecutionPlan(first, offline, plan).accepted &&
+              plan.steps[1].type == EffectType::SuperResolution &&
+              plan.steps[2].output == plan.steps[2].input &&
+              plan.steps[2].processing == veyra::pipeline::ResolutionPlan::make(plan.steps[2].input, false,
+                  exportNrSizePolicy(first.firstOf(EffectType::NrEnhance)->nr.runtime, first.firstOf(EffectType::NrEnhance)->nr.sizePolicy),
+                  false).nr, "offline list stays SR-first with preset-sized NR");
+        auto still = request; still.stillImage = true;
+        check(compileChainExecutionPlan(first, still, plan).accepted &&
+              plan.steps[1].type == EffectType::SuperResolution &&
+              plan.steps[2].processing == plan.steps[2].input, "still image list preserves existing native SR-first contract");
+
+        auto node = fixed; node.mode = ChainMode::Node;
+        removeLegacyNodeProtection(node);
+        std::swap(node.nodes[0], node.nodes[2]); // NR -> SR -> Color
+        node.nodes[0].nr.sizePolicy = veyra::pipeline::NrSizePolicy::Native;
+        check(compileChainExecutionPlan(node, request, plan).accepted &&
+              plan.steps[0].type == EffectType::NrEnhance && plan.steps[0].processing == request.source &&
+              plan.steps[2].type == EffectType::Color && plan.steps[2].input.width == 3840,
+              "node plan preserves NR before SR and Color after SR");
+        auto bypass = request; bypass.source = {3840, 2160};
+        check(compileChainExecutionPlan(node, bypass, plan).accepted &&
+              plan.resourceCounts[size_t(EffectType::SuperResolution)] == 0 && plan.stepCount == 4,
+              "identity SR requests no execution step or resource slot");
+        auto layout = node; layout.nodes[0].viewX = 731; layout.nodes[2].viewY = -300;
+        ChainExecutionPlan moved;
+        compileChainExecutionPlan(node, request, plan);
+        check(compileChainExecutionPlan(layout, request, moved).accepted && moved == plan,
+              "layout-only edits produce an identical execution plan");
+        const auto before = plan;
+        auto illegal = node; std::swap(illegal.nodes[0], illegal.nodes[illegal.nodeCount - 1]);
+        check(!compileChainExecutionPlan(illegal, request, plan).accepted && plan == before,
+              "illegal FG placement rejects without changing the accepted plan");
+        auto badSize = request; badSize.source.width = 0;
+        check(!compileChainExecutionPlan(node, badSize, plan).accepted && plan == before,
+              "invalid source extent rejects atomically");
+        node.mode = ChainMode(2);
+        check(!compileChainExecutionPlan(node, request, plan).accepted && plan == before,
+              "invalid chain mode rejects atomically");
+    }
+}
+
+void testGeneratedExecutionPlans() {
+    {
+        // Deterministic varied legal chains: disabled instances, six NR sizes,
+        // SR on either side of NR/Color, and optional HDR/FG tails. Verify each
+        // step independently rather than merely asking validateChain() twice.
+        std::mt19937 rng(0x5032026u);
+        bool all = true;
+        uint32_t beforeSr = 0, afterSr = 0, disabled = 0, mixedNr = 0;
+        for (uint32_t sample = 0; sample < 200; ++sample) {
+            EffectChain chain; chain.mode = ChainMode::Node;
+            const auto add = [&](EffectType type, bool enabled) -> ChainNode& {
+                auto& n = chain.nodes[chain.nodeCount++]; n.type = type; n.enabled = enabled; return n;
+            };
+            const auto colors = 1u + rng() % kMaxColorInstances;
+            const auto nrs = 1u + rng() % kMaxNrInstances;
+            for (uint32_t i = 0; i < colors; ++i) add(EffectType::Color, rng() % 4 != 0);
+            for (uint32_t i = 0; i < nrs; ++i)
+                add(EffectType::NrEnhance, rng() % 4 != 0).nr.sizePolicy = veyra::pipeline::NrSizePolicy(rng() % 6);
+            add(EffectType::SuperResolution, sample % 3 != 0);
+            std::shuffle(chain.nodes.begin(), chain.nodes.begin() + chain.nodeCount, rng);
+            if (sample % 3) add(EffectType::VideoHdr, true);
+            if (sample % 4) add(EffectType::FrameGeneration, true);
+            const ChainExecutionRequest request{{1280, 720}, veyra::pipeline::SrTarget::Uhd4K};
+            ChainExecutionPlan plan;
+            bool ok = compileChainExecutionPlan(chain, request, plan).accepted;
+            auto extent = request.source;
+            std::array<uint32_t, effectTypeCount> parameter{}, resource{};
+            uint32_t step = 0, nrBefore = 0, nrAfter = 0; bool scaled = false;
+            for (uint32_t i = 0; i < chain.nodeCount; ++i) {
+                const auto& n = chain.nodes[i]; const auto type = size_t(n.type);
+                const auto ordinal = parameter[type]++;
+                if (!n.enabled) { ++disabled; continue; }
+                if (step >= plan.stepCount) { ok = false; break; }
+                const auto& p = plan.steps[step++];
+                ok = ok && p.nodeIndex == i && p.type == n.type && p.parameterIndex == ordinal &&
+                    p.resourceIndex == resource[type]++ && p.input == extent;
+                if (n.type == EffectType::SuperResolution) { extent = {3840, 2160}; scaled = true; }
+                if (n.type == EffectType::NrEnhance) {
+                    if (scaled) { ++afterSr; ++nrAfter; } else { ++beforeSr; ++nrBefore; }
+                    const auto limit = veyra::pipeline::nrHeightLimit(n.nr.sizePolicy);
+                    const auto expectedH = limit ? std::min(limit, extent.height) : extent.height;
+                    ok = ok && p.processing.height == expectedH && p.processing.width == ((expectedH * 16 / 9) & ~1u);
+                } else ok = ok && p.processing == extent;
+                ok = ok && p.output == extent;
+            }
+            if (nrBefore && nrAfter) ++mixedNr;
+            ok = ok && step == plan.stepCount && resource == plan.resourceCounts && plan.output == extent;
+            all = all && ok;
+            if (!ok) std::printf("FAIL generated chain seed=0x5032026 sample=%u\n", sample);
+        }
+        std::printf("plan properties: 200 chains; NR before SR=%u after SR=%u mixed=%u disabled=%u\n",
+                    beforeSr, afterSr, mixedNr, disabled);
+        check(all && beforeSr && afterSr && mixedNr && disabled,
+              "200 fixed-seed plans preserve order, instance identity and per-stage extents (CPU only)");
+    }
+}
+
+void testLegacyPlanDimensions() {
+    bool all = true; uint32_t cases = 0;
+    const std::array<veyra::pipeline::Extent, 4> sources{{{1280, 720}, {3440, 1440}, {1080, 1920}, {3840, 2160}}};
+    for (const auto source : sources)
+    for (uint32_t sr = 0; sr < 2; ++sr)
+    for (uint32_t first = 0; first < 2; ++first)
+    for (uint32_t context = 0; context < 3; ++context)
+    for (uint32_t policy = 0; policy < 7; ++policy)
+    for (uint32_t target = 0; target < 3; ++target) {
+        auto s = populated();
+        s.sr = sr != 0; s.lowLatency = first != 0;
+        s.nrPolicy = veyra::pipeline::NrSizePolicy(policy);
+        s.srTarget = veyra::pipeline::SrTarget(target);
+        const auto chain = toChain(s);
+        ChainExecutionPlan plan;
+        const ChainExecutionRequest request{source, s.srTarget, context == 1, context == 2};
+        bool ok = compileChainExecutionPlan(chain, request, plan).accepted;
+        StageRequest legacyRequest;
+        legacyRequest.width = source.width; legacyRequest.height = source.height;
+        legacyRequest.nr = s.nr; legacyRequest.sr = s.sr; legacyRequest.fg = true;
+        legacyRequest.stillImage = request.stillImage; legacyRequest.exportJob = request.exportJob;
+        veyra::pipeline::EnhanceGraphDesc legacy;
+        describeStages(legacyRequest, s, legacy);
+        // Independent sizing formula. Video SR can also restore at 1:1:
+        // source-size restoration has no resize resource but keeps NR/SR order.
+        const auto oldPlan=veyra::pipeline::ResolutionPlan::make(source,s.sr,
+            request.exportJob?exportNrSizePolicy(s.nrRuntime,s.nrPolicy):s.nrPolicy,
+            request.stillImage,s.revision,s.srTarget,
+            !request.exportJob&&s.lowLatency&&s.nr);
+        const bool nativeVideoSr=s.sr&&!request.stillImage&&s.videoSrQuality>=1&&s.videoSrQuality<=4;
+        const bool oldNrFirst=!request.stillImage&&!request.exportJob&&s.lowLatency&&s.nr&&(oldPlan.srApplied||nativeVideoSr);
+        ok = ok && legacy.fixedExecutionPlan.has_value() && legacy.validateFixedExecutionPlan().empty() &&
+             plan.output == oldPlan.base && plan.output == veyra::pipeline::Extent{legacy.workWidth, legacy.workHeight} &&
+             legacy.nrBeforeSr==oldNrFirst && legacy.nrWidth==oldPlan.nr.width && legacy.nrHeight==oldPlan.nr.height &&
+             plan.resourceCounts[size_t(EffectType::SuperResolution)] == uint32_t(oldPlan.srApplied);
+        bool checkedNr = false;
+        for (uint32_t i = 0; i < plan.stepCount; ++i) {
+            const auto& step = plan.steps[i];
+            if (step.type != EffectType::NrEnhance) continue;
+            const auto expectedInput = oldNrFirst ? source : oldPlan.base;
+            ok = ok && step.input == expectedInput && step.output == expectedInput &&
+                 step.processing==oldPlan.nr && !legacy.nrLayersExtent.empty() && step.processing == legacy.nrLayersExtent.front();
+            checkedNr = true;
+        }
+        all = all && ok && checkedNr; ++cases;
+        if (!ok || !checkedNr) std::printf("FAIL legacy plan dimensions case=%u source=%ux%u sr=%u nrFirst=%u context=%u policy=%u target=%u\n",
+            cases, source.width, source.height, sr, first, context, policy, target);
+    }
+    std::printf("legacy dimension parity: %u cases (CPU descriptions only)\n", cases);
+    check(all && cases == 1008, "production fixed plans match independent legacy formulas across 1008 dimension/context combinations");
+}
+
+void testProductionFixedPlanDescription() {
+    using namespace veyra::pipeline;
+    EnhancementSettings s;s.nr=true;s.sr=true;s.nrLayerCount=3;
+    s.nrLayers[0].enabled=false;
+    s.nrLayers[1].enabled=true;s.nrLayers[1].sizePolicy=NrSizePolicy::Native;
+    s.nrLayers[2].enabled=true;s.nrLayers[2].sizePolicy=NrSizePolicy::Realtime;
+    StageRequest request;request.width=1280;request.height=720;request.nr=true;request.sr=true;
+    EnhanceGraphDesc desc;describeStages(request,s,desc);
+    check(desc.fixedExecutionPlan.has_value()&&desc.validateFixedExecutionPlan().empty(),
+        "production builder supplies a validated fixed execution plan");
+    std::vector<ChainExecutionStep> nr;
+    if(desc.fixedExecutionPlan)for(uint32_t i=0;i<desc.fixedExecutionPlan->stepCount;++i)
+        if(desc.fixedExecutionPlan->steps[i].type==EffectType::NrEnhance)nr.push_back(desc.fixedExecutionPlan->steps[i]);
+    check(nr.size()==2&&nr[0].parameterIndex==1&&nr[0].resourceIndex==0&&
+          nr[1].parameterIndex==2&&nr[1].resourceIndex==1,
+        "production plan keeps disabled parameter slots distinct from active resources");
+    check(desc.nrLayersExtent==std::vector<Extent>{{3840,2160},{1920,1080}},
+        "production NR allocation extents come from each compiled active layer");
+    desc.nrLayersExtent[0]={640,360};
+    check(!desc.validateFixedExecutionPlan().empty(),
+        "resource dimensions tampering is rejected before GPU allocation");
+    s.lowLatency=true;for(auto& n:s.nrLayers)n.lowLatencyPairing=true;
+    describeStages(request,s,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.nrBeforeSr&&
+          desc.nrLayersExtent==std::vector<Extent>{{1280,720},{1280,720}},
+        "NR-first fixed plan uses source-space input for all active layers");
+    request.exportJob=true;describeStages(request,s,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&!desc.nrBeforeSr&&
+          desc.nrLayersExtent==std::vector<Extent>{{3840,2160},{1920,1080}},
+        "offline description keeps per-layer NR presets and default order");
+    request.exportJob=false;request.nvidiaAdapter=false;describeStages(request,s,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&!desc.enableNr&&!desc.enableSr&&
+          desc.fixedExecutionPlan&&desc.fixedExecutionPlan->resourceCounts[size_t(EffectType::NrEnhance)]==0&&
+          desc.fixedExecutionPlan->output==Extent{3840,2160},
+        "non-NVIDIA fallback retains ordinary resize extent without NR resources");
+    // As the engine sends it after AMD normalization: DLSS SR removed, NR kept.
+    request.amdNr=true;request.sr=false;describeStages(request,s,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.enableNr&&!desc.enableSr&&desc.fixedExecutionPlan&&
+          desc.fixedExecutionPlan->resourceCounts[size_t(EffectType::NrEnhance)]==2,
+        "AMD adapter description keeps NR layers for the lmxxf runtime");
+    request.amdNr=false;request.sr=true;
+    request.nvidiaAdapter=true;request.nr=false;describeStages(request,s,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&!desc.enableNr&&desc.fixedExecutionPlan&&
+          desc.fixedExecutionPlan->resourceCounts[size_t(EffectType::NrEnhance)]==0,
+        "request bypass clears active plan resources on a reused descriptor");
+    s.nrLayerCount=0;s.nr=false;request.nr=true;request.sr=false;describeStages(request,s,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.enableNr&&desc.fixedExecutionPlan&&
+          desc.fixedExecutionPlan->resourceCounts[size_t(EffectType::NrEnhance)]==1,
+        "flat caller request override is preserved rather than silently dropping NR");
+    s.nrLayerCount=kMaxNrInstances+1;describeStages(request,s,desc);
+    check(!desc.fixedExecutionPlan&&!desc.validateFixedExecutionPlan().empty(),
+        "oversized runtime input fails instead of truncating into an apparently valid plan");
+    s.nrLayerCount=0;request.width=0;describeStages(request,s,desc);
+    check(!desc.fixedExecutionPlan&&!desc.validateFixedExecutionPlan().empty(),
+        "invalid source dimensions leave an explicit construction error");
+    request.width=1280;describeStages(request,s,desc);
+    check(desc.fixedExecutionPlan&&desc.validateFixedExecutionPlan().empty(),
+        "valid rebuild clears the preceding plan error");
+    s.nr=true;s.color.enabled=true;s.sr=false;s.lowLatency=false;
+    describeStages(request,s,desc);
+    auto chain=toChain(s);chain.mode=ChainMode::Node;
+    removeLegacyNodeProtection(chain);
+    std::swap(chain.nodes[0],chain.nodes[2]);
+    ChainExecutionPlan ordered;
+    check(compileChainExecutionPlan(chain,{{1280,720},s.srTarget,false,false},ordered).accepted,
+        "NR-before-color is a legal requested node plan");
+    desc.fixedExecutionPlan=ordered;
+    check(!desc.validateFixedExecutionPlan().empty(),
+        "fixed dispatcher refuses legal but unsupported node order instead of pretending to execute it");
+}
+
+void testRuntimeOrderTransport() {
+    namespace pipeline = veyra::pipeline;
+    EnhancementSettings settings;
+    settings.nr=true;settings.sr=true;settings.srTarget=pipeline::SrTarget::Qhd;
+    settings.color.enabled=true;settings.nrLayerCount=2;
+    settings.nrLayers[0].enabled=false;settings.nrLayers[0].model.intensity=.17f;
+    settings.nrLayers[1].enabled=true;settings.nrLayers[1].model.intensity=.73f;
+    settings.nrLayers[1].sizePolicy=pipeline::NrSizePolicy::P480;
+    auto chain=toChain(settings);
+    check(!runtimeOrder(chain),"legacy list keeps the original runtime request contract");
+    chain.mode=ChainMode::Node;
+    removeLegacyNodeProtection(chain);
+    std::rotate(chain.nodes.begin()+1,chain.nodes.begin()+2,chain.nodes.begin()+4);
+    fromChain(chain,settings);
+    const auto order=runtimeOrder(chain);
+    chain.nodes[0].viewX=519;chain.nodes[2].viewY=87;
+    check(order==runtimeOrder(chain),"layout is excluded from runtime topology and cannot trigger a rebuild");
+    EffectChain restored;
+    check(order&&restoreRuntimeOrder(settings,*order,restored).accepted&&
+          restored.mode==ChainMode::Node&&restored.nodes[1].type==EffectType::NrEnhance&&
+          !restored.nodes[1].enabled&&restored.nodes[1].nr.model.intensity==.17f&&
+          restored.nodes[2].enabled&&restored.nodes[2].nr.model.intensity==.73f&&
+          restored.nodes[3].type==EffectType::SuperResolution,
+          "runtime envelope restores actual order and disabled per-instance parameter slots");
+    StageRequest request;request.width=640;request.height=360;request.nr=true;request.sr=true;
+    request.nodeOrder=&*order;
+    pipeline::EnhanceGraphDesc desc;describeStages(request,settings,desc);
+    check(desc.runtimeNodeOrder&&desc.fixedExecutionPlan&&desc.validateFixedExecutionPlan().empty()&&
+          desc.nrBeforeSr&&desc.fixedExecutionPlan->steps[1].type==EffectType::NrEnhance&&
+          desc.fixedExecutionPlan->steps[1].parameterIndex==1&&
+          desc.fixedExecutionPlan->steps[1].resourceIndex==0&&
+          desc.fixedExecutionPlan->steps[1].input==pipeline::Extent{640,360},
+          "production builder consumes requested node order instead of flattening to SR-first");
+    const auto preserved=restored;
+    auto broken=*order;broken.types[0]=EffectType::Count;
+    check(!restoreRuntimeOrder(settings,broken,restored).accepted&&restored==preserved,
+          "invalid runtime order leaves previously accepted chain untouched");
+    broken=*order;broken.nodeCount=kMaxChainNodes+1;
+    check(!restoreRuntimeOrder(settings,broken,restored).accepted&&restored==preserved,
+          "oversized runtime order fails atomically");
+    broken=*order;broken.nodeCount=0;
+    check(!restoreRuntimeOrder(settings,broken,restored).accepted&&restored==preserved,
+          "runtime order cannot silently omit enabled stages or disabled parameter slots");
+    std::swap(chain.nodes[0],chain.nodes[2]);fromChain(chain,settings);
+    const auto interleaved=runtimeOrder(chain);request.nodeOrder=&*interleaved;
+    describeStages(request,settings,desc);
+    check(desc.fixedExecutionPlan&&desc.fixedExecutionPlan->steps[0].type==EffectType::NrEnhance&&
+          desc.preSrColor(0)&&desc.validateFixedExecutionPlan().empty(),
+          "NR -> Color -> SR reaches admission intact and consumes the new pre-SR boundary");
+    EffectChain empty;empty.mode=ChainMode::Node;settings={};fromChain(empty,settings);
+    check(restoreRuntimeOrder(settings,*runtimeOrder(empty),restored).accepted&&restored.nodeCount==0,
+          "empty node configuration does not resurrect synthetic list stages");
+}
+
+void testNodeTailColorDescription() {
+    using namespace veyra;
+    using namespace veyra::engine;
+    EffectChain chain;chain.mode=ChainMode::Node;chain.nodeCount=4;
+    chain.nodes[0].type=EffectType::Color;chain.nodes[0].enabled=true;chain.nodes[0].color.enabled=true;
+    chain.nodes[1].type=EffectType::SuperResolution;chain.nodes[1].enabled=true;
+    chain.nodes[2].type=EffectType::NrEnhance;chain.nodes[2].enabled=true;
+    chain.nodes[3].type=EffectType::Color;chain.nodes[3].enabled=true;chain.nodes[3].color.enabled=true;
+    EnhancementSettings settings;fromChain(chain,settings);
+    auto order=runtimeOrder(chain);
+    StageRequest request;request.width=640;request.height=360;request.sr=true;request.nr=true;request.nodeOrder=&*order;
+    pipeline::EnhanceGraphDesc desc;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&!desc.tailColor(0)&&desc.tailColor(1),
+          "node Color -> SR -> NR -> Color admits an independently bound tail grade");
+    chain.nodes[0].enabled=false;fromChain(chain,settings);order=runtimeOrder(chain);request.nodeOrder=&*order;
+    describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&!desc.tailColor(0)&&desc.tailColor(1)&&
+          desc.fixedExecutionPlan->steps[2].parameterIndex==1&&desc.fixedExecutionPlan->steps[2].resourceIndex==0,
+          "disabled ingress Color retains the tail parameter identity without a GPU slot");
+    auto broken=desc;broken.fixedExecutionPlan->steps[2].parameterIndex=engine::kMaxColorInstances;
+    check(!broken.validateFixedExecutionPlan().empty(),
+          "out-of-range tail Color parameter is rejected before GPU allocation");
+    std::swap(chain.nodes[2],chain.nodes[3]);fromChain(chain,settings);order=runtimeOrder(chain);request.nodeOrder=&*order;
+    describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.preNrColor(1)&&!desc.tailColor(1)&&!desc.nodeColor(0),
+          "SR -> Color -> NR uses a distinct pre-NR grade without flattening to ingress or tail");
+    chain.nodes[1].type=EffectType::NrEnhance;fromChain(chain,settings);order=runtimeOrder(chain);
+    request.sr=false;request.nodeOrder=&*order;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.nodeColor(1)&&
+          desc.interNrColorTarget(1)==1&&!desc.preNrColor(1)&&!desc.tailColor(1),
+          "NR -> Color -> NR binds the grade to the next compact NR resource, not ingress or tail");
+    chain.nodeCount=5;chain.nodes[4]=chain.nodes[3];chain.nodes[3]=chain.nodes[2];
+    fromChain(chain,settings);order=runtimeOrder(chain);request.nodeOrder=&*order;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.interNrColorTarget(1)==1&&desc.interNrColorTarget(2)==1,
+          "consecutive grades between NR layers keep distinct parameter slots with one downstream target");
+    chain.nodeCount=6;chain.nodes[5].type=EffectType::SuperResolution;chain.nodes[5].enabled=true;
+    fromChain(chain,settings);order=runtimeOrder(chain);request.sr=true;request.nodeOrder=&*order;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.nrBeforeSr&&desc.interNrColorTarget(1)==1&&
+          desc.fixedExecutionPlan->steps[1].output==pipeline::Extent{640,360},
+          "NR -> Color -> Color -> NR -> SR keeps inter-NR grades at source extent");
+    std::swap(chain.nodes[4],chain.nodes[5]);fromChain(chain,settings);order=runtimeOrder(chain);
+    request.nodeOrder=&*order;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.splitNrAcrossSr()&&desc.preSrColor(1)&&desc.preSrColor(2),
+          "NR -> Color -> Color -> SR -> NR uses the split NR boundary, not the inter-NR boundary");
+}
+
+void testNodePreSrColorDescription() {
+    using namespace veyra;
+    using namespace veyra::engine;
+    EffectChain chain;chain.mode=ChainMode::Node;chain.nodeCount=6;
+    chain.nodes[0].type=EffectType::Color;chain.nodes[0].enabled=false;chain.nodes[0].color.enabled=true;
+    chain.nodes[1].type=EffectType::NrEnhance;chain.nodes[1].enabled=true;
+    chain.nodes[2].type=EffectType::Color;chain.nodes[2].enabled=true;chain.nodes[2].color.enabled=true;
+    chain.nodes[3]=chain.nodes[2];
+    chain.nodes[4].type=EffectType::SuperResolution;chain.nodes[4].enabled=true;
+    chain.nodes[5]=chain.nodes[2];
+    EnhancementSettings settings;fromChain(chain,settings);
+    auto order=runtimeOrder(chain);
+    StageRequest request;request.width=640;request.height=360;request.sr=true;request.nr=true;request.nodeOrder=&*order;
+    pipeline::EnhanceGraphDesc desc;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.nrBeforeSr&&desc.preSrColor(1)&&desc.preSrColor(2)&&
+          !desc.preSrColor(0)&&!desc.preSrColor(3)&&desc.tailColor(3)&&
+          desc.fixedExecutionPlan->steps[1].output==pipeline::Extent{640,360}&&
+          desc.fixedExecutionPlan->steps[1].parameterIndex==1&&desc.fixedExecutionPlan->steps[1].resourceIndex==0,
+          "NR -> Color -> Color -> SR -> Color preserves source-size pre-SR grades and disabled parameter slots");
+    check(!desc.preNrColor(1)&&desc.interNrColorTarget(1)==kMaxNrInstances,
+          "pre-SR grade is not mistaken for pre-NR or inter-NR");
+    chain.nodeCount=7;chain.nodes[6]=chain.nodes[5];chain.nodes[5]=chain.nodes[4];
+    chain.nodes[4]=chain.nodes[3];chain.nodes[3]=chain.nodes[2];
+    chain.nodes[2].type=EffectType::Protection;chain.nodes[2].enabled=true;
+    check(removeLegacyNodeProtection(chain)==1, "legacy pre-SR protection migrates before execution");
+    fromChain(chain,settings);order=runtimeOrder(chain);request.nodeOrder=&*order;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.preSrColor(1)&&desc.preSrColor(2),
+          "NR -> Color -> Color -> SR retains its grades after protection migration");
+    auto fixed=desc;fixed.runtimeNodeOrder=false;
+    check(!fixed.preSrColor(1)&&!fixed.validateFixedExecutionPlan().empty(),
+          "pre-SR node admission does not change fixed-list execution");
+    request.stillImage=true;describeStages(request,settings,desc);
+    check(!desc.validateFixedExecutionPlan().empty(),
+          "pre-SR support retains the offline NR-before-SR boundary");
+}
+
+void testNodeSplitNrDescription() {
+    using namespace veyra;using namespace veyra::engine;
+    EffectChain chain;chain.mode=ChainMode::Node;chain.nodeCount=7;
+    const EffectType types[]={EffectType::NrEnhance,EffectType::NrEnhance,EffectType::Color,
+        EffectType::SuperResolution,EffectType::Color,EffectType::NrEnhance,EffectType::Color};
+    for(uint32_t i=0;i<chain.nodeCount;++i){
+        chain.nodes[i].type=types[i];chain.nodes[i].enabled=i!=0;
+        chain.nodes[i].nr.sizePolicy=pipeline::NrSizePolicy::Native;
+        chain.nodes[i].color.enabled=true;
+    }
+    EnhancementSettings settings;fromChain(chain,settings);settings.srTarget=pipeline::SrTarget::Qhd;
+    auto order=runtimeOrder(chain);StageRequest request;
+    request.width=640;request.height=360;request.sr=true;request.nr=true;request.nodeOrder=&*order;
+    pipeline::EnhanceGraphDesc desc;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.splitNrAcrossSr()&&desc.nrBeforeSrLayerCount()==1&&
+          desc.nrBeforeSr&&desc.finalNrAfterSr(),
+          "split NR has a source-side prefix and a work-side final output");
+    check(desc.nrFullExtent(0)==pipeline::Extent{640,360}&&desc.nrFullExtent(1)==pipeline::Extent{2560,1440}&&
+          desc.nrLayersExtent==std::vector<pipeline::Extent>{{640,360},{2560,1440}},
+          "each native NR allocates the declared input extent on its own side of SR");
+    check(desc.preSrColor(0)&&desc.preNrColor(1)&&desc.tailColor(2)&&
+          desc.fixedExecutionPlan->steps[0].parameterIndex==1&&desc.fixedExecutionPlan->steps[4].parameterIndex==2,
+          "disabled NR preserves parameter identity; boundary grades are neither ingress nor duplicated");
+    auto broken=desc;broken.nrLayersExtent[1]={640,360};
+    check(!broken.validateFixedExecutionPlan().empty(),
+          "a downstream NR cannot reuse the source-side allocation");
+    broken=desc;broken.protection.enabled=true;
+    check(!broken.validateFixedExecutionPlan().empty(),
+          "split protection stays explicitly incomplete until an original-reference stage is supplied");
+    broken=desc;broken.noNgx=true;
+    check(!broken.validateFixedExecutionPlan().empty(),
+          "split graph cannot read unallocated NR intermediates with NGX disabled");
+    broken=desc;broken.noFeatures=true;
+    check(!broken.validateFixedExecutionPlan().empty(),
+          "split graph cannot claim successful execution with all features bypassed");
+    // Same-size DLSS folds away; RTX Video SR intentionally also restores
+    // native-size video. This contract must name DLSS rather than rely on the
+    // fresh-session model default.
+    settings.videoSrQuality=0;
+    request.width=2560;request.height=1440;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&!desc.splitNrAcrossSr()&&!desc.enableSr&&
+          desc.nrLayersExtent.size()==2&&desc.nrFullExtent(0)==desc.nrFullExtent(1),
+          "same-size DLSS SR folds away while both NR stages remain at the same declared extent");
+    request.stillImage=true;describeStages(request,settings,desc);
+    check(!desc.validateFixedExecutionPlan().empty(),
+          "split preview does not bypass offline NR-before-SR guard");
+}
+
+static void testNodePreSrProtectionDescription(){
+    using namespace veyra;using namespace veyra::engine;
+    EffectChain chain;chain.mode=ChainMode::Node;chain.nodeCount=7;
+    const EffectType types[]={EffectType::NrEnhance,EffectType::NrEnhance,EffectType::Protection,
+        EffectType::Color,EffectType::SuperResolution,EffectType::NrEnhance,EffectType::NrEnhance};
+    for(uint32_t i=0;i<chain.nodeCount;++i){
+        chain.nodes[i].type=types[i];chain.nodes[i].enabled=true;
+        chain.nodes[i].nr.sizePolicy=pipeline::NrSizePolicy::Native;
+        chain.nodes[i].color.enabled=true;
+    }
+    chain.nodes[2].protection.enabled=true;
+    chain.nodes[2].protection.regions[0]={.1f,.2f,.4f,.6f};
+    check(validateChain(chain).accepted, "node Protection is supported at its pre-SR boundary");
+    EnhancementSettings settings;fromChain(chain,settings);settings.srTarget=pipeline::SrTarget::Qhd;
+    auto order=runtimeOrder(chain);StageRequest request;
+    request.width=640;request.height=360;request.sr=true;request.nr=true;request.nodeOrder=&*order;
+    pipeline::EnhanceGraphDesc desc;describeStages(request,settings,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.protectionBeforeSr()&&desc.protection.enabled&&
+          desc.nrBeforeSrLayerCount()==2&&desc.preSrColor(0),
+          "split chain retains its independent pre-SR protection and Color");
+    check(desc.fixedExecutionPlan->steps[3].input==pipeline::Extent{640,360}&&
+          desc.nrFullExtent(2)==pipeline::Extent{2560,1440},
+          "Color and post-SR NR retain their declared extents");
+    auto disabled=chain;disabled.nodes[2].enabled=false;
+    check(validateChain(disabled).accepted&&disabled.countOf(EffectType::Protection)==1,
+          "disabled protection remains an editable independent node");
+}
+
+static void testNodeInterNrProtectionDescription(){
+    using namespace veyra;using namespace veyra::engine;
+    const auto nr=EffectType::NrEnhance,sr=EffectType::SuperResolution;
+    const auto mask=EffectType::Protection,color=EffectType::Color;
+    for(const auto& types:std::vector<std::vector<EffectType>>{
+            {nr,mask,nr},{sr,nr,mask,color,nr},{nr,mask,color,nr,sr,nr},
+            {nr,nr,mask,color,nr,sr,nr}}){
+        EffectChain chain;chain.mode=ChainMode::Node;chain.nodeCount=uint32_t(types.size());
+        uint32_t maskIndex=0,nrPrefix=0;
+        for(uint32_t i=0;i<chain.nodeCount;++i){
+            chain.nodes[i].type=types[i];chain.nodes[i].enabled=true;
+            chain.nodes[i].nr.sizePolicy=pipeline::NrSizePolicy::Native;
+            chain.nodes[i].color.enabled=true;
+            if(types[i]==mask)maskIndex=i;
+            if(types[i]==nr&&!maskIndex)++nrPrefix;
+        }
+        chain.nodes[maskIndex].protection.enabled=true;
+        chain.nodes[maskIndex].protection.regions[0]={.1f,.2f,.4f,.6f};
+        check(validateChain(chain).accepted,"independent inter-NR Protection is retained");
+        EnhancementSettings settings;fromChain(chain,settings);settings.srTarget=pipeline::SrTarget::Qhd;
+        auto order=runtimeOrder(chain);StageRequest request;
+        request.width=640;request.height=360;request.nr=true;
+        request.sr=std::find(types.begin(),types.end(),sr)!=types.end();request.nodeOrder=&*order;
+        pipeline::EnhanceGraphDesc desc;describeStages(request,settings,desc);
+        check(desc.validateFixedExecutionPlan().empty()&&desc.protection.enabled&&
+              desc.interNrProtectionTarget()==nrPrefix,
+              "inter-NR protection restores the original before the next layer");
+        if(std::find(types.begin(),types.end(),color)!=types.end())
+            check(desc.interNrColorTarget(0)==nrPrefix,
+                  "inter-NR Color still feeds the next NR");
+        check(desc.nrFullExtent(nrPrefix)==desc.fixedExecutionPlan->steps[maskIndex].output,
+              "downstream consumer retains its extent");
+        auto disabled=chain;disabled.nodes[maskIndex].enabled=false;
+        check(validateChain(disabled).accepted&&disabled.countOf(mask)==1,
+              "disabled inter-NR protection keeps its stored regions");
+    }
+    EffectChain split;split.mode=ChainMode::Node;split.nodeCount=5;
+    const EffectType unsafe[]={nr,sr,nr,mask,nr};
+    for(uint32_t i=0;i<split.nodeCount;++i){split.nodes[i].type=unsafe[i];split.nodes[i].enabled=true;}
+    EnhancementSettings settings;fromChain(split,settings);auto order=runtimeOrder(split);
+    StageRequest request;request.width=640;request.height=360;request.nr=request.sr=true;request.nodeOrder=&*order;
+    pipeline::EnhanceGraphDesc desc;describeStages(request,settings,desc);
+    check(!desc.validateFixedExecutionPlan().empty()&&settings.protection.enabled,
+          "unsupported cross-SR protection is rejected instead of silently deleted");
+}
+
+static void testOutputControlNodes(){
+    using namespace veyra;using namespace veyra::engine;
+    EnhancementSettings s;s.nr=true;s.sr=true;s.multiplier=3;
+    s.nrHoldStrength=.63f;s.nrHoldTolerance=.04f;
+    s.exclusion.enabled=true;s.exclusion.featherPixels=17;
+    s.exclusion.regions[0]={.1f,.2f,.5f,.7f,true};
+    auto chain=toChain(s);chain.mode=ChainMode::Node;
+    check(validateChain(chain).accepted&&chain.countOf(EffectType::NrStabilizer)==1&&
+          chain.countOf(EffectType::Exclusion)==1,"output controls have independent node types");
+    EnhancementSettings restored;fromChain(chain,restored);
+    check(restored.exclusion==s.exclusion&&restored.nrHoldStrength==s.nrHoldStrength&&
+          restored.nrHoldTolerance==s.nrHoldTolerance,"mask and stabilizer retain independent payloads");
+    const auto order=runtimeOrder(chain);
+    StageRequest request;request.width=640;request.height=360;request.nr=request.sr=request.fg=true;request.fgMultiplier=3;request.nodeOrder=&*order;
+    pipeline::EnhanceGraphDesc desc;describeStages(request,restored,desc);
+    check(desc.validateFixedExecutionPlan().empty()&&desc.exclusion==s.exclusion,
+          "mask and stabilizer compile alongside NR SR and frame generation");
+    auto changed=s;changed.exclusion.featherPixels=18;
+    check(!requiresGraphRebuild(s,changed),"mask geometry and feather edit live");
+    changed.exclusion.enabled=false;
+    check(requiresGraphRebuild(s,changed),"mask allocation is rebuilt on enable transitions");
+    for(uint32_t i=0;i<chain.nodeCount;++i)
+        if(chain.nodes[i].type==EffectType::NrStabilizer||chain.nodes[i].type==EffectType::Exclusion){
+            chain.nodes[i].enabled=false;chain.nodes[i].protection={};
+        }
+    fromChain(chain,restored);EffectChain reopened;
+    check(restoreRuntimeOrder(restored,*order,reopened).accepted&&
+          reopened.countOf(EffectType::NrStabilizer)==1&&reopened.countOf(EffectType::Exclusion)==1,
+          "disabled untouched output controls survive runtime order reconstruction");
+    auto invalid=chain;
+    invalid.firstOf(EffectType::NrStabilizer)->holdStrength=std::numeric_limits<float>::quiet_NaN();
+    check(!validateChain(invalid).accepted,"invalid stabilizer payload is rejected even when disabled");
+}
+
+void testNrCorrectionDescription(){
+    EnhancementSettings s;s.nr=true;s.nrMotion=MotionSource::Zero;
+    veyra::pipeline::EnhanceGraphDesc d;StageRequest request;request.nr=true;request.width=1280;request.height=720;
+    describeStages(request,s,d);
+    check(!d.nrTemporal&&!d.enableNvofStandalone,"NR correction off retains zero-motion/no-history topology");
+    auto corrected=s;corrected.residual.correction.enabled=true;
+    check(requiresGraphRebuild(s,corrected),"NR correction switch rebuilds history topology");
+    describeStages(request,corrected,d);
+    check(d.nrTemporal&&d.enableNvofStandalone,"NR auto requests real flow even with zero model motion");
+    auto noAmount=corrected;noAmount.residual.correction.autoAmount=0;
+    check(requiresGraphRebuild(corrected,noAmount),"zero automatic amount releases corrected history");
+    describeStages(request,noAmount,d);
+    check(!d.nrTemporal&&!d.enableNvofStandalone,"zero automatic amount has no correction history");
+    auto halfAmount=corrected;halfAmount.residual.correction.autoAmount=.5f;
+    check(!requiresGraphRebuild(corrected,halfAmount),"nonzero automatic amount changes live without new history");
+    for(int style:{0,1,2}){
+        NrCorrectionSettings automatic;automatic.enabled=true;automatic.autoAmount=.6f;
+        const auto a=automatic.constants(false,style);automatic.useAutomaticValues(style);const auto b=automatic.constants(false,style);
+        bool same=true;for(unsigned i=0;i<a.size();++i)if(i!=6)same&=a[i]==b[i];
+        check(same&&!automatic.automatic,"copy automatic profile into manual preserves effective values");
+    }
+    auto manual=corrected;manual.residual.correction.automatic=false;manual.residual.correction.stability=.5f;
+    check(!requiresGraphRebuild(corrected,manual),"NR manual/auto with history is a live parameter update");
+    manual.residual.correction.stability=0;
+    check(requiresGraphRebuild(corrected,manual),"NR stability zero releases history via rebuild");
+    describeStages(request,manual,d);
+    check(!d.nrTemporal&&!d.enableNvofStandalone,"NR manual stability zero needs no history or flow");
+    manual.nrTemporal=true;describeStages(request,manual,d);
+    check(!d.nrTemporal,"manual correction owns temporal setting while enabled");
+    manual.residual.correction.enabled=false;describeStages(request,manual,d);
+    check(d.nrTemporal,"switch off restores saved legacy temporal option");
+    manual.nrLayerCount=2;manual.nrLayers[0].enabled=true;manual.nrLayers[1].enabled=true;
+    manual.nrLayers[1].residual.correction.enabled=true;
+    describeStages(request,manual,d);
+    check(d.nrLayersTemporal.size()==2&&!d.nrLayersTemporal[0]&&d.nrLayersTemporal[1],
+          "controlled history is allocated per active layer");
+}
+void testPerLayerAntiFlickerSnapshot(){
+    using namespace veyra::engine;
+    for(uint32_t count:{1u,2u}){
+        EnhancementSettings settings;settings.nr=true;settings.nrLayerCount=count;
+        settings.nrTemporal=false;settings.nrAntiFlicker=NrAntiFlicker::Flow;
+        for(uint32_t i=0;i<count;++i){settings.nrLayers[i].enabled=true;settings.nrLayers[i].temporal=true;
+            settings.nrLayers[i].antiFlicker=i?NrAntiFlicker::Static:NrAntiFlicker::FlowPlus;}
+        const auto chain=toChain(settings);auto restored=settings;fromChain(chain,restored);
+        check(restored.nrLayer(0).usesTemporal()&&restored.nrLayer(0).antiFlicker==NrAntiFlicker::FlowPlus,
+              "single and stacked snapshots retain first layer anti-flicker tier");
+        if(count==2)check(restored.nrLayer(1).antiFlicker==NrAntiFlicker::Static,
+                         "stacked snapshot retains independent second layer anti-flicker tier");
+    }
+}
+__declspec(noinline) void testInactiveEffectEdits(){
+    auto off=populated();off.nr=off.sr=off.color.enabled=off.videoHdr.enabled=off.protection.enabled=false;off.multiplier=1;
+    off.nrLayerCount=2;off.nrLayers={};off.additionalColorCount=2;
+    auto edited=off;
+    edited.model.style=2;edited.nrRuntime=NrRuntime::NvidiaOriginal;edited.nrTemporal=false;
+    edited.nrPolicy=veyra::pipeline::NrSizePolicy::P480;edited.nrMotion=MotionSource::Zero;
+    edited.nrLayers[0].temporal=true;edited.nrLayers[0].runtime=NrRuntime::LmxxfAmd;edited.nrLayers[0].sizePolicy=veyra::pipeline::NrSizePolicy::Native;
+    edited.nrLayers[1].residual.correction.enabled=true;
+    edited.videoSrQuality=5;edited.srTarget=veyra::pipeline::SrTarget::Qhd;edited.srMotion=MotionSource::Zero;
+    edited.frameGenerationBackend=FrameGenerationBackend::Vfg;edited.vfgQuality=2;edited.fgMotion=MotionSource::Zero;edited.fgStrictAdmission=true;
+    edited.color.setLutName(L"missing-disabled.cube");edited.color.exposure=.7f;
+    edited.additionalColors[0].setLutName(L"missing-second.cube");edited.additionalColors[1].exposure=-.8f;
+    edited.videoHdr.peakNits=700;edited.protection.featherPixels=40;edited.nrHoldTolerance=.25f;
+    edited.hdrCurve.midGrayNits=400;edited.hdrMetadata.maxCllNits=2000;
+    edited.flow=FlowQuality::Performance;edited.opticalFlowBackend=OpticalFlowBackend::GpuDis;edited.amdFlowHalfResolution=true;
+    edited.fgMotionRefine=false;
+    check(edited.validate().empty()&&off!=edited,"inactive edits remain valid distinct persistent settings");
+    check(off.sameActiveVideoParameters(edited)&&edited.sameActiveVideoParameters(off)&&off.sameVideoConfiguration(edited),"all bypassed effect parameters are absent from active GPU identity");
+    check(!requiresGraphRebuild(off,edited)&&!requiresGraphRebuild(edited,off),"bypassed topology/LUT/backend edits do not rebuild in either direction");
+    auto restored=edited;fromChain(toChain(edited),restored);
+    check(restored.model==edited.nrLayers[0].model&&restored.nrLayers==edited.nrLayers&&restored.color==edited.color&&restored.videoHdr==edited.videoHdr,"chain conversion retains disabled values independently of comparison");
+    for(unsigned effect=0;effect<7;++effect){
+        auto active=edited;
+        switch(effect){
+        case 0:active.nr=true;active.nrLayers[1].enabled=true;active.nrRuntime=active.nrLayers[1].runtime;break;
+        case 1:active.sr=true;break;
+        case 2:active.multiplier=2;break;
+        case 3:active.color.enabled=true;break;
+        case 4:active.videoHdr.enabled=true;break;
+        case 5:active.hdrCurve.enabled=true;break;
+        case 6:active.multiplier=3;break;  // metadata no longer changes identity
+        }
+        check(!active.sameVideoConfiguration(edited)&&!active.sameActiveVideoParameters(edited),"enabling an edited effect changes active identity");
+    }
+    for(auto backend:{FrameGenerationBackend::Dlss,FrameGenerationBackend::XeSS,FrameGenerationBackend::Fsr,FrameGenerationBackend::Anr,FrameGenerationBackend::Vfg}){
+        auto active=off;active.multiplier=2;active.frameGenerationBackend=backend;active.fgMotion=MotionSource::OpticalFlow;
+        auto next=active;next.flow=FlowQuality::Performance;
+        check(active.sameVideoConfiguration(next)==(backend==FrameGenerationBackend::Vfg),"shared flow stays active for every external-flow FG consumer");
+        next=active;next.nrPolicy=veyra::pipeline::NrSizePolicy::Native;next.nrRuntime=NrRuntime::LmxxfAmd;
+        check(active.sameVideoConfiguration(next),"active FG does not activate stored NR parameters");
+        // 边缘神盾 (fgMotionRefine) shapes every FG motion taken from optical flow (2026-11-13):
+        // DLSS/FSR/ANR, and XeSS with the optical-flow source; VFG estimates its own.
+        next=active;next.fgMotionRefine=false;
+        const bool refines=backend!=FrameGenerationBackend::Vfg;
+        check(active.sameVideoConfiguration(next)!=refines&&requiresGraphRebuild(active,next)==refines,"edge aegis rebuilds every optical-flow FG motion, not VFG");
+        auto automatic=active;automatic.fgMotion=MotionSource::Automatic;next=automatic;next.fgMotionRefine=false;
+        const bool automaticFlow=backend!=FrameGenerationBackend::Vfg&&backend!=FrameGenerationBackend::XeSS;
+        check(requiresGraphRebuild(automatic,next)==automaticFlow,"edge aegis follows automatic motion: flow for DLSS/FSR/ANR, none for XeSS");
+        auto zero=active;zero.fgMotion=MotionSource::Zero;next=zero;next.fgMotionRefine=false;
+        check(!requiresGraphRebuild(zero,next),"edge aegis is inactive with zero FG motion");
+    }
+    auto stack=populated();stack.nrLayerCount=2;stack.nrLayers[0].enabled=false;stack.nrLayers[1].enabled=true;
+    stack.nrLayers[1].runtime=stack.nrRuntime;stack.nrLayers[1].lowLatencyPairing=stack.lowLatency;
+    auto next=stack;next.nrLayers[0].runtime=NrRuntime::LmxxfAmd;next.nrLayers[0].sizePolicy=veyra::pipeline::NrSizePolicy::Native;next.nrLayers[0].temporal=true;
+    check(stack.sameActiveVideoParameters(next)&&!requiresGraphRebuild(stack,next),"a bypassed first NR layer does not change an active second layer");
+    next.nrLayers[1].sizePolicy=veyra::pipeline::NrSizePolicy::P720;
+    check(!stack.sameVideoConfiguration(next)&&requiresGraphRebuild(stack,next),"active layer size still rebuilds after bypassed edits");
+    auto live=populated();live.sr=false;live.multiplier=1;
+    next=live;next.videoSrQuality=5;next.frameGenerationBackend=FrameGenerationBackend::XeSS;next.color.exposure+=.1f;
+    check(live.sameVideoConfiguration(next)&&!live.sameActiveVideoParameters(next)&&!requiresGraphRebuild(live,next),"mixed live colour and inactive backend edits need uniform upload without a reset");
+    // HDR10 static metadata was removed, so it can no longer pull the display peak
+    // into the resolved curve. Normalisation forces it off; only the pixel curve
+    // makes the display peak matter now.
+    auto metadata=off;metadata.hdrMetadata.enabled=true;metadata.hdrMetadata.maxCllNits=1000;
+    const auto active=metadata.activeVideoSettings();
+    check(active.hdrMetadata==HdrMetadataSettings{},"metadata is normalised away");
+    metadata.hdrCurve.enabled=true;metadata.hdrCurve.displayPeakNits=600;
+    HdrCurveSettings curve;HdrMetadataSettings resolved;
+    resolveHdrTuning(metadata.hdrCurve,metadata.hdrMetadata,curve,resolved);
+    check(curve.displayPeakNits==600,"the pixel curve still carries the display peak");
+}
+// 2.0.7 runs RTX Video SR at native size to repair compression artifacts. Raw capture has
+// none, so a raw source already at the target skips SR as 2.0.6 did (5090 field log 57).
+static void testNativeVideoSrPolicy(){
+    EnhancementSettings s;s.nr=false;s.sr=true;s.multiplier=1;s.videoSrQuality=4;s.srTarget=veyra::pipeline::SrTarget::Uhd4K;
+    StageRequest request;request.sr=true;request.width=3840;request.height=2160;
+    veyra::pipeline::EnhanceGraphDesc d;
+    describeStages(request,s,d);
+    check(d.enableSr,"native-size RTX Video SR still repairs a compressed 4K source");
+    request.uncompressedSource=true;describeStages(request,s,d);
+    check(!d.enableSr,"raw 4K capture at a 4K target skips SR as in 2.0.6");
+    request.width=1920;request.height=1080;describeStages(request,s,d);
+    check(d.enableSr,"raw 1080p capture still upscales to the 4K target");
+    request.uncompressedSource=false;request.width=3840;request.height=2160;s.videoSrQuality=0;describeStages(request,s,d);
+    check(!d.enableSr,"DLSS SR keeps skipping a source already at the target");
+}
+
+// E0 (2026-10-18): anti-aliasing / beauty effect types, chains past 16 nodes and
+// the same-size insertion slots shared with Color.
+__declspec(noinline) void testAntiAliasSettingsChain() {
+    using namespace veyra;
+    using namespace veyra::engine;
+    const EnhancementSettings plain;
+    auto chain = std::make_unique<EffectChain>(toChain(plain));
+    check(chain->countOf(EffectType::AntiAliasing) == 0 && chain->countOf(EffectType::Beauty) == 0 && !chain->overflow,
+          "E0: untouched settings add no anti-aliasing or beauty node");
+    check(effectInfo(EffectType::AntiAliasing).hidden != pipeline::EnhanceGraphDesc::antiAliasExecutor &&
+          effectInfo(EffectType::Beauty).hidden != pipeline::EnhanceGraphDesc::beautyExecutor,
+          "E0: the catalog shows exactly the effects whose executor is built");
+    chain->overflow = true;
+    check(!validateChain(*chain).accepted, "E0: an overflowing chain is refused instead of losing its last node");
+
+    auto s = std::make_unique<EnhancementSettings>(populated());
+    s->antiAlias.enabled = true; s->antiAlias.method = AntiAliasMethod::Fxaa; s->antiAlias.quality = 1;
+    s->additionalAntiAliasCount = 1;
+    auto& second = s->additionalAntiAlias[0];
+    second.enabled = false; second.method = AntiAliasMethod::Mlaa; second.quality = 0;
+    second.mlaaThreshold = 0.12f; second.mlaaStrength = 0.6f;
+    check(s->validate().empty(), "E0: two anti-aliasing instances validate");
+    *chain = toChain(*s);
+    uint32_t lastColor = 0, firstAa = chain->nodeCount, sr = chain->nodeCount;
+    for (uint32_t i = 0; i < chain->nodeCount; ++i) {
+        const auto type = chain->nodes[i].type;
+        if (type == EffectType::Color) lastColor = i;
+        if (type == EffectType::AntiAliasing && firstAa == chain->nodeCount) firstAa = i;
+        if (type == EffectType::SuperResolution) sr = i;
+    }
+    check(chain->countOf(EffectType::AntiAliasing) == 2 && lastColor < firstAa && firstAa + 2 == sr &&
+          chain->nodes[firstAa].enabled && !chain->nodes[firstAa + 1].enabled && validateChain(*chain).accepted,
+          "E0: the list chain keeps both instances between the grades and SR");
+    auto back = std::make_unique<EnhancementSettings>();
+    fromChain(*chain, *back);
+    check(back->antiAlias == s->antiAlias && back->additionalAntiAliasCount == 1 && back->additionalAntiAlias[0] == second,
+          "E0: anti-aliasing instances round-trip through the chain");
+
+    auto bad = std::make_unique<EnhancementSettings>(*s);
+    bad->antiAlias.quality = 3;
+    check(!bad->validate().empty(), "E0: an FXAA tier past ultra is rejected");
+    *bad = *s; bad->antiAlias.temporal = AntiAliasTemporal::T2x;
+    check(!bad->validate().empty(), "E0: temporal accumulation requires SMAA");
+    *bad = *s; bad->additionalAntiAliasCount = kMaxAntiAliasInstances;
+    check(!bad->validate().empty(), "E0: a third anti-aliasing instance is rejected");
+    *bad = *s; bad->additionalAntiAlias[0].mlaaThreshold = 0.5f;
+    check(!bad->validate().empty(), "E0: an MLAA threshold out of range is rejected even while switched off");
+
+    EnhancementSettings a; a.antiAlias.enabled = true; a.antiAlias.method = AntiAliasMethod::Mlaa; a.antiAlias.quality = 0;
+    auto b = a; b.antiAlias.mlaaThreshold = 0.2f; b.antiAlias.mlaaStrength = 0.5f;
+    check(!requiresGraphRebuild(a, b) && a.sameVideoConfiguration(b), "E0: MLAA threshold and strength are live uniforms");
+    b = a; b.antiAlias.method = AntiAliasMethod::Smaa; b.antiAlias.quality = 1;
+    check(requiresGraphRebuild(a, b) && !a.sameVideoConfiguration(b), "E0: changing the anti-aliasing method rebuilds");
+    b = a; b.antiAlias.enabled = false;
+    check(requiresGraphRebuild(a, b), "E0: switching anti-aliasing off rebuilds");
+    b = a; b.additionalAntiAliasCount = 1;
+    check(requiresGraphRebuild(a, b), "E0: adding an anti-aliasing instance rebuilds");
+    auto off = a; off.antiAlias.enabled = false; b = off; b.antiAlias.method = AntiAliasMethod::Fxaa;
+    check(!requiresGraphRebuild(off, b), "E0: edits of a switched-off instance do not rebuild");
+
+    // List mode: the instance reaches the description. With NR it runs behind the NR
+    // group (NR redraws the edges it smoothed in front); without NR at source size.
+    auto listSettings = std::make_unique<EnhancementSettings>();
+    listSettings->nr = true; listSettings->sr = true; listSettings->antiAlias = a.antiAlias;
+    StageRequest request; request.width = 1280; request.height = 720; request.nr = true; request.sr = true;
+    auto desc = std::make_unique<pipeline::EnhanceGraphDesc>();
+    const auto stepOf = [&](EffectType type) {
+        uint32_t found = kMaxChainNodes;
+        if (desc->fixedExecutionPlan)
+            for (uint32_t i = 0; i < desc->fixedExecutionPlan->stepCount; ++i)
+                if (desc->fixedExecutionPlan->steps[i].type == type) found = i;
+        return found;
+    };
+    using Slot = pipeline::EnhanceGraphDesc::PassSlot;
+    auto noNr = std::make_unique<EnhancementSettings>(*listSettings); noNr->nr = false;
+    StageRequest noNrRequest = request; noNrRequest.nr = false;
+    describeStages(noNrRequest, *noNr, *desc);
+    uint32_t aaStep = stepOf(EffectType::AntiAliasing);
+    check(aaStep < kMaxChainNodes && aaStep < stepOf(EffectType::SuperResolution) &&
+          desc->fixedExecutionPlan->steps[aaStep].output == pipeline::Extent{1280, 720} &&
+          desc->slotOfStep(aaStep) == Slot::SourcePost && desc->sourcePostActive(),
+          "E0: without NR, list anti-aliasing runs at source size right after the input conversion");
+    auto nrFirst = std::make_unique<EnhancementSettings>(*listSettings); nrFirst->lowLatency = true;
+    describeStages(request, *nrFirst, *desc);
+    aaStep = stepOf(EffectType::AntiAliasing);
+    check(desc->nrBeforeSr && aaStep < kMaxChainNodes && stepOf(EffectType::NrEnhance) < aaStep &&
+          aaStep < stepOf(EffectType::SuperResolution) && desc->fixedExecutionPlan->steps[aaStep].output == pipeline::Extent{1280, 720} &&
+          desc->slotOfStep(aaStep) == Slot::PreSr && !desc->sourcePostActive(),
+          "E0: NR first, list anti-aliasing follows NR at source size, in front of SR");
+    describeStages(request, *listSettings, *desc);
+    check(desc->fixedExecutionPlanError.empty() && desc->fixedExecutionPlan && desc->antiAlias[0] == a.antiAlias &&
+          desc->antiAlias[1] == AntiAliasSettings{} && desc->antiAliasActive(), "E0: describeStages carries the anti-aliasing instance");
+    aaStep = stepOf(EffectType::AntiAliasing);
+    check(aaStep < kMaxChainNodes && stepOf(EffectType::SuperResolution) < aaStep && stepOf(EffectType::NrEnhance) < aaStep &&
+          desc->fixedExecutionPlan->steps[aaStep].output == desc->fixedExecutionPlan->output &&
+          desc->slotOfStep(aaStep) == Slot::Tail && !desc->sourcePostActive(),
+          "E0: SR first, list anti-aliasing follows NR at the output size");
+    const auto error = desc->validateFixedExecutionPlan();
+    check(pipeline::EnhanceGraphDesc::antiAliasExecutor ? error.empty() : error == "anti-aliasing is not available in this build",
+          "E0: an enabled instance is refused until its executor is built");
+    auto inactive = std::make_unique<EnhancementSettings>(*listSettings); inactive->antiAlias.enabled = false;
+    describeStages(request, *inactive, *desc);
+    check(desc->validateFixedExecutionPlan().empty() && !desc->antiAliasActive(),
+          "E0: a switched-off instance adds no step and no refusal");
+}
+
+__declspec(noinline) void testSameSizeSlots() {
+    using namespace veyra;
+    using namespace veyra::engine;
+    using Slot = pipeline::EnhanceGraphDesc::PassSlot;
+    const auto describe = [](const std::vector<EffectType>& types, bool sr, pipeline::EnhanceGraphDesc& desc) {
+        auto chain = std::make_unique<EffectChain>(); chain->mode = ChainMode::Node;
+        for (const auto type : types) {
+            auto& node = chain->nodes[chain->nodeCount++]; node.type = type; node.enabled = true;
+            if (type == EffectType::Color) node.color.enabled = true;
+            if (type == EffectType::AntiAliasing) { node.aa.enabled = true; node.aa.method = AntiAliasMethod::Smaa; node.aa.quality = 1; }
+            if (type == EffectType::Beauty) { node.beauty.enabled = true; node.beauty.smooth = true; }
+        }
+        auto settings = std::make_unique<EnhancementSettings>(); fromChain(*chain, *settings);
+        const auto order = runtimeOrder(*chain);
+        StageRequest request; request.width = 640; request.height = 360; request.sr = sr; request.nodeOrder = &*order;
+        request.nr = std::find(types.begin(), types.end(), EffectType::NrEnhance) != types.end();
+        describeStages(request, *settings, desc);
+    };
+    const auto step = [](const pipeline::EnhanceGraphDesc& desc, EffectType type, uint32_t parameter) {
+        return desc.planStepOf(type, parameter);
+    };
+    const auto refusedOrValid = [](const pipeline::EnhanceGraphDesc& desc) {
+        const auto error = desc.validateFixedExecutionPlan();
+        return pipeline::EnhanceGraphDesc::antiAliasExecutor ? error.empty() : error == "anti-aliasing is not available in this build";
+    };
+    auto desc = std::make_unique<pipeline::EnhanceGraphDesc>();
+    describe({EffectType::AntiAliasing, EffectType::SuperResolution, EffectType::NrEnhance}, true, *desc);
+    check(desc->fixedExecutionPlanError.empty() && desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 0)) == Slot::SourcePost &&
+          refusedOrValid(*desc), "E0 slots: AA -> SR -> NR runs anti-aliasing at source size");
+    describe({EffectType::SuperResolution, EffectType::AntiAliasing, EffectType::NrEnhance}, true, *desc);
+    check(desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 0)) == Slot::PreNr && refusedOrValid(*desc),
+          "E0 slots: SR -> AA -> NR uses the pre-NR slot");
+    describe({EffectType::NrEnhance, EffectType::AntiAliasing, EffectType::SuperResolution}, true, *desc);
+    check(desc->nrBeforeSr && desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 0)) == Slot::PreSr && refusedOrValid(*desc),
+          "E0 slots: NR -> AA -> SR uses the pre-SR slot");
+    describe({EffectType::SuperResolution, EffectType::NrEnhance, EffectType::AntiAliasing}, true, *desc);
+    check(desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 0)) == Slot::Tail && refusedOrValid(*desc),
+          "E0 slots: SR -> NR -> AA uses the tail slot");
+    describe({EffectType::NrEnhance, EffectType::AntiAliasing, EffectType::NrEnhance}, false, *desc);
+    uint32_t target = kMaxNrInstances;
+    check(desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 0), &target) == Slot::InterNr && target == 1 && refusedOrValid(*desc),
+          "E0 slots: NR -> AA -> NR binds to the next NR resource");
+    describe({EffectType::Color, EffectType::AntiAliasing, EffectType::SuperResolution, EffectType::NrEnhance}, true, *desc);
+    check(desc->slotOfStep(step(*desc, EffectType::Color, 0)) == Slot::Ingress && !desc->nodeColor(0) &&
+          desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 0)) == Slot::SourcePost,
+          "E0 slots: a leading grade stays fused; the following anti-aliasing runs at source size");
+    describe({EffectType::AntiAliasing, EffectType::Color, EffectType::SuperResolution, EffectType::NrEnhance}, true, *desc);
+    check(desc->slotOfStep(step(*desc, EffectType::Color, 0)) == Slot::SourcePost && desc->sourcePostColor(0) && desc->nodeColor(0),
+          "E0 slots: a grade behind anti-aliasing cannot be fused and runs as a source-size pass");
+    describe({EffectType::SuperResolution, EffectType::AntiAliasing, EffectType::Color, EffectType::AntiAliasing}, true, *desc);
+    check(desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 0)) == Slot::Tail && desc->slotOfStep(step(*desc, EffectType::Color, 0)) == Slot::Tail &&
+          desc->slotOfStep(step(*desc, EffectType::AntiAliasing, 1)) == Slot::Tail && desc->antiAlias[1].enabled,
+          "E0 slots: mixed same-size passes after SR share the tail slot in order");
+    describe({EffectType::SuperResolution, EffectType::NrEnhance, EffectType::Beauty}, true, *desc);
+    check(desc->fixedExecutionPlanError.empty() && desc->slotOfStep(step(*desc, EffectType::Beauty, 0)) == Slot::Tail &&
+          desc->validateFixedExecutionPlan().empty() && desc->beautyActive(), "beauty: SR -> NR -> beauty runs in the tail slot");
+    describe({EffectType::Beauty, EffectType::SuperResolution, EffectType::NrEnhance}, true, *desc);
+    check(desc->slotOfStep(step(*desc, EffectType::Beauty, 0)) == Slot::SourcePost && desc->validateFixedExecutionPlan().empty(),
+          "beauty: a leading beauty node runs at source size");
+    describe({EffectType::SuperResolution, EffectType::Beauty, EffectType::NrEnhance}, true, *desc);
+    check(desc->slotOfStep(step(*desc, EffectType::Beauty, 0)) == Slot::PreNr && desc->validateFixedExecutionPlan().empty(),
+          "beauty: SR -> beauty -> NR uses the pre-NR slot");
+    describe({EffectType::NrEnhance, EffectType::Beauty, EffectType::SuperResolution}, true, *desc);
+    check(desc->nrBeforeSr && desc->slotOfStep(step(*desc, EffectType::Beauty, 0)) == Slot::PreSr && desc->validateFixedExecutionPlan().empty(),
+          "beauty: NR -> beauty -> SR uses the pre-SR slot");
+    // Color-only chains keep their existing slots (also covered byte-for-byte by the slot regression).
+    describe({EffectType::NrEnhance, EffectType::Color, EffectType::SuperResolution, EffectType::Color}, true, *desc);
+    check(desc->validateFixedExecutionPlan().empty() && desc->preSrColor(0) && desc->tailColor(1) && !desc->sourcePostActive(),
+          "E0 slots: Color-only node chains keep the pre-SR and tail grades");
+}
+
+__declspec(noinline) void testBeautySettingsChain() {
+    using namespace veyra;
+    using namespace veyra::engine;
+    using Slot = pipeline::EnhanceGraphDesc::PassSlot;
+    BeautySettings b;
+    check(b.validate().empty() && !b.configured() && !b.effective(), "beauty: defaults validate and do nothing");
+    const auto refused = [](auto edit) { BeautySettings v; v.enabled = true; edit(v); return !v.validate().empty(); };
+    check(refused([](BeautySettings& v) { v.radius = 13.0f; }) && refused([](BeautySettings& v) { v.satMin = 0.9f; }) &&
+          refused([](BeautySettings& v) { v.minConfidence = 0.2f; }) && refused([](BeautySettings& v) { v.regionExpand = 0.5f; }) &&
+          refused([](BeautySettings& v) { v.restoreStrength = std::nanf(""); }),
+          "beauty: out-of-range values are refused");
+    BeautyDetection d;
+    check(d.validate().empty() && d.inputLongSide() == 512, "beauty: balanced detection by default");
+    d.maxFaces = 0; check(!d.validate().empty(), "beauty: a detector needs at least one face");
+    // Sub-functions are independent: strength 0 skips only the smoothing.
+    b.enabled = true; b.restore = true; b.smooth = true; b.strength = 0.0f;
+    check(b.restoreActive() && !b.smoothActive() && b.effective(), "beauty: smoothing strength 0 keeps the face restore");
+    b.strength = 1.0f; b.restoreStrength = 0.0f;
+    check(!b.restoreActive() && b.smoothActive(), "beauty: restore strength 0 keeps the smoothing");
+
+    // Two list layers and shared detection survive the chain round trip, after protection.
+    auto s = std::make_unique<EnhancementSettings>();
+    s->nr = true; s->sr = true; s->protection.enabled = true;
+    s->beauty.enabled = true; s->beauty.restore = true; s->beauty.restoreStrength = 0.75f; s->beauty.feather = 0.12f;
+    s->additionalBeautyCount = 1;
+    auto& second = s->additionalBeauty[0];
+    second.enabled = false; second.smooth = true; second.smoothAmount = 0.5f; second.radius = 3.5f; second.scope = BeautyScope::AllSkin;
+    s->beautyDetection.quality = 2; s->beautyDetection.maxFaces = 2; s->beautyDetection.stability = 0.8f;
+    check(s->validate().empty(), "beauty: two list layers validate");
+    auto chain = std::make_unique<EffectChain>(toChain(*s));
+    uint32_t protection = chain->nodeCount, first = chain->nodeCount, hdr = chain->nodeCount;
+    for (uint32_t i = 0; i < chain->nodeCount; ++i) {
+        if (chain->nodes[i].type == EffectType::Protection) protection = i;
+        if (chain->nodes[i].type == EffectType::Beauty && first == chain->nodeCount) first = i;
+        if (chain->nodes[i].type == EffectType::VideoHdr) hdr = i;
+    }
+    check(chain->countOf(EffectType::Beauty) == 2 && protection < first && first < hdr && chain->beautyDetection == s->beautyDetection,
+          "beauty: the list group follows NR protection and precedes RTX Video HDR");
+    auto back = std::make_unique<EnhancementSettings>();
+    fromChain(*chain, *back);
+    check(back->beauty == s->beauty && back->additionalBeautyCount == 1 && back->additionalBeauty[0] == second &&
+          back->beautyDetection == s->beautyDetection, "beauty: fromChain restores both layers and the detection values");
+
+    // Plan: default order puts the group in the tail; NR-first preview right after NR.
+    StageRequest request; request.width = 1280; request.height = 720; request.nr = true; request.sr = true;
+    auto desc = std::make_unique<pipeline::EnhanceGraphDesc>();
+    describeStages(request, *s, *desc);
+    const auto beautyStep = desc->planStepOf(EffectType::Beauty, 0);
+    check(desc->fixedExecutionPlanError.empty() && desc->slotOfStep(beautyStep) == Slot::Tail && desc->beauty[0] == s->beauty &&
+          desc->beautyDetection == s->beautyDetection && desc->validateFixedExecutionPlan().empty(),
+          "beauty: list mode runs the group in the tail slot");
+    auto nrFirst = std::make_unique<EnhancementSettings>(*s); nrFirst->lowLatency = true;
+    for (auto& layer : nrFirst->nrLayers) layer.lowLatencyPairing = true;
+    describeStages(request, *nrFirst, *desc);
+    check(desc->nrBeforeSr && desc->slotOfStep(desc->planStepOf(EffectType::Beauty, 0)) == Slot::PreSr && desc->validateFixedExecutionPlan().empty(),
+          "beauty: NR-first preview runs the group between NR and SR");
+    StageRequest still = request; still.stillImage = true; still.sr = false;
+    describeStages(still, *s, *desc);
+    check(!desc->beautyRequireDetector, "beauty: a picture runs without requiring the detector");
+    StageRequest exportJob = request; exportJob.exportJob = true;
+    auto masked = std::make_unique<EnhancementSettings>(*s); masked->beauty.showMask = true;
+    describeStages(exportJob, *masked, *desc);
+    check(desc->beautyRequireDetector && !desc->beauty[0].showMask,
+          "beauty: export needs the detector and never writes the mask view");
+
+    // Only the master switch (and the instance count) rebuilds; every value is live.
+    auto live = std::make_unique<EnhancementSettings>(*s);
+    live->beauty.restoreStrength = 0.3f; live->beauty.smooth = true; live->beauty.radius = 6.0f; live->beautyDetection.quality = 0;
+    check(s->sameVideoConfiguration(*live) && !requiresGraphRebuild(*s, *live), "beauty: tuning an enabled node is live");
+    auto toggled = std::make_unique<EnhancementSettings>(*s); toggled->beauty.enabled = false;
+    check(!s->sameVideoConfiguration(*toggled) && requiresGraphRebuild(*s, *toggled), "beauty: switching a node rebuilds");
+    auto counted = std::make_unique<EnhancementSettings>(*s); counted->additionalBeautyCount = 0;
+    check(requiresGraphRebuild(*s, *counted), "beauty: removing a layer rebuilds");
+    auto disabled = std::make_unique<EnhancementSettings>(*toggled); disabled->beauty.radius = 7.0f;
+    check(toggled->sameVideoConfiguration(*disabled), "beauty: editing a disabled node changes nothing");
+
+    // Node mode: two beauty nodes keep their order and parameters.
+    auto node = std::make_unique<EffectChain>(); node->mode = ChainMode::Node;
+    const auto add = [&](EffectType type) -> ChainNode& { auto& n = node->nodes[node->nodeCount++]; n = ChainNode{}; n.type = type; n.enabled = true; return n; };
+    add(EffectType::Beauty).beauty.smooth = true;
+    add(EffectType::SuperResolution);
+    auto& tail = add(EffectType::Beauty); tail.beauty.restore = true; tail.beauty.minConfidence = 0.8f;
+    auto nodeSettings = std::make_unique<EnhancementSettings>(); fromChain(*node, *nodeSettings);
+    const auto order = runtimeOrder(*node);
+    auto restored = std::make_unique<EffectChain>();
+    const auto verdict = restoreRuntimeOrder(*nodeSettings, *order, *restored);
+    check(verdict.accepted && restored->nodes[2].beauty.minConfidence == 0.8f && restored->nodes[0].beauty.smooth,
+          "beauty: node order restores both instances");
+    StageRequest nodeRequest; nodeRequest.width = 640; nodeRequest.height = 360; nodeRequest.sr = true; nodeRequest.nodeOrder = &*order;
+    describeStages(nodeRequest, *nodeSettings, *desc);
+    check(desc->slotOfStep(desc->planStepOf(EffectType::Beauty, 0)) == Slot::SourcePost &&
+          desc->slotOfStep(desc->planStepOf(EffectType::Beauty, 1)) == Slot::Tail && desc->validateFixedExecutionPlan().empty(),
+          "beauty: node mode runs one instance at source size and one in the tail");
+    // A node just added (beauty arrives switched off) or switched off at its defaults
+    // has no settings instance; the node order still restores it, for AA too.
+    auto fresh = std::make_unique<EffectChain>(); fresh->mode = ChainMode::Node;
+    const auto addFresh = [&](EffectType type, bool enabled) { auto& n = fresh->nodes[fresh->nodeCount++]; n = ChainNode{}; n.type = type; n.enabled = enabled; };
+    addFresh(EffectType::AntiAliasing, false); addFresh(EffectType::SuperResolution, true); addFresh(EffectType::Beauty, false);
+    auto freshSettings = std::make_unique<EnhancementSettings>(); fromChain(*fresh, *freshSettings);
+    check(!freshSettings->beauty.configured() && !freshSettings->antiAlias.configured(), "untouched nodes: no settings instance");
+    const auto freshOrder = runtimeOrder(*fresh);
+    auto freshRestored = std::make_unique<EffectChain>();
+    check(restoreRuntimeOrder(*freshSettings, *freshOrder, *freshRestored).accepted && freshRestored->nodeCount == 3 &&
+          freshRestored->nodes[0] == fresh->nodes[0] && freshRestored->nodes[2] == fresh->nodes[2],
+          "untouched nodes: a switched-off default AA and beauty node keep their places in the node order");
+    auto twice = *freshOrder; twice.types[twice.nodeCount++] = EffectType::AntiAliasing;
+    check(!restoreRuntimeOrder(*freshSettings, twice, *freshRestored).accepted,
+          "untouched nodes: an order asking for a second untouched instance is still refused");
+    addFresh(EffectType::Beauty, false);
+    fromChain(*fresh, *freshSettings);
+    check(restoreRuntimeOrder(*freshSettings, *runtimeOrder(*fresh), *freshRestored).accepted &&
+          freshRestored->countOf(EffectType::Beauty) == 2, "untouched nodes: two beauty nodes carry their own instances");
+
+    for (int i = 0; i < 6; ++i) add(EffectType::Beauty);
+    check(!validateChain(*node).accepted, "beauty: more than six beauty nodes are refused");
+}
+
+__declspec(noinline) void testWideChains() {
+    using namespace veyra::engine;
+    auto chain = std::make_unique<EffectChain>(); chain->mode = ChainMode::Node;
+    const auto add = [&](EffectType type, uint32_t count) {
+        for (uint32_t i = 0; i < count; ++i) {
+            auto& node = chain->nodes[chain->nodeCount++]; node = ChainNode{}; node.type = type; node.enabled = true;
+            if (type == EffectType::Color) node.color.enabled = true;
+        }
+    };
+    add(EffectType::Color, kMaxColorInstances); add(EffectType::AntiAliasing, kMaxAntiAliasInstances);
+    add(EffectType::SuperResolution, 1); add(EffectType::NrEnhance, kMaxNrInstances); add(EffectType::Beauty, kMaxBeautyInstances);
+    add(EffectType::VideoHdr, 1); add(EffectType::FrameGeneration, 1);
+    check(chain->nodeCount == 21 && validateChain(*chain).accepted, "E0: the widest node chain (21 nodes) validates");
+    auto plan = std::make_unique<ChainExecutionPlan>();
+    check(compileChainExecutionPlan(*chain, {{640, 360}, EnhancementSettings{}.srTarget, false, false, false}, *plan).accepted &&
+          plan->stepCount >= 20 && plan->stepCount <= kMaxChainNodes, "E0: a 21-node chain compiles every step");
+    auto extra = std::make_unique<EffectChain>(*chain);
+    extra->nodes[extra->nodeCount++].type = EffectType::Beauty;
+    check(!validateChain(*extra).accepted, "E0: a seventh beauty node is refused");
+    const auto order = runtimeOrder(*chain);
+    check(order && order->nodeCount == 21 && order->types[20] == EffectType::FrameGeneration,
+          "E0: the runtime order transports every node of a wide chain");
+}
+
+// Three-step SR (2026-10-28): shrink, RTX Video SR, fit. Off/Target must stay the
+// single-step sizes; the plan, the chain step and the graph description agree.
+static void testThreeStepSr(){
+    using namespace veyra;using pipeline::Extent;using pipeline::SrPrescale;using pipeline::SrOutput;using pipeline::SrTarget;
+    bool same=true;unsigned cases=0;
+    const std::array<Extent,7> sources{{{640,360},{1280,720},{1920,1080},{2560,1440},{3840,2160},{3840,1600},{1080,1920}}};
+    for(const auto source:sources)for(uint32_t target=0;target<=uint32_t(SrTarget::Uhd7K);++target){
+        const auto box=pipeline::srTargetExtent(SrTarget(target));
+        const double scale=std::min(double(box.width)/source.width,double(box.height)/source.height);
+        const Extent expected=scale>1.0?Extent{std::max(2u,uint32_t(source.width*scale+1e-6)&~1u),std::max(2u,uint32_t(source.height*scale+1e-6)&~1u)}:source;
+        const auto stage=pipeline::srStageExtents(source,SrTarget(target));
+        const auto plan=pipeline::ResolutionPlan::make(source,true,pipeline::NrSizePolicy::Native,false,0,SrTarget(target));
+        same=same&&stage.input==source&&stage.evaluated==expected&&stage.output==expected&&!stage.prescaleIneffective&&!stage.outputIneffective&&
+            plan.base==expected&&plan.srInput==source&&plan.srOutput==expected&&plan.srApplied==(expected!=source);
+        ++cases;
+    }
+    check(same&&cases==42,"three-step SR: off/target keeps the single-step sizes for every source and target");
+    struct Case{Extent source;SrPrescale prescale;SrTarget target;SrOutput fit;Extent input,evaluated,output;bool prescaleOff,outputOff;const char* label;};
+    const Case table[]={
+        {{3840,2160},SrPrescale::P1080,SrTarget::Uhd4K,SrOutput::Target,{1920,1080},{3840,2160},{3840,2160},false,false,"three-step SR: blurry 4K -> 1080p -> 4K"},
+        {{3840,2160},SrPrescale::P1440,SrTarget::Uhd4K,SrOutput::Target,{2560,1440},{3840,2160},{3840,2160},false,false,"three-step SR: 4K -> 1440p -> 4K"},
+        {{2560,1440},SrPrescale::Off,SrTarget::Uhd8K,SrOutput::Uhd4K,{2560,1440},{7680,4320},{3840,2160},false,false,"three-step SR: native 2K -> 8K -> fit 4K"},
+        {{2560,1440},SrPrescale::P1080,SrTarget::Uhd4K,SrOutput::Target,{1920,1080},{3840,2160},{3840,2160},false,false,"three-step SR: native 2K -> 1080p -> 4K"},
+        {{3840,2160},SrPrescale::P1080,SrTarget::Uhd8K,SrOutput::Uhd4K,{1920,1080},{7680,4320},{3840,2160},false,false,"three-step SR: 4K -> 1080p -> 8K -> fit 4K"},
+        {{3840,1600},SrPrescale::P1080,SrTarget::Uhd4K,SrOutput::Target,{1920,800},{3840,1600},{3840,1600},false,false,"three-step SR: 21:9 keeps its aspect"},
+        {{3840,2160},pipeline::srPrescaleForPercent(75),SrTarget::Uhd4K,SrOutput::Target,{2880,1620},{3840,2160},{3840,2160},false,false,"three-step SR: manual 75 %"},
+        {{2560,1440},SrPrescale::Off,SrTarget::Uhd8K,SrOutput::Source,{2560,1440},{7680,4320},{2560,1440},false,false,"three-step SR: fit back to the exact source size"},
+        {{1920,1080},SrPrescale::Off,SrTarget::Uhd4K,SrOutput::Qhd,{1920,1080},{3840,2160},{2560,1440},false,false,"three-step SR: 1080p -> 4K -> fit 2K"},
+        {{1920,1080},SrPrescale::P1080,SrTarget::Uhd4K,SrOutput::Target,{1920,1080},{3840,2160},{3840,2160},true,false,"three-step SR: a source already at the prescale size is reported, not shrunk"},
+        {{3840,2160},SrPrescale::P1440,SrTarget::Qhd,SrOutput::Target,{3840,2160},{3840,2160},{3840,2160},true,false,"three-step SR: a prescale nothing can enlarge again is not applied"},
+        {{3840,2160},pipeline::srPrescaleForPercent(90),SrTarget::Qhd,SrOutput::Target,{3840,2160},{3840,2160},{3840,2160},true,false,"three-step SR: manual 90 % of 4K with a 2K target is not applied"},
+        {{3840,2160},SrPrescale::Off,SrTarget::Uhd4K,SrOutput::Qhd,{3840,2160},{3840,2160},{3840,2160},false,true,"three-step SR: the output fit needs an enlarging SR"},
+        {{1920,1080},SrPrescale::Off,SrTarget::Uhd4K,SrOutput::Uhd5K,{1920,1080},{3840,2160},{3840,2160},false,true,"three-step SR: an output box larger than the SR result is reported"},
+    };
+    for(const auto& c:table){
+        const auto s=pipeline::srStageExtents(c.source,c.target,c.prescale,c.fit);
+        const bool ok=s.input==c.input&&s.evaluated==c.evaluated&&s.output==c.output&&s.prescaleIneffective==c.prescaleOff&&s.outputIneffective==c.outputOff;
+        if(!ok)std::printf("  got %ux%u -> %ux%u -> %ux%u flags %d %d\n",s.input.width,s.input.height,s.evaluated.width,s.evaluated.height,
+            s.output.width,s.output.height,int(s.prescaleIneffective),int(s.outputIneffective));
+        check(ok,c.label);
+    }
+    {
+        const auto plan=pipeline::ResolutionPlan::make({3840,2160},true,pipeline::NrSizePolicy::Realtime,false,0,SrTarget::Uhd4K,false,0,SrPrescale::P1080);
+        const auto single=pipeline::ResolutionPlan::make({3840,2160},true,pipeline::NrSizePolicy::Realtime,false,0,SrTarget::Uhd4K);
+        check(plan.srApplied&&!single.srApplied&&plan.srInput==Extent{1920,1080}&&plan.srOutput==Extent{3840,2160}&&
+              plan.base==single.base&&plan.nr==single.nr&&plan.flow==single.flow&&plan.output==single.output,
+              "three-step SR: a 4K prescale changes only what SR reads; NR, flow and output sizes stay");
+    }
+    // The chain step: present even when the source already has the target size.
+    EnhancementSettings s;s.nr=false;s.sr=true;s.videoSrQuality=3;s.srPrescale=SrPrescale::P1080;s.dualSrEnabled=true;
+    {
+        const auto chain=toChain(s);
+        ChainExecutionPlan plan;ChainExecutionRequest request{{3840,2160},SrTarget::Uhd4K,false,false,false,SrPrescale::P1080,SrOutput::Target};
+        bool ok=compileChainExecutionPlan(chain,request,plan).accepted&&plan.resourceCounts[size_t(EffectType::SuperResolution)]==1;
+        for(uint32_t i=0;i<plan.stepCount;++i)if(plan.steps[i].type==EffectType::SuperResolution)
+            ok=ok&&plan.steps[i].input==Extent{3840,2160}&&plan.steps[i].processing==Extent{3840,2160}&&plan.steps[i].output==Extent{3840,2160};
+        check(ok,"three-step SR: 4K -> 1080p -> 4K keeps an SR step");
+        request.srPrescale=SrPrescale::Off;
+        check(compileChainExecutionPlan(chain,request,plan).accepted&&plan.resourceCounts[size_t(EffectType::SuperResolution)]==0,
+              "three-step SR: without it a 4K source at a 4K target still has no SR step");
+        ChainExecutionRequest fit{{2560,1440},SrTarget::Uhd8K,false,false,false,SrPrescale::Off,SrOutput::Uhd4K};
+        ok=compileChainExecutionPlan(chain,fit,plan).accepted&&plan.output==Extent{3840,2160};
+        for(uint32_t i=0;i<plan.stepCount;++i)if(plan.steps[i].type==EffectType::SuperResolution)
+            ok=ok&&plan.steps[i].processing==Extent{7680,4320}&&plan.steps[i].output==Extent{3840,2160};
+        check(ok,"three-step SR: the SR step evaluates 8K and outputs the 4K fit");
+        fit.srPrescale=SrPrescale(5);
+        check(!compileChainExecutionPlan(chain,fit,plan).accepted,"three-step SR: an invalid prescale fails the plan");
+    }
+    // The graph description: RTX Video SR on NVIDIA only.
+    {
+        StageRequest request;request.width=3840;request.height=2160;request.sr=true;request.nvidiaAdapter=true;
+        pipeline::EnhanceGraphDesc desc;describeStages(request,s,desc);
+        check(desc.enableSr&&desc.srInputWidth==1920&&desc.srInputHeight==1080&&desc.srOutputWidth==3840&&desc.srOutputHeight==2160&&
+              desc.workWidth==3840&&desc.workHeight==2160&&desc.validateFixedExecutionPlan().empty(),
+              "three-step SR: the graph description carries the shrunk SR input");
+        request.uncompressedSource=true;describeStages(request,s,desc);
+        check(desc.enableSr&&desc.srInputWidth==1920,"three-step SR: an explicit prescale also runs on raw capture");
+        request.uncompressedSource=false;request.exportJob=true;describeStages(request,s,desc);
+        check(desc.enableSr&&desc.srInputWidth==1920&&desc.validateFixedExecutionPlan().empty(),"three-step SR: exports use the same sizes");
+        request.exportJob=false;request.stillImage=true;describeStages(request,s,desc);
+        check(desc.enableSr&&desc.srInputWidth==1920&&desc.validateFixedExecutionPlan().empty(),"three-step SR: still images run it too");
+        request.stillImage=false;
+        // Since 2026-11-08 a DLSS SR or FSR base runs double SR as well.
+        for(const unsigned backend:{0u,kVideoSrFsr}){
+            auto other=s;other.videoSrQuality=backend;describeStages(request,other,desc);
+            check(desc.enableSr&&desc.dualSr&&desc.srInputWidth==1920&&desc.srOutputWidth==3840&&desc.validateFixedExecutionPlan().empty(),
+                  "double SR: DLSS SR and FSR bases run both steps");
+        }
+        request.nvidiaAdapter=false;describeStages(request,s,desc);
+        check(desc.srInputWidth==3840&&desc.srOutputWidth==desc.workWidth,"three-step SR: other adapters keep the single step");
+        auto fsrPair=s;fsrPair.videoSrQuality=kVideoSrFsr;fsrPair.dualSrQuality=kVideoSrFsr;describeStages(request,fsrPair,desc);
+        check(desc.enableSr&&desc.dualSr&&desc.srInputWidth==1920,"double SR: FSR -> FSR runs on other adapters");
+        request.nvidiaAdapter=true;request.width=2560;request.height=1440;
+        auto fit=s;fit.srPrescale=SrPrescale::P1080;fit.srTarget=SrTarget::Uhd8K;fit.srOutput=SrOutput::Uhd4K;describeStages(request,fit,desc);
+        check(desc.enableSr&&desc.dualSr&&desc.firstSrWidth==7680&&desc.srInputWidth==1920&&desc.srOutputWidth==3840&&desc.srOutputHeight==2160&&desc.workWidth==3840&&
+              desc.workHeight==2160&&desc.validateFixedExecutionPlan().empty(),"three-step SR: 2K -> 8K -> 4K works at 4K after SR");
+    }
+    // Settings: validation, inactive normalization, rebuilds and chain globals.
+    {
+        auto bad=s;
+        for(const uint32_t value:{5u,149u,191u}){bad.srPrescale=SrPrescale(value);check(!bad.validate().empty(),"three-step SR: an invalid prescale is rejected");}
+        for(const uint32_t value:{150u,190u}){bad.srPrescale=SrPrescale(value);check(bad.validate().empty(),"three-step SR: manual 50 % and 90 % are valid");}
+        bad=s;bad.srOutput=SrOutput(7);check(!bad.validate().empty(),"three-step SR: an invalid output is rejected");
+        check(s.activeVideoSettings().srPrescale==SrPrescale::P1080,"three-step SR: RTX Video SR keeps the prescale");
+        auto off=s;off.sr=false;auto dlss=s;dlss.videoSrQuality=0;
+        check(off.activeVideoSettings().srPrescale==SrPrescale::Off&&dlss.activeVideoSettings().srPrescale==SrPrescale::P1080,
+              "three-step SR: SR off normalizes the fields, a DLSS SR base keeps the double SR reduction");
+        auto before=s;before.srPrescale=SrPrescale::Off;auto output=s;output.srOutput=SrOutput::Qhd;
+        check(requiresGraphRebuild(before,s)&&!requiresGraphRebuild(s,output),"double SR: reduction rebuilds, the kept shrink is inactive under double SR");
+        auto single=s;single.dualSrEnabled=false;auto shrunk=single;shrunk.srOutput=SrOutput::Uhd4K;
+        check(requiresGraphRebuild(single,shrunk)&&shrunk.activeVideoSettings().srOutput==SrOutput::Uhd4K&&
+              output.activeVideoSettings().srOutput==SrOutput::Target,"supersample: the shrink rebuilds a single RTX Video SR pass only");
+        auto dlssBefore=before;dlssBefore.videoSrQuality=0;
+        check(requiresGraphRebuild(dlssBefore,dlss),"double SR: a DLSS SR base's reduction rebuilds the graph too");
+        auto idle=dlssBefore;idle.dualSrEnabled=false;auto idleEdit=idle;idleEdit.srPrescale=SrPrescale::P1080;
+        check(!requiresGraphRebuild(idle,idleEdit),"three-step SR: inactive edits do not rebuild the graph");
+        EnhancementSettings restored;ChainGlobalSettings::capture(output).apply(restored);
+        check(restored.srPrescale==SrPrescale::P1080&&restored.srOutput==SrOutput::Qhd,"three-step SR: chain globals carry both fields");
+        auto a=ChainConfiguration::capture(toChain(s),s,-1,-1);auto b=a;b.srOutput=SrOutput::Qhd;
+        check(!(a==b),"three-step SR: configuration equality sees the output fit");
+    }
+}
+
+// Supersampling (2026-10-28): one RTX Video SR pass evaluates at its target and is
+// shrunk before every later effect, so NR and FG never run at the larger size.
+static void testSupersampleSr(){
+    using namespace veyra;using pipeline::Extent;using pipeline::SrOutput;using pipeline::SrTarget;
+    EnhancementSettings s;s.sr=true;s.nr=true;s.lowLatency=false;s.nrPolicy=pipeline::NrSizePolicy::Native;
+    s.videoSrQuality=4;s.srTarget=SrTarget::Uhd8K;s.srOutput=SrOutput::Uhd4K;s.multiplier=2;
+    StageRequest r;r.width=1920;r.height=1080;r.sr=true;r.nr=true;r.fg=true;r.nvidiaAdapter=true;
+    pipeline::EnhanceGraphDesc d;auto p=describeStages(r,s,d);
+    check(d.enableSr&&!d.dualSr&&d.srInputWidth==1920&&d.srOutputWidth==7680&&d.srOutputHeight==4320&&d.workWidth==3840&&d.workHeight==2160&&
+          d.validateFixedExecutionPlan().empty(),"supersample: 1080p evaluates 8K and the chain continues at 4K");
+    bool layers=!d.nrLayersExtent.empty();for(const auto e:d.nrLayersExtent)layers=layers&&e==Extent{3840,2160};
+    check(d.enableNr&&d.nrWidth==3840&&d.nrHeight==2160&&layers&&p.fg==Extent{3840,2160}&&p.output==Extent{3840,2160},
+          "supersample: NR and FG run at the shrunk 4K, never at 8K");
+    for(const bool exporting:{true,false}){
+        auto q=r;q.exportJob=exporting;q.stillImage=!exporting;q.fg=false;describeStages(q,s,d);
+        check(d.srOutputWidth==7680&&d.workWidth==3840&&d.validateFixedExecutionPlan().empty(),
+              exporting?"supersample: exports use the same sizes":"supersample: still images use the same sizes");
+    }
+    {
+        auto source=s;source.srOutput=SrOutput::Source;auto q=r;q.width=2560;q.height=1440;p=describeStages(q,source,d);
+        check(d.srOutputWidth==7680&&d.workWidth==2560&&d.workHeight==1440,"supersample: 2K -> 8K -> back to the exact source size");
+        auto qhd=s;qhd.srTarget=SrTarget::Uhd4K;qhd.srOutput=SrOutput::Qhd;describeStages(r,qhd,d);
+        check(d.srOutputWidth==3840&&d.workWidth==2560&&d.workHeight==1440&&d.validateFixedExecutionPlan().empty(),
+              "supersample: 1080p -> 4K -> a non-integer 2K shrink");
+        auto none=s;none.srTarget=SrTarget::Uhd4K;none.srOutput=SrOutput::Qhd;auto q4k=r;q4k.width=3840;q4k.height=2160;
+        p=describeStages(q4k,none,d);
+        check(p.srOutputIneffective&&d.workWidth==3840&&d.srOutputWidth==3840,"supersample: no enlargement leaves the shrink unapplied and reported");
+    }
+    {
+        auto dual=s;dual.dualSrEnabled=true;dual.srPrescale=pipeline::SrPrescale::P1080;dual.dualSrTarget=SrTarget::Uhd4K;describeStages(r,dual,d);
+        check(d.dualSr&&d.firstSrWidth==7680&&d.srOutputWidth==3840&&d.workWidth==3840,"supersample: double SR keeps its own second target and ignores the shrink");
+        for(const unsigned backend:{0u,kVideoSrFsr}){
+            auto other=s;other.videoSrQuality=backend;describeStages(r,other,d);
+            check(d.workWidth==7680&&d.srOutputWidth==7680&&other.activeVideoSettings().srOutput==SrOutput::Target,
+                  "supersample: DLSS SR and FSR keep their single step");
+        }
+        auto amd=r;amd.nvidiaAdapter=false;describeStages(amd,s,d);
+        check(d.srOutputWidth==d.workWidth,"supersample: other adapters keep the single step");
+    }
+}
+
+int main() {
+    {
+        EnhancementSettings before;before.nr=before.sr=false;
+        before.antiAlias.enabled=true;before.antiAlias.method=AntiAliasMethod::Dlaa;before.antiAlias.quality=0;
+        auto after=before;after.dlssSrModel=1;
+        check(requiresGraphRebuild(before,after),"DLAA: model edits rebuild even when SR is disabled");
+        after=before;after.flow=FlowQuality::Quality;
+        check(!(before.activeVideoSettings()==after.activeVideoSettings()),"DLAA: flow tuning stays active with no other flow consumer");
+        before.antiAlias.enabled=false;after=before;after.dlssSrModel=1;
+        check(!requiresGraphRebuild(before,after),"DLAA: disabled instance does not activate the model");
+        for(auto failure:{FailedBackend::Dlaa,FailedBackend::NgxCore,FailedBackend::OpticalFlow}){
+            auto failed=before;
+            failed.antiAlias.enabled=true;
+            failed.additionalAntiAliasCount=1;failed.additionalAntiAlias[0].enabled=true;
+            check(disableFailedBackend(failed,failure)&&!failed.usesDlaa()&&failed.additionalAntiAlias[0].enabled,
+                  "DLAA: recovery removes the failed consumer and leaves spatial anti-aliasing enabled");
+        }
+    }
+    {
+        using namespace veyra;using namespace veyra::engine;
+        EnhancementSettings original;original.nr=false;original.sr=true;original.videoSrQuality=0;
+        check(original.dlssSrModel==0,"DLSS SR: original model remains the default");
+        for(unsigned model=1;model<kDlssSrModelCount;++model){
+            auto next=original;next.dlssSrModel=model;
+            check(next.validate().empty()&&requiresGraphRebuild(original,next),"DLSS SR: active model switch rebuilds the feature");
+            EnhancementSettings restored;ChainGlobalSettings::capture(next).apply(restored);
+            check(restored.dlssSrModel==model,"DLSS SR: chain globals retain the selected model");
+            StageRequest request;request.width=1920;request.height=1080;request.sr=true;request.nvidiaAdapter=true;
+            pipeline::EnhanceGraphDesc desc;describeStages(request,next,desc);
+            check(desc.enableSr&&desc.dlssSrModel==model&&desc.workWidth==3840&&desc.workHeight==2160,
+                  "DLSS SR: preview graph gets the model at actual upscale dimensions");
+            request.exportJob=true;describeStages(request,next,desc);
+            check(desc.dlssSrModel==model,"DLSS SR: export uses the same model contract");
+            for(unsigned backend:{0u,1u,kVideoSrFsr}){
+                auto before=original;before.videoSrQuality=backend;before.sr=false;
+                auto after=before;after.dlssSrModel=model;
+                check(!requiresGraphRebuild(before,after),"DLSS SR: disabled model edits do not rebuild the graph");
+                if(backend!=0){before.sr=after.sr=true;
+                    check(!requiresGraphRebuild(before,after),"DLSS SR: RTX Video SR and FSR ignore inactive model edits");}
+            }
+        }
+        auto invalid=original;invalid.dlssSrModel=kDlssSrModelCount;
+        check(!invalid.validate().empty(),"DLSS SR: invalid model is rejected");
+    }
+    testInactiveEffectEdits();
+    {
+        using namespace veyra;using namespace veyra::engine;
+        for(const auto source:{pipeline::Extent{3840,2160},pipeline::Extent{2560,1440},pipeline::Extent{3840,1600}}){
+            EnhancementSettings s;s.nr=true;s.nrRuntime=NrRuntime::LmxxfAmd;s.nrLayerCount=2;
+            for(auto& n:s.nrLayers){n.enabled=true;n.runtime=NrRuntime::LmxxfAmd;n.sizePolicy=pipeline::NrSizePolicy::Native;}
+            s.nrLayers[0].model.style=1;s.nrLayers[1].model.style=2;s.nrLayers[1].residual.total=5;
+            const auto frozen=freezeExportSettings(s);auto restored=frozen;fromChain(toChain(frozen),restored);
+            check(restored==frozen&&frozen.nrLayers[1].residual.total==5,"AMD export freeze round-trip retains controls and worker contract");
+            StageRequest r;r.nr=true;r.exportJob=true;r.nvidiaAdapter=false;r.amdNr=true;r.width=source.width;r.height=source.height;
+            pipeline::EnhanceGraphDesc d;const auto plan=describeStages(r,frozen,d);
+            check(d.enableNr&&plan.output==source&&d.workWidth==source.width&&d.workHeight==source.height,"high-resolution AMD export keeps native output and enabled NR");
+            check(d.nrLayersExtent.size()==2&&std::all_of(d.nrLayersExtent.begin(),d.nrLayersExtent.end(),[](auto e){return e.height<=1080&&uint64_t(e.width)*e.height<=1920ull*1080;}),"every offline AMD model input fits the actual budget");
+            check(d.validateFixedExecutionPlan().empty()&&d.nrLayersSizePolicy[0]==pipeline::NrSizePolicy::Realtime,"bounded AMD processing matches the fixed shared execution plan");
+            s.nrRuntime=NrRuntime::NvidiaOriginal;for(auto& n:s.nrLayers)n.runtime=s.nrRuntime;
+            r.nvidiaAdapter=true;r.amdNr=false;describeStages(r,s,d);
+            check(d.nrLayersExtent[0]==source&&d.nrLayersExtent[1]==source,"NVIDIA export preserves native NR input dimensions");
+        }
+        for(auto backend:{FrameGenerationBackend::Dlss,FrameGenerationBackend::Vfg,FrameGenerationBackend::XeSS,FrameGenerationBackend::Fsr,FrameGenerationBackend::Fsr4}){
+            EnhancementSettings s;s.nr=s.sr=false;s.frameGenerationBackend=backend;s.multiplier=2;
+            StageRequest r;r.fg=true;r.fgMultiplier=2;r.exportJob=true;r.nvidiaAdapter=false;r.width=1920;r.height=1080;
+            pipeline::EnhanceGraphDesc d;describeStages(r,s,d);
+            check(d.frameGenerationBackend==backend&&d.fgMultiplier==2,"offline planning never substitutes DLSS or silently changes multiplier");
+            check(d.enableFg==fsrFrameGeneration(backend),"cross-vendor export admits actual FSR textures, rejects NVIDIA-only and present-sink stages");
+        }
+    }
+    testPerLayerAntiFlickerSnapshot();
+    testNrCorrectionDescription();
+    std::setvbuf(stdout,nullptr,_IONBF,0);
+    testNodeEditorGraph();
+    testExistingChainContracts();
+    testExecutionPlans();
+    testGeneratedExecutionPlans();
+    testLegacyPlanDimensions();
+    testProductionFixedPlanDescription();
+    testRuntimeOrderTransport();
+    testNodeTailColorDescription();
+    testNodePreSrColorDescription();
+    testNodeSplitNrDescription();
+    testNodePreSrProtectionDescription();
+    testNodeInterNrProtectionDescription();
+    testOutputControlNodes();
+    testNativeVideoSrPolicy();
+    testAntiAliasSettingsChain();
+    testSameSizeSlots();
+    testBeautySettingsChain();
+    testWideChains();
+    testThreeStepSr();
+    testSupersampleSr();
+    {
+        using namespace veyra;using pipeline::SrTarget;using pipeline::SrPrescale;using pipeline::SrOutput;
+        EnhancementSettings s;s.sr=true;s.nr=false;s.videoSrQuality=2;s.srTarget=SrTarget::Uhd8K;
+        s.srPrescale=SrPrescale::P1080;s.srOutput=SrOutput::Uhd4K;
+        StageRequest r;r.width=2560;r.height=1440;r.sr=true;
+        pipeline::EnhanceGraphDesc d;auto p=describeStages(r,s,d);
+        check(!d.dualSr&&d.srInputWidth==2560&&d.srOutputWidth==7680&&d.workWidth==3840&&d.validateFixedExecutionPlan().empty(),
+              "dual off: the kept reduction is unused and the 4K shrink supersamples the 8K pass");
+        {
+            auto plain=s;plain.srOutput=SrOutput::Target;pipeline::EnhanceGraphDesc o;describeStages(r,plain,o);
+            check(!o.dualSr&&o.workWidth==7680&&o.srOutputWidth==7680,"dual off without a shrink keeps ordinary 8K");
+        }
+        s.dualSrEnabled=true;s.dualSrTarget=SrTarget::Uhd4K;s.dualSrQuality=1;
+        p=describeStages(r,s,d);
+        check(d.dualSr&&d.firstSrWidth==7680&&d.srInputWidth==1920&&d.srOutputWidth==3840&&d.workWidth==3840&&d.dualSrQuality==1&&d.videoSrQuality==2&&d.validateFixedExecutionPlan().empty(),
+              "dual SR describes first 8K, reduction 1080p and second 4K with separate qualities");
+        check(p.dualSrApplied&&p.firstSrOutput==pipeline::Extent{7680,4320},"metrics preserve first-stage dimensions rather than labelling one AI pass as two");
+        s.srTarget=SrTarget::Uhd4K;s.dualSrTarget=SrTarget::Uhd8K;p=describeStages(r,s,d);
+        check(d.firstSrWidth==3840&&d.workWidth==7680&&s.dualSrTarget==SrTarget::Uhd8K,"second 8K selection remains 8K with no silent 4K fit");
+        auto disabled=s;disabled.dualSrEnabled=false;auto edited=disabled;edited.dualSrTarget=SrTarget::Qhd;edited.dualSrQuality=3;
+        check(!requiresGraphRebuild(disabled,edited),"editing stored second-stage settings while disabled does not rebuild base SR");
+        check(requiresGraphRebuild(disabled,s),"enabling the second actual SR pass rebuilds");
+        auto g=ChainGlobalSettings::capture(s);EnhancementSettings restored;g.apply(restored);
+        check(restored.dualSrEnabled&&restored.dualSrTarget==s.dualSrTarget&&restored.dualSrQuality==s.dualSrQuality,"chain globals retain independent second-stage settings");
+        auto invalid=s;invalid.dualSrQuality=6;check(!invalid.validate().empty(),"reject invalid second SR quality before any GPU work");
+        invalid=s;invalid.dualSrTarget=SrTarget(99);check(!invalid.validate().empty(),"reject invalid second SR target");
+        ChainExecutionRequest badRequest{{2560,1440},s.srTarget};badRequest.dualSrEnabled=true;badRequest.dualSrTarget=SrTarget(99);
+        ChainExecutionPlan rejected;check(!compileChainExecutionPlan(toChain(s),badRequest,rejected).accepted,"invalid second target returns a rejected plan rather than throwing");
+        // Every SR backend runs double SR since 2026-11-08 (FSR base, standard second pass here).
+        s.videoSrQuality=kVideoSrFsr;describeStages(r,s,d);check(d.dualSr&&s.activeVideoSettings().dualSrEnabled&&d.videoSrQuality==kVideoSrFsr&&d.dualSrQuality==1,
+            "an FSR base runs double SR with its own second pass");
+    }
+    std::printf(failures ? "effect chain: %d FAILURES\n" : "effect chain: all checks passed\n", failures);
+    return failures ? 1 : 0;
+}

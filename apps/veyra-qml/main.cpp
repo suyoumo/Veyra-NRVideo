@@ -1,0 +1,1422 @@
+// Veyra QML front end.
+//
+// The window is Qt; the video is not. The engine presents into a native child
+// HWND that Qt hosts but never composites (measured in S3: 499/499 presents at
+// 0.205 ms while the QML scene animated at its full 100 Hz panel rate). The QML
+// scene draws the interface around and above that window.
+//
+// The video child window is created here, before the QML engine loads, so the
+// first frame has somewhere to go. Its geometry is driven by the QML item named
+// "videoHost": when that item moves or resizes, this code moves the native
+// window to match. That keeps the layout in QML (where it belongs) and the
+// pixels in D3D12 (where the latency budget lives).
+#include <QApplication>
+#include <QUrlQuery>
+#include <QProcess>
+#include <QIcon>
+#include <QImage>
+#include <QPixmap>
+#include "../veyra/resource.h"
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickItem>
+#include <QQuickWindow>
+#include <QSGRendererInterface>
+#include <QKeyEvent>
+#include <QTimer>
+#include <atomic>
+#include <QPointer>
+#include <QVariantMap>
+#include <QList>
+#include <QRect>
+#include <QtCore/private/qabstractanimation_p.h>
+#include <QDebug>
+#include <QAbstractNativeEventFilter>
+#include <QFile>
+#include <QDir>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QStandardPaths>
+
+#include <windows.h>
+#include <shellapi.h>
+#include <shobjidl.h>
+#include <dbghelp.h>
+#include <d3d12.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <format>
+#include <memory>
+
+#include "veyra/Log.h"
+#include "veyra/RuntimePaths.h"
+#include "veyra/engine/EngineController.h"
+#include "veyra/engine/ExportJobManager.h"
+#include "veyra/engine/PresentationGeometry.h"
+#include "veyra/gfx/PresentationHooks.h"
+#include "veyra/pipeline/AmdHipPreflight.h"
+#include "veyra/ui/InterfaceRenderer.h"
+#include "veyra/ui/QmlDataDirectory.h"
+#include "veyra/ui/QmlDiskCache.h"
+#include "veyra/ui/PlaybackServer.h"   // Custom: local HTTP endpoint for the browser extension
+#include "veyra/ui/QmlPlayerBridge.h"
+#include "../../src/ui/WinCaptionReader.h"
+#include "veyra/ui/StartupMusic.h"
+#include "veyra/ui/ThumbnailProvider.h"
+#include "veyra/ui/UpdateChecker.h"
+#include "veyra/base/PortableLayout.h"
+
+using namespace veyra;
+
+namespace {
+HWND g_video = nullptr;
+bool g_videoCursorHidden = false;
+
+// The video is a foreign HWND, not a Qt item. Match the QML cursor policy here
+// without a repaint, a polling timer or ShowCursor's process-wide counter.
+bool pointerOverVideo() {
+    if (!g_video || !IsWindowVisible(g_video)) return false;
+    const HWND parent = GetParent(g_video);
+    if (!parent || GetForegroundWindow() != parent) return false;
+    POINT p{};
+    if (!GetCursorPos(&p)) return false;
+    const HWND hit = WindowFromPoint(p);
+    if (hit != g_video && hit != parent) return false;
+    ScreenToClient(g_video, &p);
+    RECT client{};
+    GetClientRect(g_video, &client);
+    if (!PtInRect(&client, p)) return false;
+    // Floating QML controls are holes in this region; never override their
+    // pointing/text cursors, nor any other application's cursor.
+    HRGN region = CreateRectRgn(0, 0, 0, 0);
+    const int kind = GetWindowRgn(g_video, region);
+    const bool inside = kind == ERROR || PtInRegion(region, p.x, p.y);
+    DeleteObject(region);
+    return inside;
+}
+
+void syncVideoCursor(bool hidden) {
+    if (g_videoCursorHidden == hidden) return;
+    g_videoCursorHidden = hidden;
+    const bool overVideo = pointerOverVideo();
+    if (overVideo) SetCursor(hidden ? nullptr : LoadCursorW(nullptr, IDC_ARROW));
+    CURSORINFO cursor{sizeof(cursor)};
+    const bool known = GetCursorInfo(&cursor) != 0;
+    veyra::log::info("ui-cursor", std::format("hidden={} overVideo={} applied={} cursorKnown={} cursorShowing={}",
+        hidden, overVideo, overVideo, known, known && (cursor.flags & CURSOR_SHOWING) != 0));
+}
+enum class VideoProbeMode { Normal, Hidden, NoRegion, CoversOnly };
+VideoProbeMode g_videoProbe = VideoProbeMode::Normal;
+bool g_videoHiddenByProbe = false;
+// Set while a new source is opening: the window keeps the previous session's last
+// frame until the new one presents, so its region is emptied instead. A slow PS5
+// connect after a capture card left the card's last frame up for 20 s and the
+// window looked frozen (field report 2026-10-01).
+bool g_videoBlanked = false;
+
+void blankVideo(const char* why) {
+    if (!g_video || g_videoBlanked) return;
+    g_videoBlanked = true;
+    const int result = SetWindowRgn(g_video, CreateRectRgn(0, 0, 0, 0), TRUE);
+    veyra::log::info("qml-window", std::format("blank video until the new source presents ({}) result={}", why, result));
+}
+
+const char* videoProbeName() {
+    switch (g_videoProbe) {
+    case VideoProbeMode::Hidden: return "hidden";
+    case VideoProbeMode::NoRegion: return "no-region";
+    case VideoProbeMode::CoversOnly: return "covers-only";
+    default: return "normal";
+    }
+}
+
+void logVideoWindowState(QQuickWindow* window, QQuickItem* host, const char* event) {
+    if (!window || !host || !g_video) return;
+    const HWND parent = GetParent(g_video);
+    RECT parentClient{}, client{}, screen{};
+    GetClientRect(parent, &parentClient);
+    GetClientRect(g_video, &client);
+    GetWindowRect(g_video, &screen);
+    HRGN region = CreateRectRgn(0, 0, 0, 0);
+    const int regionType = GetWindowRgn(g_video, region);
+    RECT regionBox{};
+    const int regionBoxType = GetRgnBox(region, &regionBox);
+    DeleteObject(region);
+    const QPointF scene = host->mapToScene(QPointF(0, 0));
+    veyra::log::info("qml-window", std::format(
+        "{} probe={} root={}x{} dpr={:.3f} host=({:.1f},{:.1f}) {:.1f}x{:.1f} "
+        "parent={} parentClient={}x{} client={}x{} screen=({},{}) {}x{} "
+        "style=0x{:X} visible={} regionType={} regionBoxType={} regionBox=({},{}) {}x{}",
+        event, videoProbeName(), window->width(), window->height(), window->devicePixelRatio(),
+        scene.x(), scene.y(), host->width(), host->height(), parent != nullptr,
+        parentClient.right, parentClient.bottom, client.right, client.bottom,
+        screen.left, screen.top, screen.right - screen.left, screen.bottom - screen.top,
+        static_cast<unsigned long long>(GetWindowLongPtrW(g_video, GWL_STYLE)),
+        IsWindowVisible(g_video) != 0, regionType, regionBoxType,
+        regionBox.left, regionBox.top, regionBox.right - regionBox.left,
+        regionBox.bottom - regionBox.top));
+}
+
+LRESULT CALLBACK videoProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    // The engine owns this window's pixels. Qt must not paint it, or the two
+    // swapchains fight and we lose the whole point of the native path.
+    if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_PAINT) { ValidateRect(h, nullptr); return 0; }
+    // The pointer belongs to the QML layer under the picture (the dock's hot zone
+    // at the top edge, the cinema controls): pass hit testing through to it.
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;
+    if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_videoCursorHidden && pointerOverVideo()) {
+        SetCursor(nullptr);
+        return TRUE;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+HWND createVideoWindow() {
+    const wchar_t* cls = L"VeyraQmlVideoHost";
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = videoProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = cls;
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    RegisterClassExW(&wc);
+    // Created as an unrealised popup, then reparented into the QML window before
+    // anything reads its size. Creating it as WS_CHILD with no parent does not
+    // work: Windows refuses with ERROR_CANNOT_MAKE (1406), which is what left the
+    // video window invalid and the swapchain at 1x1. WS_POPUP with no WS_VISIBLE
+    // creates cleanly; SetParent plus the child style below turns it into a child.
+    HWND created = CreateWindowExW(WS_EX_NOPARENTNOTIFY | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, cls, L"",
+                                   WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                   0, 0, 16, 16, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (created == nullptr) {
+        veyra::log::error("qml", std::format("CreateWindowExW failed err={}", GetLastError()));
+    }
+    return created;
+}
+
+// Places the native video window at the QML item's position. Qt reports the
+// item's geometry in scene coordinates, which for a child of the window's
+// content item are already window-relative.
+// 视频直出 (QML window property "directPresent", from the saved preference): the
+// video window stays a top-level popup instead of becoming a WS_CHILD of the QML
+// window. A child window is always composited by DWM, which costs a full display
+// pipeline stage; an unowned top-level flip window is scanned out directly.
+bool directVideoPresent(QQuickWindow* window) {
+    return window && window->property("directPresent").toBool();
+}
+
+bool syncVideoGeometry(QQuickWindow* window, QQuickItem* host) {
+    const HWND appWindow = window ? reinterpret_cast<HWND>(window->winId()) : nullptr;
+    const bool direct = directVideoPresent(window);
+    if (!window || !host || !g_video) return false;
+    // Direct present: the window is its own top-level, owned by the app window
+    // (an owner keeps it above the app window and hides it when that is
+    // minimised; it is still not a child). Otherwise the window must still be the
+    // Qt window's child, or the layout below means nothing.
+    const HWND parent = GetParent(g_video);
+    if (direct ? (parent != nullptr && parent != appWindow) : parent != appWindow) return false;
+    const QPointF topLeft = host->mapToScene(QPointF(0, 0));
+    const qreal dpr = window->devicePixelRatio();
+    if (host->width() < 1 || host->height() < 1 ||
+        topLeft.x() + host->width() <= 0 || topLeft.y() + host->height() <= 0 ||
+        topLeft.x() >= window->width() || topLeft.y() >= window->height()) {
+        if (IsWindowVisible(g_video)) ShowWindow(g_video, SW_HIDE);
+        return false;
+    }
+    // Keep partial QML viewports stable while they animate. A viewport that
+    // spans the window must use its actual physical client extent: Qt rounds
+    // the HWND at fractional DPI, whereas flooring width*dpr can leave a
+    // one-pixel strip outside the video (for example 642 DIP at 125%).
+    const bool aligned = window->property("gameAligned").toBool();
+    const auto physical = [aligned](qreal value) { return int(aligned ? std::round(value) : std::floor(value)); };
+    const int xClient = physical(topLeft.x() * dpr);
+    const int yClient = physical(topLeft.y() * dpr);
+    int x = xClient;
+    int y = yClient;
+    int w = std::max(1, physical(host->width() * dpr));
+    int h = std::max(1, physical(host->height() * dpr));
+    RECT parentClient{};
+    if (GetClientRect(reinterpret_cast<HWND>(window->winId()), &parentClient)) {
+        if (std::abs(topLeft.x()) < 0.001 && std::abs(host->width() - window->width()) < 0.001)
+            w = std::max(1L, parentClient.right);
+        if (std::abs(topLeft.y()) < 0.001 && std::abs(host->height() - window->height()) < 0.001)
+            h = std::max(1L, parentClient.bottom);
+    }
+    if (direct) {
+        // The QML rectangle is window-relative; a top-level window needs screen
+        // coordinates. Map the CLIENT origin, not the window rect: a captioned,
+        // bordered window puts the content a few pixels in, and using the frame
+        // origin shifted the picture right and down and left a strip uncovered.
+        // A minimised app must take its video with it, and the video must stay
+        // immediately above the app window (not topmost: other programs still
+        // cover both).
+        if (IsIconic(appWindow)) {
+            if (IsWindowVisible(g_video)) ShowWindow(g_video, SW_HIDE);
+            return false;
+        }
+        POINT origin{0, 0};
+        if (!ClientToScreen(appWindow, &origin)) return false;
+        x += origin.x;
+        y += origin.y;
+    }
+    // A film-fitted cinema window can have no fractional HWND pixels. Tell
+    // the presenter the exact rounding bound; real bars/zoom/fullscreen retain
+    // their normal mapping. Keep this synchronized even when the rect is equal.
+    const qreal aspect = window->property("filmAspect").toReal();
+    const bool filmWindow = window->property("cinema").toBool() &&
+        !window->property("screenSized").toBool() && aspect > 0 &&
+        std::abs(topLeft.x()) < 0.001 && std::abs(topLeft.y()) < 0.001 &&
+        std::abs(host->width() - window->width()) < 0.001 &&
+        std::abs(host->height() - window->height()) < 0.001 &&
+        std::abs(window->height() - window->width() / aspect) <= 0.501;
+    const uintptr_t roundingUnits = filmWindow
+        ? uintptr_t(std::ceil((0.5 * dpr + 0.5 + 0.5 / aspect) * 1024)) : 0;
+    constexpr auto roundingProperty = veyra::engine::kFilmPixelRoundingProperty;
+    if (reinterpret_cast<uintptr_t>(GetPropW(g_video, roundingProperty)) != roundingUnits) {
+        if (roundingUnits && !SetPropW(g_video, roundingProperty, reinterpret_cast<HANDLE>(roundingUnits)))
+            veyra::log::error("qml-window", std::format("SetProp film pixel rounding failed err={}", GetLastError()));
+        if (!roundingUnits) RemovePropW(g_video, roundingProperty);
+        veyra::log::info("qml-window", std::format("film pixel rounding allowance={} height pixels", double(roundingUnits) / 1024));
+    }
+    // Called every rendered frame: only a changed rect reaches the window manager,
+    // so a moving popover never makes the presenter see a spurious resize.
+    static RECT last{-1, -1, -1, -1};
+    if (IsWindowVisible(g_video) && last.left == x && last.top == y && last.right == w && last.bottom == h) {
+        // Direct present with an unchanged rect: the video must still sit directly
+        // above the app window, hidden windows excepted. Something shown or raised
+        // in between would bury the picture, so put it back (no move, no size).
+        if (direct) {
+            HWND below = GetWindow(g_video, GW_HWNDNEXT);
+            while (below && below != appWindow && !IsWindowVisible(below)) below = GetWindow(below, GW_HWNDNEXT);
+            if (below != appWindow) {
+                HWND above = GetWindow(appWindow, GW_HWNDPREV);
+                if (above == g_video) above = HWND_TOP;
+                SetWindowPos(g_video, above, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                static ULONGLONG lastPutBack = 0;
+                const auto tick = GetTickCount64();
+                if (tick - lastPutBack > 1000) { lastPutBack = tick; veyra::log::info("qml-window", "direct present: video window put back above the app window"); }
+            }
+        }
+        return true;
+    }
+    last = RECT{x, y, w, h};
+    SetLastError(0);
+    // Z order: hWndInsertAfter names the window that stays ABOVE ours. In direct
+    // present the video belongs right above the app window, so insert it after
+    // whatever currently precedes the app window. That window is often the video
+    // itself (it already is the one right above): inserting a window after itself
+    // is a silent no-op that returns success, which left the picture at its old
+    // size on the first fullscreen toggle (and the unchanged-rect cache never
+    // retried). In that case only move and size, and keep the z-order.
+    HWND after = HWND_TOP;
+    UINT flags = SWP_NOACTIVATE | (g_videoHiddenByProbe ? 0 : SWP_SHOWWINDOW);
+    if (direct) {
+        after = GetWindow(appWindow, GW_HWNDPREV);
+        if (after == g_video) { after = HWND_TOP; flags |= SWP_NOZORDER; }
+        else if (after == nullptr) after = HWND_TOP;
+    }
+    const BOOL placed = SetWindowPos(g_video, after, x, y, w, h, flags);
+    const DWORD error = placed ? 0 : GetLastError();
+    veyra::log::info("qml-window", std::format(
+        "SetWindowPos rect=({},{}) {}x{} result={} error={} direct={} noZOrder={}", x, y, w, h, placed != 0, error, direct, (flags & SWP_NOZORDER) != 0));
+    logVideoWindowState(window, host, "geometry");
+    return placed != 0;
+}
+
+struct Cover { QRectF rect; qreal radius = 0; bool informational = false; QString name; };
+
+// cineIn (pages.css @keyframes cineIn, plan M21): the stage is clipped with
+// inset(12% 0 12% 0) and expands to inset(0). The picture is a native window, so
+// the equivalent is its REGION: bands are cut off the top and bottom while the
+// animation runs. The window and the swapchain keep their size, so this costs no
+// ResizeBuffers - only the visible band changes. MinimalPage.inset carries the
+// fraction (0.12 -> 0).
+//
+// The walk starts at the window's content item, NOT at the video host: the host is a
+// sibling of the pages, so searching under it finds nothing. (The cover walk has the
+// same shape and the same reason; both are rooted at the scene.)
+qreal videoInsetFraction(QQuickItem* item) {
+    if (!item) return 0.0;
+    if (item->objectName() == QLatin1String("videoInset"))
+        return item->property("frac").toReal();
+    for (QQuickItem* child : item->childItems()) {
+        const qreal f = videoInsetFraction(child);
+        if (f > 0.0) return f;
+    }
+    return 0.0;
+}
+
+qreal sceneInsetFraction(QQuickWindow* window) {
+    if (!window) return 0.0;
+    QQuickItem* content = window->contentItem();
+    QQuickItem* root = content && content->parentItem() ? content->parentItem() : content;
+    return videoInsetFraction(root);
+}
+
+void collectCovers(QQuickItem* item, QList<Cover>& out) {
+    if (!item->isVisible() || item->opacity() <= 0.0) return;
+    // A cover is named "videoCover" or carries videoCover: true; the property lets a
+    // dialog keep its own objectName for tests (an overridden name used to drop
+    // the hole, leaving five dialogs behind the picture).
+    // Hover tips are Controls ToolTips: their popup item sits in the window overlay and
+    // its QObject parent is the ToolTip. Every tip is a cover, so a tip over the
+    // picture is no longer hidden behind it (field report 2026-10-02).
+    // Only the popup's own item: its background and text are QObject children of the
+    // ToolTip too, and would only add the same hole again.
+    const bool toolTip = item->inherits("QQuickPopupItem") && item->parent() && item->parent()->inherits("QQuickToolTip");
+    if (toolTip || item->objectName() == QLatin1String("videoCover") || item->property("videoCover").toBool()) {
+        // Scale is folded into the scene rect; the corner radius scales with it.
+        const QRectF r = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+        const qreal s = item->width() > 0 ? r.width() / item->width() : 1.0;
+        // informational: a readout that is over the picture all the time, not
+        // something the pointer reaches for (视频直出 keeps the rectangle whole).
+        const QString name = item->objectName().isEmpty() ? QString::fromLatin1(item->metaObject()->className()) : item->objectName();
+        out << Cover{r, item->property("coverRadius").toReal() * s,
+                     item->objectName() == QLatin1String("video-hud"), name};
+    }
+    for (QQuickItem* child : item->childItems()) collectCovers(child, out);
+}
+
+// The video is a native child window, so it is drawn above the whole QML scene
+// (airspace): a menu or a dialog over the picture would sit behind it. Items named
+// "videoCover" (popover panels, the dialog scrim) are cut out of the window's
+// region instead, so the QML under them shows. Scene rects include transforms,
+// so the hole follows a popover's scale-in. The region only changes when a cover
+// moves or the cineIn inset changes; with neither the window gets its rectangle back.
+void syncVideoCovers(QQuickWindow* window, QQuickItem* host, qreal inset) {
+    if (!window || !host || !g_video) return;
+    // 视频直出: see the holes loop below.
+    const bool direct = directVideoPresent(window);
+    std::string directCovers;
+    if (g_videoProbe == VideoProbeMode::CoversOnly) inset = 0;
+    QList<Cover> covers;
+    collectCovers(window->contentItem()->parentItem() ? window->contentItem()->parentItem()
+                                                      : window->contentItem(), covers);
+    const qreal dpr = window->devicePixelRatio();
+    const QPointF origin = host->mapToScene(QPointF(0, 0));
+    // The region clips the native HWND, so its dimensions must come from that
+    // same HWND. Repeating the logical-size floor here would cut off the last
+    // column again whenever a menu/control cover is present.
+    RECT nativeClient{};
+    if (!GetClientRect(g_video, &nativeClient)) {
+        veyra::log::error("qml-window", std::format("GetClientRect for video covers failed err={}", GetLastError()));
+        return;
+    }
+    const int w = std::max(1L, nativeClient.right);
+    const int h = std::max(1L, nativeClient.bottom);
+    static QList<QRect> last;
+    // blankVideo() set the region behind this cache's back.
+    if (g_videoBlanked) { last.clear(); g_videoBlanked = false; }
+    QList<QRect> holes;       // x, y, w, h; the radius rides along as a fifth rect
+    for (const Cover& c : covers) {
+        const QRectF local = c.rect.translated(-origin);
+        holes << QRect(int(std::floor(local.left() * dpr)), int(std::floor(local.top() * dpr)),
+                       int(std::ceil(local.width() * dpr)) + 1, int(std::ceil(local.height() * dpr)) + 1);
+        holes << QRect(0, 0, int(std::round(c.radius * dpr * 2)), 0);
+    }
+    // 视频直出: a hardware plane is a rectangle. Any hole makes the region complex
+    // and DWM composites every frame again (measured on a 4K60 capture: present to
+    // scanout 9.7 ms composed, 1.5 ms flipped). While nothing but informational
+    // covers (the HUD readout) is over the picture, the rectangle stays whole and
+    // those covers sit behind it; the moment a control, a popover or a tooltip
+    // opens, the holes come back so it shows, and latency only then is composed.
+    if (direct) {
+        // Only a cover that is actually over the picture counts: toasts park above
+        // the window's top edge instead of hiding, and one of those kept a hole
+        // (and with it composition) in the window for the whole session.
+        const QRectF picture(0, 0, host->width(), host->height());
+        bool interaction = false;
+        std::string names;
+        for (const Cover& c : covers) {
+            if (c.informational || !c.rect.translated(-origin).intersects(picture)) continue;
+            interaction = true;
+            if (!names.empty()) names += ", ";
+            names += c.name.toStdString() + "(" + std::to_string(int(c.rect.x())) + "," + std::to_string(int(c.rect.y())) + " " +
+                     std::to_string(int(c.rect.width())) + "x" + std::to_string(int(c.rect.height())) + ")";
+        }
+        directCovers = std::format("direct present: covers={} interaction={} non-informational=[{}] (an interaction cover keeps holes in the video window, which means composition)",
+                                   covers.size(), interaction, names.empty() ? "-" : names);
+        if (!interaction) holes.clear();
+    }
+    // cineIn rides along as a marker entry so one cache covers both, and the last
+    // entry keeps its steadiness on a scene that renders without moving either.
+    const int insetBand = int(std::round(inset * h));
+    {
+        QList<QRect> key = holes;
+        key << QRect(0, 0, insetBand, 0) << QRect(0, 0, w, h);
+        if (key == last) return;
+        last = key;
+    }
+    if (direct && !directCovers.empty()) veyra::log::info("qml-window", directCovers);
+    if (g_videoProbe == VideoProbeMode::NoRegion) {
+        SetLastError(0);
+        const int result = SetWindowRgn(g_video, nullptr, TRUE);
+        veyra::log::info("qml-window", std::format(
+            "SetWindowRgn no-region result={} error={}", result, result ? 0 : GetLastError()));
+        logVideoWindowState(window, host, "region");
+        return;
+    }
+    // Covers win: a popover over the picture shows the QML beneath it, and the
+    // clip inset only ever runs without one. A cover opening mid-animation simply
+    // takes the whole rectangle back for as long as it is up.
+    if (holes.isEmpty() && insetBand > 0) {
+        // The design's inset(12% 0 12% 0 round 8px): both bands off the top and
+        // bottom, corners eased with the band so the last frame has no snap.
+        const int radius = std::max(2, int(std::round(8 * dpr * (inset / 0.12))));
+        HRGN band = CreateRoundRectRgn(0, insetBand, w + 1, h - insetBand + 1, radius, radius);
+        SetLastError(0);
+        const int result = SetWindowRgn(g_video, band, TRUE);
+        const DWORD error = result ? 0 : GetLastError();
+        if (!result) DeleteObject(band);
+        veyra::log::info("qml-window", std::format(
+            "SetWindowRgn inset={}x{} band={} result={} error={}",
+            w, h, insetBand, result, error));
+        logVideoWindowState(window, host, "region");
+        // The picture is a native window PrintWindow cannot show, so the cineIn
+        // animation is evidenced here rather than in a screenshot.
+        veyra::log::info("qml", std::format("cineIn inset band={}px of {} (frac={:.3f}) radius={}",
+                                            insetBand, h, inset, radius));
+        return;
+    }
+    if (holes.isEmpty()) {
+        SetLastError(0);
+        const int result = SetWindowRgn(g_video, nullptr, TRUE);
+        veyra::log::info("qml-window", std::format(
+            "SetWindowRgn full={}x{} result={} error={}", w, h, result, result ? 0 : GetLastError()));
+        logVideoWindowState(window, host, "region");
+        return;
+    }
+    HRGN region = CreateRectRgn(0, 0, w, h);
+    for (qsizetype i = 0; i + 1 < holes.size(); i += 2) {
+        const QRect& hole = holes[i];
+        const int d = holes[i + 1].width();
+        HRGN cut = d > 0 ? CreateRoundRectRgn(hole.left(), hole.top(), hole.left() + hole.width() + 1,
+                                              hole.top() + hole.height() + 1, d, d)
+                         : CreateRectRgn(hole.left(), hole.top(), hole.left() + hole.width(), hole.top() + hole.height());
+        CombineRgn(region, region, cut, RGN_DIFF);
+        DeleteObject(cut);
+    }
+    SetLastError(0);
+    const int result = SetWindowRgn(g_video, region, TRUE); // the system owns the region on success
+    const DWORD error = result ? 0 : GetLastError();
+    if (!result) DeleteObject(region);
+    veyra::log::info("qml-window", std::format(
+        "SetWindowRgn covers={} size={}x{} result={} error={}",
+        covers.size(), w, h, result, error));
+    logVideoWindowState(window, host, "region");
+}
+} // namespace
+
+namespace {
+// Last-chance handler, as in the Win32 shell (apps/veyra/main.cpp): provider and
+// driver faults are structured exceptions no C++ catch sees. The 2.0 beta had no
+// handler, so a field crash left neither a reason nor the last buffered log lines.
+std::wstring g_crashDumpDirectory;
+LONG WINAPI crashFilter(EXCEPTION_POINTERS* info) {
+    static LONG entered = 0;
+    if (InterlockedIncrement(&entered) > 1) return EXCEPTION_CONTINUE_SEARCH;
+    const auto code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0u;
+    const auto address = info && info->ExceptionRecord
+        ? reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress) : uintptr_t(0);
+    HMODULE module = nullptr;
+    wchar_t moduleName[MAX_PATH]{};
+    if (address && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                      reinterpret_cast<LPCWSTR>(address), &module) && module)
+        GetModuleFileNameW(module, moduleName, MAX_PATH);
+    veyra::log::error("crash", std::format("unhandled exception code=0x{:08X} address=0x{:X} module={} offset=0x{:X} thread={}",
+        code, address, std::filesystem::path(moduleName).filename().string(),
+        module ? address - reinterpret_cast<uintptr_t>(module) : uintptr_t(0), GetCurrentThreadId()));
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t name[96]{};
+    swprintf_s(name, L"veyra-crash-%04u%02u%02u-%02u%02u%02u-%lu.dmp", unsigned(st.wYear), unsigned(st.wMonth),
+               unsigned(st.wDay), unsigned(st.wHour), unsigned(st.wMinute), unsigned(st.wSecond), GetCurrentProcessId());
+    const std::wstring path = (std::filesystem::path(g_crashDumpDirectory) / name).wstring();
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei{GetCurrentThreadId(), info, FALSE};
+        const BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                                          MiniDumpWithIndirectlyReferencedMemory, info ? &mei : nullptr, nullptr, nullptr);
+        CloseHandle(file);
+        veyra::log::error("crash", std::format("minidump written={} file={}", ok != FALSE,
+                                               std::filesystem::path(name).string()));
+    } else {
+        veyra::log::error("crash", std::format("minidump open failed error={}", GetLastError()));
+    }
+    // What crashed and which known-risky injected components were loaded, for the next
+    // start to explain (QmlPlayerBridge reads and deletes it).
+    const std::wstring note = L"crash " + std::filesystem::path(moduleName).filename().wstring() + L"\n" +
+                              veyra::gfx::riskyInjections() + L"\n";
+    HANDLE marker = CreateFileW((std::filesystem::path(g_crashDumpDirectory) / L"veyra-last-failure.txt").c_str(),
+                                GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (marker != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(marker, note.data(), DWORD(note.size() * sizeof(wchar_t)), &written, nullptr);
+        CloseHandle(marker);
+    }
+    veyra::Logger::instance().flush();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+} // namespace
+
+static int runApplication(int argc, char** argv, QString& restartProgram, QStringList& restartArgs) {
+    const bool updateProbe = argc > 2 && std::strcmp(argv[1], "--portable-update-probe") == 0;
+    // ExportJobManager relaunches the owning executable with an inherited mapping.
+    // Dispatch before Qt or the video HWND exists, as the Win32 shell does.
+    if (argc > 1 && std::strcmp(argv[1], "--export-worker") == 0) {
+        if (argc != 3) return 2;
+        char* end = nullptr;
+        const auto value = std::strtoull(argv[2], &end, 10);
+        if (!value || !end || *end != '\0') return 2;
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        const int result = engine::runExportWorker(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value)));
+        if (SUCCEEDED(com)) CoUninitialize();
+        return result;
+    }
+    // A log file has to be opened explicitly; without this the QML app produced
+    // no diagnostics at all, which made every failure look like a silent exit.
+    // Same path and override as the Win32 build, so support instructions do not
+    // change between the two front ends.
+    wchar_t logOverride[32768]{};
+    const auto overrideLength = GetEnvironmentVariableW(L"VEYRA_LOG_FILE", logOverride, 32768);
+    auto logPath = overrideLength > 0 && overrideLength < 32768
+                       ? std::filesystem::path(logOverride)
+                       : veyra::runtime::logsDirectory() / L"veyra-qml.log";
+    // Bounded: earlier sessions move to veyra-qml.old.log once this file passes
+    // 16 MB at start, and a session that alone reaches 64 MB (about five hours of
+    // capture) continues in a fresh file (audit 2026-10-15 B3).
+    uint64_t rotateAtStart = 16ull << 20, rotateWhileRunning = 64ull << 20;
+    // VEYRA_TEST_LOG_ROTATE_BYTES=N sets both limits to N bytes (rotation tests only).
+    wchar_t rotateTest[32]{};
+    if (GetEnvironmentVariableW(L"VEYRA_TEST_LOG_ROTATE_BYTES", rotateTest, 32) > 0 && _wtoi64(rotateTest) > 0)
+        rotateAtStart = rotateWhileRunning = uint64_t(_wtoi64(rotateTest));
+    if(!veyra::Logger::instance().startAsync())
+        veyra::log::warn("log", "asynchronous output unavailable; using synchronous logging");
+    veyra::Logger::instance().setRotation(rotateAtStart, rotateWhileRunning);
+    if (!veyra::Logger::instance().openFile(logPath.wstring(), true)) {
+        logPath = logPath.parent_path() / (L"veyra-qml-" + std::to_wstring(GetCurrentProcessId()) + L".log");
+        (void)veyra::Logger::instance().openFile(logPath.wstring(), true);
+    }
+    g_crashDumpDirectory = logPath.parent_path().wstring();
+    veyra::engine::EngineWatchdog::setDumpDirectory(g_crashDumpDirectory);
+    SetUnhandledExceptionFilter(crashFilter);
+
+    // Interface scale (设置 → 界面缩放) has to be fixed before Qt starts, so the
+    // preference file is read here, from the same data directory the bridge uses.
+    // "Auto" leaves Qt following the Windows display scale.
+    int uiScale = 0;
+    bool obsGameCapture = false;
+    bool overlayCompatAuto = true;   // 设置 → 监控软件兼容: "auto" (default) or "off"
+    bool overlayCompatRestart = false;
+    bool gpuUiChosen = false;        // 设置 → 界面绘制: "software" (default) or "gpu"
+    {
+        int count = 0;
+        LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &count);
+        std::filesystem::path dir = veyra::runtime::userDataDirectory() / L"user-data-2.0.0";
+        bool obsGameCaptureArg = false;
+        for (int i = 1; args && i < count; ++i) {
+            if (std::wstring(args[i]) == L"--data-dir" && i + 1 < count) dir = args[++i];
+            else if (std::wstring(args[i]) == L"--obs-game-capture") obsGameCaptureArg = true;
+            else if (std::wstring(args[i]) == L"--overlay-compat-restart") overlayCompatRestart = true;
+        }
+        if (args) LocalFree(args);
+        QFile prefs(QString::fromStdWString((dir / L"qml-preferences.v1.json").wstring()));
+        if (prefs.open(QIODevice::ReadOnly)) {
+            const auto saved = QJsonDocument::fromJson(prefs.readAll()).object();
+            uiScale = saved.value(QStringLiteral("uiScale")).toInt();
+            obsGameCapture = saved.value(QStringLiteral("obsGameCapture")).toBool();
+            overlayCompatAuto = saved.value(QStringLiteral("overlayCompat")).toString() != QStringLiteral("off");
+            gpuUiChosen = saved.value(QStringLiteral("uiRenderer")).toString() == QStringLiteral("gpu");
+        }
+        obsGameCapture = obsGameCapture || obsGameCaptureArg;
+        if (uiScale == 100 || uiScale == 125 || uiScale == 150) {
+            qputenv("QT_ENABLE_HIGHDPI_SCALING", "0");
+            qputenv("QT_SCALE_FACTOR", QByteArray::number(uiScale / 100.0));
+            veyra::log::info("app", std::format("interface scale fixed at {}%", uiScale));
+        } else {
+            uiScale = 0;
+        }
+    }
+    // OBS 32.1.2 shares capture state across DXGI swapchains. Keeping Qt off
+    // DXGI prevents its resize/destruction from freeing the video's capture
+    // resources on another thread. This opt-in affects UI drawing only;
+    // the native D3D12 video and enhancement pipeline are unchanged.
+    //
+    // Monitoring overlays: RivaTuner Statistics Server (MSI Afterburner's OSD) draws on one
+    // Direct3D 12 swapchain at a time, and a D3D12 interface next to the video's swapchain
+    // had the GPU device removed within a second of a video starting (gfx/PresentationHooks.h).
+    // A D3D11 interface survives but gets an OSD of its own showing the interface's rate, and
+    // crashed with XeSS frame generation in the field. Drawn in software the interface has no
+    // swapchain at all: RTSS sees only the video and puts its numbers there, as with 1.4.4's
+    // GDI interface. VEYRA_UI_RHI picks a renderer explicitly and skips this.
+    wchar_t forcedRenderer[16]{};
+    GetEnvironmentVariableW(L"VEYRA_UI_RHI", forcedRenderer, 16);
+    // VEYRA_TEST_IGNORE_RTSS=1 starts as if RivaTuner were not running (its late-start path).
+    // An orphan hooks loader can inject the DLL after RTSS itself has exited.
+    // Module presence does not prove an active OSD server. A user-accepted
+    // compatibility restart carries its intent for this launch only, so timing
+    // changes in server detection cannot turn that restart into another prompt.
+    const bool rivaTuner = !GetEnvironmentVariableW(L"VEYRA_TEST_IGNORE_RTSS", nullptr, 0)
+                           && veyra::gfx::rivaTunerRunning();
+    // NVIDIA's in-game overlay and GamePP (游戏加加) hook every swapchain too; with the
+    // interface on D3D12 next to the video, the two presenting threads deadlocked in the
+    // field (logs(15)) and GamePP broke every resize (see gfx/PresentationHooks.h).
+    // VEYRA_TEST_IGNORE_NVIDIA_OVERLAY / VEYRA_TEST_IGNORE_GAMEPP start as if they were off.
+    const bool nvidiaOverlay = !GetEnvironmentVariableW(L"VEYRA_TEST_IGNORE_NVIDIA_OVERLAY", nullptr, 0)
+                               && veyra::gfx::nvidiaOverlayRunning();
+    const bool gamePP = !GetEnvironmentVariableW(L"VEYRA_TEST_IGNORE_GAMEPP", nullptr, 0) && veyra::gfx::gamePPRunning();
+    // 抖音直播伴侣 captures the screen or this window while Veyra runs; with it the GPU
+    // hung in the field (gfx/PresentationHooks.h). The interface leaves the GPU like for
+    // the other capture and overlay tools; the bridge also lowers the GPU priority while
+    // it runs. VEYRA_TEST_IGNORE_DOUYIN=1 starts as if it were not running.
+    const bool douyin = !GetEnvironmentVariableW(L"VEYRA_TEST_IGNORE_DOUYIN", nullptr, 0) && veyra::gfx::douyinLiveCompanionRunning();
+    // 设置 → 界面绘制 (software unless GPU is chosen) together with the compatibility
+    // rules above, which are unchanged: veyra/ui/InterfaceRenderer.h.
+    const auto renderer = veyra::ui::decideInterfaceRenderer({gpuUiChosen, obsGameCapture, overlayCompatAuto,
+        rivaTuner || nvidiaOverlay || gamePP || douyin, overlayCompatRestart, forcedRenderer[0] != 0});
+    const bool overlayCompat = renderer.overlayCompat;
+    const bool softwareUi = renderer.software;
+    if (softwareUi) {
+        QQuickWindow::setSceneGraphBackend(QStringLiteral("software"));
+        veyra::log::info("app", "software UI: cached raster paths; normal partial updates; no additional frame requests");
+    }
+    using Reason = veyra::ui::InterfaceRendererReason;
+    if (renderer.reason == Reason::ObsGameCapture)
+        veyra::log::info("app", "OBS game capture compatibility: software UI; native D3D12 video unchanged");
+    else if (renderer.reason == Reason::OverlayCompat)
+        veyra::log::info("app", std::format("RTSS compatibility: software UI; activeServer={} nvidiaOverlay={} gamePP={} douyinCompanion={} acceptedRestart={}; native D3D12 video unchanged",
+                                          rivaTuner, nvidiaOverlay, gamePP, douyin, overlayCompatRestart));
+    else if (renderer.reason == Reason::Default)
+        veyra::log::info("app", "software UI by default (interface drawing preference: software); native D3D12 video unchanged");
+    else
+        veyra::log::info("app", std::format("GPU UI: {}", forcedRenderer[0] ? "renderer forced by VEYRA_UI_RHI" : "interface drawing preference: GPU"));
+    {
+        // A GPU interface keeps RTSS from drawing in this process at all, so a RivaTuner
+        // started after Veyra (or kept with 监控软件兼容 off) cannot take the device down.
+        // RTSS reads the variable when it loads its profile here; a software interface
+        // leaves it out (and clears it after a restart from a GPU-interface run).
+        wchar_t current[64]{};
+        const DWORD length = GetEnvironmentVariableW(veyra::gfx::kRivaTunerProfileOverride, current, 64);
+        const bool ours = length > 0 && wcscmp(current, veyra::gfx::kRivaTunerOsdOff) == 0;
+        const bool gpuD3d12 = !softwareUi && _wcsicmp(forcedRenderer, L"d3d11") != 0;
+        if (gpuD3d12 && length == 0) SetEnvironmentVariableW(veyra::gfx::kRivaTunerProfileOverride, veyra::gfx::kRivaTunerOsdOff);
+        else if (!gpuD3d12 && ours) SetEnvironmentVariableW(veyra::gfx::kRivaTunerProfileOverride, nullptr);
+        veyra::log::info("app", std::format("RivaTuner running={} injected={} compat={} OSD in this process={}", rivaTuner,
+            GetModuleHandleW(L"RTSSHooks64.dll") != nullptr, overlayCompatAuto ? "auto" : "off", gpuD3d12 ? "off (GPU interface)" : "on"));
+        veyra::log::info("app", std::format("NVIDIA overlay running={} GamePP running={} Douyin companion running={} interface={}", nvidiaOverlay, gamePP, douyin, softwareUi ? "software" : "GPU"));
+    }
+    {
+        // NVIDIA VFG on RTX 30 runs retargeted CUDA kernels (VfgAmpereCompat.cpp) that the driver
+        // compiles from PTX when they load. The driver keeps compiled kernels in its compute cache,
+        // but the default size is too small for these models, so later sessions compiled them again
+        // and the picture stalled inside nvptxJitCompiler64.dll (a PushFPS hang dump, 2026-11-16).
+        // Raise the cache to its 4 GiB maximum when the user has not chosen a size, and do not let it
+        // be disabled for this process. Fix ported from PushFPS 9e9a4340 (GPL-3.0-or-later).
+        wchar_t value[32]{};
+        if (GetEnvironmentVariableW(L"CUDA_CACHE_MAXSIZE", value, 32) == 0) SetEnvironmentVariableW(L"CUDA_CACHE_MAXSIZE", L"4294967296");
+        if (GetEnvironmentVariableW(L"CUDA_CACHE_DISABLE", value, 32) > 0 && wcscmp(value, L"0") != 0) SetEnvironmentVariableW(L"CUDA_CACHE_DISABLE", nullptr);
+        GetEnvironmentVariableW(L"CUDA_CACHE_MAXSIZE", value, 32);
+        veyra::log::info("app", std::format("CUDA compute cache maxSize={} (compiled VFG kernels are kept between sessions)", std::string(value, value + wcslen(value))));
+    }
+    QApplication app(argc, argv);
+    // Qt does not automatically use the executable's Win32 icon for its windows.
+    // Load the same embedded multi-size resource for the taskbar and Alt+Tab.
+    QIcon appIcon;
+    for (const int size : {16, 20, 24, 32, 40, 48, 64, 96, 128, 256}) {
+        const auto handle = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),
+            MAKEINTRESOURCEW(IDI_VEYRA), IMAGE_ICON, size, size, 0));
+        if (!handle) {
+            veyra::log::error("app-icon", std::format("LoadImageW size={} error={}", size, GetLastError()));
+            continue;
+        }
+        const auto image = QImage::fromHICON(handle);
+        DestroyIcon(handle);
+        if (!image.isNull()) appIcon.addPixmap(QPixmap::fromImage(image));
+    }
+    app.setWindowIcon(appIcon);
+    veyra::log::info("app-icon", std::format("embedded window icon sizes={}", appIcon.availableSizes().size()));
+    // A GPU interface (设置 → 界面绘制 = GPU, or VEYRA_UI_RHI) draws with Direct3D 12, like the video. Qt's default is Direct3D 11,
+    // and a D3D11 device in the process changed how overlays treat it: RivaTuner (MSI
+    // Afterburner) then crashed in d3d11.dll inside its own hooks while drawing its OSD on
+    // the XeSS swapchain through D3D11On12 (field dumps 2026-10-01). 1.4.4 drew its UI with
+    // GDI and had no D3D11 device; the overlays coexisted. VEYRA_UI_RHI=d3d11 restores
+    // Qt's default; without a usable D3D12 device Qt keeps it too.
+    if (!softwareUi) {
+        const bool wantD3d11 = _wcsicmp(forcedRenderer, L"d3d11") == 0;
+        const bool d3d12Usable = SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr));
+        if (!wantD3d11 && d3d12Usable) QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D12);
+        veyra::log::info("app", std::format("interface renderer={} (d3d12 usable={} forced={})",
+            !wantD3d11 && d3d12Usable ? "d3d12" : "d3d11", d3d12Usable, QString::fromWCharArray(forcedRenderer).toStdString()));
+    }
+    app.setProperty("veyraLogFile", QString::fromStdWString(logPath.wstring()));
+    app.setProperty("veyraUiScale", uiScale);
+    app.setProperty("veyraObsGameCapture", obsGameCapture);
+    app.setProperty("veyraOverlayCompat", overlayCompat);
+    app.setProperty("veyraSoftwareUi", softwareUi);
+    app.setProperty("veyraUiRendererForced", forcedRenderer[0] != 0);
+    // Frameless windows have no menu, yet DefWindowProc turns a bare Alt tap into
+    // SC_KEYMENU and enters modal menu tracking: the next mouse click is eaten and
+    // input stalls for about two seconds. Qt has already handled the key itself
+    // (Alt+Enter etc. are unaffected), so the system menu loop is refused.
+    struct NoKeyMenuFilter final : QAbstractNativeEventFilter {
+        bool nativeEventFilter(const QByteArray& type, void* message, qintptr* result) override {
+            if (type != "windows_generic_MSG") return false;
+            const auto* msg = static_cast<const MSG*>(message);
+            // HTTRANSPARENT forwards the native child's hit test to Qt's
+            // parent. Refuse the class arrow there too while the picture hides
+            // the cursor; hover over a control or another window is untouched.
+            if (msg->message == WM_SETCURSOR && LOWORD(msg->lParam) == HTCLIENT
+                && g_videoCursorHidden && (msg->hwnd == g_video || msg->hwnd == GetParent(g_video))
+                && pointerOverVideo()) {
+                SetCursor(nullptr);
+                if (result) *result = TRUE;
+                return true;
+            }
+            if (msg->message != WM_SYSCOMMAND || (msg->wParam & 0xFFF0) != SC_KEYMENU) return false;
+            veyra::log::info("ui-window", std::format("system key menu refused (lParam=0x{:X})", unsigned(msg->lParam)));
+            if (result) *result = 0;
+            return true;
+        }
+    };
+    static NoKeyMenuFilter noKeyMenu;
+    app.installNativeEventFilter(&noKeyMenu);
+    app.setApplicationName(QStringLiteral("Veyra"));
+    app.setOrganizationName(QStringLiteral("Veyra"));
+    veyra::log::info("app", "Veyra QML session started");
+
+    engine::EngineController controller;
+
+    // The window exists before QML loads so the engine can be handed a valid
+    // HWND as soon as the user opens something.
+    g_video = createVideoWindow();
+
+    // Keep 2.0.0 settings separate from 1.4.4 so the old executable remains a
+    // working rollback. An explicit data directory is for isolated runs and is
+    // never populated from the user's old settings.
+    std::filesystem::path dataDirectory = veyra::runtime::userDataDirectory() / L"user-data-2.0.0";
+    std::filesystem::path legacyDirectory = veyra::runtime::userDataDirectory();
+    bool explicitDataDirectory = false;
+    {
+        const QStringList early = QCoreApplication::arguments();
+        const auto at = early.indexOf(QStringLiteral("--data-dir"));
+        if (at > 0 && at + 1 < early.size()) {
+            dataDirectory = std::filesystem::path(early.at(at + 1).toStdWString());
+            explicitDataDirectory = true;
+            veyra::log::info("app", "test data directory " + early.at(at + 1).toStdString());
+        }
+        const auto importAt = early.indexOf(QStringLiteral("--import-1.4.4-data"));
+        if (importAt > 0 && importAt + 1 < early.size())
+            legacyDirectory = std::filesystem::path(early.at(importAt + 1).toStdWString());
+    }
+    if (!explicitDataDirectory) {
+        const auto migration = ui::prepareQmlDataDirectory(legacyDirectory, dataDirectory);
+        if (!migration.ok) {
+            veyra::log::error("app", "2.0.0 data migration failed: " + migration.error);
+            return 2;
+        }
+        veyra::log::info("app", std::format("2.0.0 data directory ready; copied {} legacy files",
+                                             migration.copied));
+    }
+    // Custom (Chrome bridge): veyra://play?url=... — the URL protocol the
+    // extension falls back to when the player is not running. Parsed here because
+    // the bridge below consumes it; the handler is installed by install-protocol.cmd.
+    QString protocolUrl;
+    for (const QString& a : QCoreApplication::arguments()) {
+        if (!a.startsWith(QStringLiteral("veyra://"), Qt::CaseInsensitive)) continue;
+        const QUrlQuery query(QUrl(a).query());
+        protocolUrl = query.queryItemValue(QStringLiteral("url"), QUrl::FullyDecoded);
+        break;
+    }
+    ui::QmlPlayerBridge bridge(controller, dataDirectory);
+    if (updateProbe && portable::releaseVersion(bridge.version()) != QString::fromLatin1(argv[2])) return 2;
+    bridge.attachVideoWindow(reinterpret_cast<qulonglong>(g_video));
+    auto* updater = qobject_cast<ui::UpdateChecker*>(bridge.updates())->portableUpdate();
+
+    // Custom (Chrome bridge): local HTTP endpoint the browser extension posts to.
+    // 127.0.0.1 only; port 18765 is fixed so the extension can find it without
+    // reading anything off disk (a browser cannot open local files).
+    ui::PlaybackServer playbackServer([&bridge](const QString& url){
+        bridge.bringToFront();bridge.openNetworkAddress(url);
+    });
+    if (!updateProbe) playbackServer.listen(18765);
+    if (!protocolUrl.isEmpty()) {
+        veyra::log::info("playback-server", std::format("protocol request: host={}",
+                                                         QUrl(protocolUrl).host().toStdString()));
+        QTimer::singleShot(1500, &bridge, [&bridge, url = protocolUrl] {
+            bridge.bringToFront();
+            bridge.openNetworkAddress(url);
+        });
+    }
+
+    // Qt reports QML failures through its own message handler. Routing them to
+    // the log is the difference between "it did not load" and why.
+    qInstallMessageHandler([](QtMsgType type, const QMessageLogContext&, const QString& message) {
+        const std::string utf8 = message.toUtf8().toStdString();
+        if (type == QtWarningMsg || type == QtCriticalMsg || type == QtFatalMsg) {
+            veyra::log::error("qml", utf8);
+        } else {
+            veyra::log::info("qml", utf8);
+        }
+    });
+
+    // Compiled QML goes to a cache folder of this build's own QML (see
+    // QmlDiskCache.h): with Qt's shared folder, 2.1.3 extracted over 2.1.2 ran
+    // the 2.1.2 pages. Qt reads QML_DISK_CACHE_PATH once, at the first QML load,
+    // with fromLocal8Bit; a folder the ANSI code page cannot spell turns the disk
+    // cache off rather than letting Qt fall back to the shared one.
+    {
+        const auto started = std::chrono::steady_clock::now();
+        const QString testRoot = qEnvironmentVariable("VEYRA_TEST_QML_CACHE_ROOT");
+        const auto cache = ui::chooseQmlDiskCache(
+            QCoreApplication::applicationDirPath() + QStringLiteral("/qml/Veyra"),
+            testRoot.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::CacheLocation) : testRoot,
+            qgetenv("QML_DISK_CACHE_PATH"), qgetenv("QML_DISABLE_DISK_CACHE"));
+        QString outcome = cache.note;
+        if (!cache.directory.isEmpty()) {
+            const QString folder = QDir::toNativeSeparators(cache.directory);
+            const QByteArray local = folder.toLocal8Bit();
+            if (QString::fromLocal8Bit(local) == folder) {
+                qputenv("QML_DISK_CACHE_PATH", local);
+                outcome = QStringLiteral("folder=") + folder;
+            } else {
+                qputenv("QML_DISABLE_DISK_CACHE", "1");
+                outcome = QStringLiteral("disk cache off: the code page cannot spell ") + folder;
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        veyra::log::info("qml-cache", std::format("{} digest={} files={} bytes={} ms={:.1f}",
+            outcome.toStdString(), cache.digest.isEmpty() ? "none" : cache.digest.toStdString(), cache.files, cache.bytes, ms));
+    }
+
+    // The 日落 startup music (StartupMusic.h): the user's file next to the program, if any.
+    // Declared before the engine, so it outlives every QML reference to it.
+    ui::StartupMusic startupMusic(updateProbe ? QString{} :
+        QCoreApplication::applicationDirPath() + QStringLiteral("/media/startup-music.mp3"));
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::mediaOpenRequested, &startupMusic, &ui::StartupMusic::pause);
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::preferencesChanged, &startupMusic, [&] {
+        if (bridge.preferences().value(QStringLiteral("introMusic")).isValid()
+            && !bridge.preferences().value(QStringLiteral("introMusic")).toBool()) startupMusic.pause();
+    });
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("vySoftwareUi"), softwareUi);
+    auto* thumbnails = new ui::ThumbnailProvider;
+    engine.addImageProvider(QStringLiteral("veyra-thumb"), thumbnails);
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::thumbnailSourceChanged, &app,
+                     [thumbnails](const QString& path) { thumbnails->setSource(path); });
+    engine.addImportPath(QCoreApplication::applicationDirPath() + "/qml");
+    engine.rootContext()->setContextProperty(QStringLiteral("veyra"), &bridge);
+    engine.rootContext()->setContextProperty(QStringLiteral("vyMusic"), &startupMusic);
+    bridge.setQmlEngine(&engine);   // Qt.uiLanguage drives the per-language font (Theme.qml)
+
+    QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app,
+                     [] { QCoreApplication::exit(1); }, Qt::QueuedConnection);
+    // Options are parsed rather than positional: `--page <id>` selects the screen
+    // a test wants to capture, and any other non-flag argument is a file to open.
+    //
+    // The rest are test switches (G0.3). They put the app into the exact state a
+    // design frame shows, so a screenshot of each can be compared with its design
+    // reference without anyone clicking. They go to QML as `vyTest`, never to the
+    // bridge's saved settings: a test run must not rewrite the user's preferences.
+    //   --tab <quality|fg|color|audio|display>   professional-page tab
+    //   --dialog <capture|ps5|screen|subtitle|audio|save|manage|tonode>
+    //   --aspect <ratio>        cinema aspect, overriding the source's own
+    //   --menu <source|preset>  professional-page popover menu open
+    //   --dock-pinned           dock open and held open
+    //   --tip <page>            the dock button's tooltip for that page shown (review)
+    //   --size <W>x<H>          window size in device-independent pixels
+    //   --reduced-motion        every animation at zero duration
+    //   --slow-animations <N>   every animation N times slower (motion sampling)
+    //   --full-bar <shown|hidden>  fullscreen with the control window held shown / hidden
+    //   --full-debug            log every pointer movement the fullscreen controls see
+    //   --data-dir <path>       presets and session history from that folder (read before the bridge exists)
+    //   --import-1.4.4-data <path>  read-only legacy settings source for first 2.0.0 launch
+    //   --motion-probe <name>   dock | page | switch | seg | menu: start that motion, log its value per frame
+    //   --exit-after <ms>       quit the app by itself after N ms, so a test run ends
+    //                           through the engine's own teardown instead of a kill
+    //   --video-probe <normal|hidden|no-region|covers-only>  native-window diagnosis
+    const QStringList args = QCoreApplication::arguments();
+    QString openPath;
+    QVariantMap testOptions;
+    if (updateProbe) testOptions.insert(QStringLiteral("portableUpdateProbe"), true);
+    if(qEnvironmentVariableIsSet("VEYRA_TEST_DISABLE_PAUSED_UI_IDLE"))
+        testOptions.insert(QStringLiteral("disablePausedUiIdle"),true);
+    QSize testSize;
+    // --exit-after: see the switch table. 0 means "run until closed".
+    int exitAfterMs = updateProbe ? 350 : 0;
+    for (int i = 1; i < args.size(); ++i) {
+        const QString& a = args.at(i);
+        const bool hasValue = i + 1 < args.size();
+        if (a == QLatin1String("--portable-update-probe") && hasValue) {
+            ++i;
+        } else if (a == QLatin1String("--page") && hasValue) {
+            bridge.setInitialPage(args.at(++i));
+        } else if (a == QLatin1String("--tab") && hasValue) {
+            testOptions.insert(QStringLiteral("tab"), args.at(++i));
+        } else if (a == QLatin1String("--dialog") && hasValue) {
+            testOptions.insert(QStringLiteral("dialog"), args.at(++i));
+        } else if (a == QLatin1String("--menu") && hasValue) {
+            testOptions.insert(QStringLiteral("menu"), args.at(++i));
+        } else if (a == QLatin1String("--aspect") && hasValue) {
+            testOptions.insert(QStringLiteral("aspect"), args.at(++i).toDouble());
+        } else if (a == QLatin1String("--tip") && hasValue) {
+            testOptions.insert(QStringLiteral("tip"), args.at(++i));
+        } else if (a == QLatin1String("--export-out") && hasValue) {
+            // A review run's export target, so a real export starts without the dialog.
+            bridge.setExportPath(args.at(++i));
+        } else if (a == QLatin1String("--full-bar") && hasValue) {
+            testOptions.insert(QStringLiteral("fullBar"), args.at(++i));
+        } else if (a == QLatin1String("--full-debug")) {
+            testOptions.insert(QStringLiteral("fullDebug"), true);
+        } else if (a == QLatin1String("--data-dir") && hasValue) {
+            ++i;  // handled before the bridge was created
+        } else if (a == QLatin1String("--import-1.4.4-data") && hasValue) {
+            ++i;  // handled before the bridge was created
+        } else if (a == QLatin1String("--dock-pinned")) {
+            testOptions.insert(QStringLiteral("dockPinned"), true);
+        } else if (a == QLatin1String("--size") && hasValue) {
+            const QStringList wh = args.at(++i).split(QLatin1Char('x'));
+            if (wh.size() == 2) testSize = QSize(wh.at(0).toInt(), wh.at(1).toInt());
+        } else if (a == QLatin1String("--motion-probe") && hasValue) {
+            testOptions.insert(QStringLiteral("motionProbe"), args.at(++i));
+        } else if (a == QLatin1String("--exit-after") && hasValue) {
+            exitAfterMs = args.at(++i).toInt();
+        } else if (a == QLatin1String("--video-probe") && hasValue) {
+            const QString mode = args.at(++i);
+            if (mode == QLatin1String("hidden")) g_videoProbe = VideoProbeMode::Hidden;
+            else if (mode == QLatin1String("no-region")) g_videoProbe = VideoProbeMode::NoRegion;
+            else if (mode == QLatin1String("covers-only")) g_videoProbe = VideoProbeMode::CoversOnly;
+            else if (mode != QLatin1String("normal")) {
+                veyra::log::error("qml-window", "invalid video probe mode " + mode.toStdString());
+                return 2;
+            }
+            g_videoHiddenByProbe = g_videoProbe == VideoProbeMode::Hidden;
+        } else if (a == QLatin1String("--reduced-motion")) {
+            testOptions.insert(QStringLiteral("reducedMotion"), true);
+        } else if (a == QLatin1String("--slow-animations") && hasValue) {
+            // Qt's own slow mode, the same one its debugging tools use: every
+            // animation driven by the unified timer runs N times longer, so a
+            // timed screenshot lands on a known point of the curve.
+            const qreal factor = args.at(++i).toDouble();
+            if (factor > 1.0) {
+                QUnifiedTimer::instance()->setSlowModeEnabled(true);
+                QUnifiedTimer::instance()->setSlowdownFactor(factor);
+                testOptions.insert(QStringLiteral("slowAnimations"), factor);
+            }
+        } else if (a == QLatin1String("--output-cap") && hasValue) {
+            // Test switch: set the output cap so the automatic multiplier has a target.
+            // `<fps>` = custom cap, `display` = follow the monitor, `off` = disabled.
+            const QString cap = args.at(++i);
+            QTimer::singleShot(0, &bridge, [&bridge, cap] {
+                if (cap == QLatin1String("off")) bridge.setOutputRateMode(0);
+                else if (cap == QLatin1String("display")) bridge.setOutputRateMode(1);
+                else { bridge.setOutputRateMode(2); bridge.setOutputCustomFps(cap.toDouble()); }
+                veyra::log::info("qml-test", std::format("output cap: {}", cap.toStdString()));
+            });
+        } else if (a == QLatin1String("--fg-auto")) {
+            // Test switch: turn the automatic multiplier on (or off with `--fg-auto off`).
+            // Same entry point the 自动选择倍率 switch uses, so the decision path is real.
+            bool on = true;
+            if (hasValue && args.at(i + 1) == QLatin1String("off")) { on = false; ++i; }
+            QTimer::singleShot(0, &bridge, [&bridge, on] { bridge.setFgAutoMultiplier(on); });
+        } else if (a == QLatin1String("--fg-auto-toggle") && hasValue) {
+            // Test switch: after N ms pick a manual multiplier, then switch the automatic
+            // selection back on `back-ms` later. Reproduces 「开→手动→开」without clicking.
+            // Format: --fg-auto-toggle <set-ms> <manual> <back-ms>
+            const int setMs = args.at(++i).toInt();
+            int manual = 4;
+            int backMs = 0;
+            if (i + 1 < args.size()) manual = args.at(++i).toInt();
+            if (i + 1 < args.size()) backMs = args.at(++i).toInt();
+            QTimer::singleShot(setMs, &bridge, [&bridge, manual] {
+                veyra::log::info("qml-test", std::format("fg-auto-toggle: manual {}X", manual));
+                bridge.setFgMultiplier(manual);
+            });
+            if (backMs > 0) {
+                QTimer::singleShot(setMs + backMs, &bridge, [&bridge] {
+                    veyra::log::info("qml-test", "fg-auto-toggle: back to automatic");
+                    bridge.setFgAutoMultiplier(true);
+                });
+            }
+        } else if (a == QLatin1String("--pref-at") && hasValue) {
+            // Test switch: set a preference N ms in, exactly as the settings page would,
+            // so live-update paths can be checked without clicking.
+            // Format: --pref-at <ms> <key> <value>
+            const int atMs = args.at(++i).toInt();
+            const QString pkey = args.at(++i);
+            const QString pval = i + 1 < args.size() ? args.at(++i) : QString();
+            QTimer::singleShot(atMs, &bridge, [&bridge, pkey, pval] {
+                veyra::log::info("qml-test", std::format("pref-at {}={}", pkey.toStdString(), pval.toStdString()));
+                bridge.setPreference(pkey, pval);
+            });
+        } else if (!a.startsWith(QLatin1Char('-'))) {
+            openPath = a;
+        }
+    }
+    if (!testOptions.isEmpty() || testSize.isValid())
+        veyra::log::info("qml", std::format("test switches: {} size={}x{}",
+                                            QStringList(testOptions.keys()).join(',').toStdString(),
+                                            testSize.width(), testSize.height()));
+    veyra::log::info("qml-window", std::format("probe mode={}", videoProbeName()));
+    engine.rootContext()->setContextProperty(QStringLiteral("vyTest"), testOptions);
+    if (!openPath.isEmpty() && !updateProbe) {
+        QTimer::singleShot(600, &bridge, [&bridge, openPath] { bridge.openPath(openPath); });
+    } else if (!updateProbe) {
+        QTimer::singleShot(600, &bridge, [&bridge] { bridge.autoResumeLastSource(); });
+    }
+
+    engine.loadFromModule("Veyra", "Main");
+
+    if (engine.rootObjects().isEmpty()) {
+        veyra::log::error("qml", "no root object: the QML module failed to load");
+        return 1;
+    }
+
+    auto* window = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+    if (!window) {
+        veyra::log::error("qml", "root object is not a window");
+        return 1;
+    }
+    if (testSize.isValid()) window->resize(testSize);
+    bridge.attachMainWindow(static_cast<qulonglong>(window->winId()));
+
+    // Fullscreen must own the whole monitor. Without telling the shell, the taskbar
+    // stayed above the fullscreen picture on some systems (field report with the
+    // control pill showing behind it): the shell decides "fullscreen application"
+    // from its own heuristics, and the owned control window defeats them.
+    // ITaskbarList2::MarkFullscreenWindow states it explicitly.
+    QObject::connect(window, &QWindow::visibilityChanged, &app, [window](QWindow::Visibility visibility) {
+        const bool full = visibility == QWindow::FullScreen;
+        ITaskbarList2* taskbar = nullptr;
+        const HRESULT created = CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&taskbar));
+        HRESULT marked = created;
+        if (SUCCEEDED(created) && taskbar) {
+            if (SUCCEEDED(taskbar->HrInit()))
+                marked = taskbar->MarkFullscreenWindow(reinterpret_cast<HWND>(window->winId()), full ? TRUE : FALSE);
+            taskbar->Release();
+        }
+        veyra::log::info("qml-window", std::format("taskbar fullscreen mark={} hr=0x{:X}", full, unsigned(marked)));
+    });
+
+    // Clicking the taskbar button minimises a window only when it has a minimise box;
+    // Qt's frameless window is a bare WS_POPUP, so the click did nothing (field report).
+    // The two bits add no frame or caption. Qt may rebuild the style on a fullscreen
+    // switch, so it is put back on every visibility change.
+    const auto allowTaskbarMinimise = [window] {
+        const HWND hwnd = reinterpret_cast<HWND>(window->winId());
+        const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        const LONG_PTR wanted = style | WS_MINIMIZEBOX | WS_SYSMENU;
+        if (wanted == style) return;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, wanted);
+        veyra::log::info("qml-window", std::format("taskbar minimise enabled style=0x{:X}", static_cast<unsigned long long>(wanted)));
+    };
+    allowTaskbarMinimise();
+    QObject::connect(window, &QWindow::visibilityChanged, &app, [allowTaskbarMinimise](QWindow::Visibility) { allowTaskbarMinimise(); });
+
+    // Closing the window must run the engine's own teardown, not just end the loop.
+    // A test harness that hard-kills the process (Stop-Process -Force) loses every
+    // log line still in the file sink's 64 KB buffer - including the ones a test is
+    // looking for, because the flush condition (250 ms since the last write) is
+    // never reached when the process dies first. Qt's default for a window with no
+    // explicit handler is to close it and exit on the last window, which does run
+    // teardown; this makes it explicit so a harness can also ask for a clean exit
+    // with --exit-after and get the same, complete log either way.
+    QObject::connect(window, &QQuickWindow::closing, &app, [](QQuickCloseEvent*) {
+        veyra::log::info("qml", "closing: quitting the application loop");
+        // Flush before quitting: the file sink is a 64 KB _IOFBF buffer, so a run
+        // that ends without this loses its last lines (the exact ones a headless
+        // check is looking for). closeFile() at teardown would also flush, but a
+        // quit path is not guaranteed to reach it.
+        veyra::Logger::instance().flush();
+        QCoreApplication::quit();
+    }, Qt::DirectConnection);
+    if (exitAfterMs > 0) {
+        // Self-terminating test run: the same teardown path as a user closing the
+        // window, so the log a harness reads is complete either way.
+        QTimer::singleShot(exitAfterMs, &app, [window, updateProbe] {
+            veyra::log::info("qml", "exit-after elapsed: closing the window");
+            if (updateProbe) QCoreApplication::quit();
+            else window->close();
+        });
+    }
+#ifdef VEYRA_PORTABLE_UPDATE_TEST
+    if (!updateProbe && qEnvironmentVariableIsSet("VEYRA_PORTABLE_UPDATE_SMOKE")) {
+        QObject::connect(updater, &ui::PortableUpdate::changed, window, [window, updater, attempted = false]() mutable {
+            if (updater->available() && !attempted) {
+                attempted = true;
+                updater->downloadAndSchedule();
+            } else if (updater->scheduled()) {
+                QTimer::singleShot(200, window, &QWindow::close);
+            }
+        });
+        QTimer::singleShot(100000, window, &QWindow::close);
+    }
+#endif
+
+    // Focus changes are diagnostic only: they never pause playback, change the
+    // selected effects, or reduce submission cadence. Keep the actual throughput
+    // and Windows process throttle state alongside field reports of background lag.
+    QObject::connect(window, &QWindow::activeChanged, &app, [window, &controller] {
+        const auto s=controller.snapshot();
+        PROCESS_POWER_THROTTLING_STATE throttle{};
+        throttle.Version=PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        const bool known=GetProcessInformation(GetCurrentProcess(),ProcessPowerThrottling,&throttle,sizeof(throttle));
+        const DWORD error=known?0:GetLastError();
+        veyra::log::info("app-focus",std::format(
+            "active={} running={} transport={} sourceFps={:.2f} submitFps={:.2f} nr={} sr={} fg={} powerKnown={} control=0x{:X} state=0x{:X} err={}",
+            window->isActive(),s.running,int(s.transport),s.nominalSourceFps,s.submissionFps.value_or(-1),
+            s.nrActive,s.srActive,s.fgActive,known,throttle.ControlMask,throttle.StateMask,error));
+    });
+
+    // Reparent the native window under the QML window and keep it in step. The
+    // host item is looked up by objectName so the QML side owns the layout and
+    // this side only follows it.
+    // The host item is followed per rendered frame rather than on a timer or through
+    // its own change signals. afterAnimating fires on the GUI thread before every
+    // frame Qt produces, so anything that moves the host (layout, a resize, the
+    // page switch, a cinema height animation, a popover scaling in) is picked up in
+    // the same frame, and an idle scene renders no frames and costs nothing. Change
+    // signals alone were not enough: the first layout pass can leave the host at its
+    // default 0x0 with no change to observe, which is how the engine once built a
+    // swapchain from a 1x1 window. The native calls only run when a value changed.
+    auto follow = [window, &bridge] {
+        if (!g_video) return;
+        syncVideoCursor(window->property("fullscreenCursorHidden").toBool());
+        // Only the pre-open hook attaches the popup and converts it to WS_CHILD.
+        // GetParent() is null for an unattached WS_POPUP, so reparenting here on
+        // every animation frame can starve input and timers before any source opens.
+        if (!bridge.hasSource()) {
+            // The window stays up for the presenter, but empty: the QML stage and its
+            // "正在连接" pill show instead of the last source's frozen frame.
+            if (bridge.openingSource()) { blankVideo("opening"); return; }
+            if (IsWindowVisible(g_video)) {
+                veyra::log::info("qml-window", "follow: hide video because source snapshot is inactive");
+                ShowWindow(g_video, SW_HIDE);
+            }
+            return;
+        }
+        static QPointer<QQuickItem> host;
+        if (!host) {
+            host = window->findChild<QQuickItem*>(QStringLiteral("videoHost"));
+            // Report the search: "the log is silent" and "the lookup failed" look
+            // identical otherwise.
+            veyra::log::info("qml", std::format("video host lookup: found={} contentChildren={}",
+                                                host != nullptr,
+                                                window->contentItem() ? window->contentItem()->childItems().size() : -1));
+            if (!host) return;
+        }
+        // Report the resolved geometry once at each distinct size, so the log
+        // says what the video window was actually given.
+        static int lastW = -1, lastH = -1;
+        const int w = int(host->width()), h = int(host->height());
+        if (w != lastW || h != lastH) {
+            lastW = w; lastH = h;
+            veyra::log::info("qml", std::format("video host geometry {}x{} at {},{}",
+                                                w, h, int(host->x()), int(host->y())));
+        }
+        if (syncVideoGeometry(window, host))
+            syncVideoCovers(window, host, sceneInsetFraction(window));
+    };
+    // Hold-to-compare (V by default) is the bridge's application event filter:
+    // the key is rebindable (设置 → 快捷键) and can be switched off (显示 →
+    // 按住 V 查看原画). A second hard-wired V filter here used to override both.
+    QObject::connect(window, &QQuickWindow::afterAnimating, &app, follow);
+    QObject::connect(&bridge, &ui::QmlPlayerBridge::snapshotChanged, &app, follow);
+    // The first frame may come before the page layout settles; one pass after the
+    // event loop starts covers a scene that then never animates.
+    QTimer::singleShot(0, &app, follow);
+    // How often the Qt windows present. OBS game capture locks onto one swapchain and only
+    // moves to another after 16 presents in a row from it, so a UI that keeps presenting
+    // during playback keeps OBS on the UI instead of the video (field report 2026-10-01).
+    {
+        static std::atomic<int> mainFrames{0}, barFrames{0};
+        QObject::connect(window, &QQuickWindow::frameSwapped, &app, [] { ++mainFrames; }, Qt::DirectConnection);
+        if (auto* bar = window->findChild<QQuickWindow*>(QStringLiteral("fullscreenBar")))
+            QObject::connect(bar, &QQuickWindow::frameSwapped, &app, [] { ++barFrames; }, Qt::DirectConnection);
+        auto* frameLog = new QTimer(&app);
+        QObject::connect(frameLog, &QTimer::timeout, &app, [] {
+            const int m = mainFrames.exchange(0), b = barFrames.exchange(0);
+            if (m || b) veyra::log::info("qml-frames", std::format("ui presents per 10 s: main={} controlBar={}", m, b));
+        });
+        frameLog->start(10000);
+    }
+    // A GPU reset takes the interface's own device too (logs 56): Qt cleans up the scene
+    // graph and builds it again on a new device, but Qt 6.8.3's curve-rendered Shapes come
+    // back empty, so every icon was missing. Tell the icons to rebuild their paths.
+    {
+        const auto watch = [&app, &bridge](QQuickWindow* w, const QString& name) {
+            auto lost = std::make_shared<std::atomic<bool>>(false);
+            QObject::connect(w, &QQuickWindow::sceneGraphInvalidated, &app, [lost] { lost->store(true); }, Qt::DirectConnection);
+            QObject::connect(w, &QQuickWindow::sceneGraphInitialized, &bridge, [lost, &bridge, name] {
+                if (lost->exchange(false)) bridge.noteUiDeviceRecreated(name);
+            }, Qt::QueuedConnection);
+        };
+        watch(window, QStringLiteral("main"));
+        if (auto* bar = window->findChild<QQuickWindow*>(QStringLiteral("fullscreenBar"))) watch(bar, QStringLiteral("controlBar"));
+    }
+    // Test only: VEYRA_TEST_DPI_FLIP=<ms> sends the window the WM_DPICHANGED a move to a
+    // 150 % screen would, then back to 100 % three seconds later, so the screen-change
+    // crash (field report 2026-10-01, two monitors) can be reproduced on one monitor.
+    if (const auto flip = qEnvironmentVariableIntValue("VEYRA_TEST_DPI_FLIP"); flip > 0) {
+        const auto send = [window](UINT dpi) {
+            const HWND hwnd = reinterpret_cast<HWND>(window->winId());
+            RECT r{};
+            GetWindowRect(hwnd, &r);
+            veyra::log::info("dpi-test", std::format("WM_DPICHANGED dpi={}", dpi));
+            SendMessageW(hwnd, WM_DPICHANGED, MAKEWPARAM(dpi, dpi), reinterpret_cast<LPARAM>(&r));
+        };
+        QTimer::singleShot(flip, &app, [send] { send(144); });
+        QTimer::singleShot(flip + 3000, &app, [send] { send(96); });
+    }
+    // Test only: VEYRA_TEST_UI_DEVICE_REMOVE=<ms> removes the interface's own D3D12 device
+    // on its render thread, as a GPU reset does (logs 56: "Graphics device lost, cleaning up
+    // scenegraph and releasing RHI"), so the interface's recovery can be checked without one.
+    if (const auto remove = qEnvironmentVariableIntValue("VEYRA_TEST_UI_DEVICE_REMOVE"); remove > 0) {
+        QTimer::singleShot(remove, &app, [window] {
+            auto pending = std::make_shared<QMetaObject::Connection>();
+            *pending = QObject::connect(window, &QQuickWindow::beforeRendering, window, [window, pending] {
+                QObject::disconnect(*pending);
+                auto* device = window->rendererInterface()
+                    ? static_cast<ID3D12Device*>(window->rendererInterface()->getResource(window, QSGRendererInterface::DeviceResource)) : nullptr;
+                ID3D12Device5* device5 = nullptr;
+                const bool ok = device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5)));
+                veyra::log::warn("ui-device-test", std::format("removing the interface D3D12 device ok={}", ok));
+                if (ok) { device5->RemoveDevice(); device5->Release(); }
+            }, Qt::DirectConnection);
+            window->update();
+        });
+    }
+
+    // Before every open, place the native window and force the pending layout to
+    // be applied so the client size the presenter reads is the real one.
+    bridge.setPreOpenHook([window, &bridge] {
+        auto* host = window->findChild<QQuickItem*>(QStringLiteral("videoHost"));
+        veyra::log::info("qml", std::format("pre-open: host={} size={}x{} contentChildren={}",
+                                            host != nullptr,
+                                            host ? int(host->width()) : -1,
+                                            host ? int(host->height()) : -1,
+                                            window->contentItem() ? window->contentItem()->childItems().size() : -1));
+        // Parent first: a WS_CHILD window without a parent is not realized, so its
+        // rect stays 0x0 and any SetWindowPos is discarded. Reparenting here, not
+        // on a later timer tick, is what lets the geometry below take effect.
+        // 视频直出 keeps the popup a top-level window on purpose: a child window is
+        // always composited, and only an own flip window reaches scanout directly.
+        // It is NOT owned by the app window either: Windows treats an owned popup
+        // as part of its owner's composition, and the display stopped scanning it
+        // out directly (measured 1.45 ms unowned, 8.6 ms owned). Minimising is
+        // handled where the rectangle is computed (IsIconic).
+        if (directVideoPresent(window)) {
+            if (GetParent(g_video) != nullptr) {
+                SetWindowLongPtrW(g_video, GWLP_HWNDPARENT, 0);
+                veyra::log::info("qml-window", "direct present: video window unowned");
+            }
+        } else if (GetParent(g_video) == nullptr) {
+            const HWND parent = reinterpret_cast<HWND>(window->winId());
+            SetParent(g_video, parent);
+            // SetParent alone leaves the popup style in place; a child style is what
+            // makes the window clip to its parent and behave as part of the layout.
+            const LONG_PTR style = GetWindowLongPtrW(g_video, GWL_STYLE);
+            SetWindowLongPtrW(g_video, GWL_STYLE,
+                              (style & ~(WS_POPUP)) | WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
+        }
+        const bool validHost = host && syncVideoGeometry(window, host);
+        if (!validHost) {
+            veyra::log::error("qml-window", "pre-open: video host has no valid client rectangle");
+            return;
+        }
+        const BOOL wasVisible = IsWindowVisible(g_video);
+        ShowWindow(g_video, SW_SHOWNA);
+        veyra::log::info("qml-window", std::format(
+            "pre-open: show video wasVisible={} nowVisible={} sourceSnapshot={}",
+            wasVisible != 0, IsWindowVisible(g_video) != 0, bridge.hasSource()));
+        if (g_videoHiddenByProbe) ShowWindow(g_video, SW_HIDE);
+        UpdateWindow(g_video);
+        // Report the native window's own client rect, not the QML item's: the
+        // presenter builds its swapchain from this, and the two sizes can differ.
+        // The size the engine will build its swapchain from. Reporting it is what
+        // makes a regression here visible instead of a 1x1 surface with no clue.
+        RECT client{};
+        GetClientRect(g_video, &client);
+        veyra::log::info("qml", std::format("video window {}x{} parent={}",
+                                            client.right, client.bottom,
+                                            GetParent(g_video) != nullptr));
+    });
+
+    // A file on the command line opens immediately. This exists so playback can
+    // be verified end to end by a test rather than by a person clicking around;
+    // it is not a user-facing feature.
+    const int rc = app.exec();
+    if (updateProbe) veyra::log::info("portable-update-probe", "QML startup completed");
+    if (rc == 0 && updater->scheduled() && !bridge.exportRunning()) {
+        if (g_video) { DestroyWindow(g_video); g_video = nullptr; }
+        return portable::applyExitCode;
+    }
+    if (rc == 42) {
+        if (args.contains(QStringLiteral("--managed-portable"))) {
+            const auto restartCode = app.property("veyraOverlayCompatRestart").toBool()
+                ? portable::overlayRestartExitCode : 42;
+            if (g_video) { DestroyWindow(g_video); g_video = nullptr; }
+            return restartCode;
+        }
+        restartProgram = QCoreApplication::applicationFilePath();
+        // Preserve the selected profile, not transient capture/open/test flags.
+        const auto args = QCoreApplication::arguments();
+        for (int i = 1; i + 1 < args.size(); ++i) {
+            if (args[i] == QStringLiteral("--data-dir")) {
+                restartArgs << args[i] << args[i + 1];
+                ++i;
+            }
+        }
+        if (app.property("veyraOverlayCompatRestart").toBool())
+            restartArgs << QStringLiteral("--overlay-compat-restart");
+        restartArgs << QStringLiteral("--page") << QStringLiteral("set");
+    }
+    if (g_video) { DestroyWindow(g_video); g_video = nullptr; }
+    return rc;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--read-live-captions") == 0)
+        return veyra::ui::runLiveCaptionReader();
+    // A child for the AMD HIP self-test (AmdHipPreflight.h): no Qt, no window and
+    // no player state, only the HIP calls and their result lines on the pipe.
+    if (argc >= 2 && std::strcmp(argv[1], "--amd-hip-preflight") == 0) {
+        int count = 0;
+        wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &count);
+        const int code = wide ? veyra::pipeline::amdhip::preflightMain(count, wide) : 2;
+        if (wide) LocalFree(wide);
+        return code;
+    }
+    {
+        std::wstring self(32768, L'\0');
+        self.resize(GetModuleFileNameW(nullptr, self.data(), DWORD(self.size())));
+        veyra::pipeline::amdhip::setPreflightExecutable(self);
+        const std::string_view option = argc > 1 ? argv[1] : "";
+        if (option != "--managed-portable" && option != "--portable-update-probe" && option != "--export-worker") {
+            const auto root = portable::rootFromVersionDirectory(std::filesystem::path(self).parent_path());
+            if (!root.empty()) {
+                int count = 0;
+                auto* wide = CommandLineToArgvW(GetCommandLineW(), &count);
+                QStringList args;
+                if (wide) {
+                    for (int i = 1; i < count; ++i) args << QString::fromWCharArray(wide[i]);
+                    LocalFree(wide);
+                }
+                return QProcess::startDetached(QString::fromStdWString((root / portable::launcherName).wstring()), args)
+                    ? 0 : 1;
+            }
+        }
+    }
+    QString program;
+    QStringList arguments;
+    const int result = runApplication(argc, argv, program, arguments);
+    if (result != 42 || program.isEmpty()) return result;
+    // Player, QML engine and QApplication have all been destroyed.
+    if (QProcess::startDetached(program, arguments)) return 0;
+    MessageBoxW(nullptr, L"设置已保存，但自动重启失败。请重新打开软件。\nSettings saved. Automatic restart failed; please reopen Veyra.",
+                L"Veyra", MB_OK | MB_ICONERROR);
+    return 1;
+}

@@ -1,0 +1,245 @@
+#pragma once
+
+// PresentSink (Playbook P6.3): a Win32 window plus a DXGI flip-model
+// (FLIP_DISCARD by default, optional FLIP_SEQUENTIAL, 3-buffer) swapchain used as the display output of the
+// Veyra engine. The normal path NEVER reads back: the engine blits the
+// finished frame (Feature 18 output, then FG, then UI) into the back buffer
+// and presents. Resize recreates the buffers; vsync can be disabled for
+// tearing-capable contexts.
+
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <optional>
+#include <vector>
+
+#include "veyra/Result.h"
+#include "veyra/gfx/XessPresenter.h"
+
+namespace veyra::gfx {
+
+template <typename T>
+using ComPtr = Microsoft::WRL::ComPtr<T>;
+
+class PresentSink {
+public:
+    // Custom: what the panel itself reports through DXGI. Used to default the HDR
+    // tuning's display peak ("0 = ask the system") and to show the user the values
+    // the system claims, so a wrong guess can be corrected by hand.
+    struct DisplayPeakInfo {
+        unsigned peakNits = 0;        // small-area peak
+        unsigned fullFrameNits = 0;   // sustained full-screen
+        double minNits = 0.0;         // black level
+        bool valid = false;
+        // False when the numbers look like the panel's EDID ceiling rather than a
+        // measurement: full-scale peak together with an idealised (near zero) black.
+        // Almost every display answers 10000/0.000 here, and scaling a curve against
+        // that number pushes its highlight start out of reach of real content.
+        bool plausible = false;
+    };
+    static bool hdrDisplayActive(HWND);
+    // The factory is cached process-wide; DXGI factories detect display
+    // topology changes (IsCurrent) so a stale one is recreated on demand.
+    // Creating a factory and enumerating every adapter/output each call ran
+    // on the graph owner every 2 s under HDR (sweep 2026-09-22 A1). `peak`
+    // receives the same output description's luminance.
+    static std::optional<bool> queryHdrDisplayActive(HWND,HMONITOR* queriedMonitor=nullptr,DisplayPeakInfo* peak=nullptr);
+    static double displayRefreshFps(HWND);
+    PresentSink() = default;
+    ~PresentSink();
+
+    PresentSink(const PresentSink&) = delete;
+    PresentSink& operator=(const PresentSink&) = delete;
+
+    struct Desc {
+        uint32_t width = 1280;
+        uint32_t height = 720;
+        bool vsync = true;
+        bool tearing = false; // request DXGI_PRESENT_ALLOW_TEARING (only without vsync)
+        bool waitable = false;
+        bool xess = false;
+        bool captureCompatible = false;
+        bool hdr = false;
+        bool hdr10 = false;
+        // Requested frame-generation multiplier (2 = one generated frame).
+        // Only the XeSS path consumes it today; >2 requires the provider unlock.
+        uint32_t fgMultiplier = 1;
+        // XeLL low-latency sleep on the source-input thread. Must stay true
+        // for generation (provider returns -15 otherwise); diagnostic toggle.
+        bool xessLowLatencySleep = true;
+        // Probe runs create their own window class name per process.
+        std::wstring title = L"Veyra";
+        HWND targetWindow = nullptr; // borrowed UI-owned child HWND; never destroyed by sink
+    };
+
+    // Creates a Win32 window (not shown as foreground; background probe
+    // friendly) and the flip-model swapchain on the given device/queue.
+    bool initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
+                    const Desc& desc, Status& status);
+
+    // Handles WM_SIZE; returns true when the swapchain buffers were resized
+    // and the caller must recreate sized resources.
+    bool processMessages(bool& windowClosed);
+
+    // Returns the current back buffer (transitioned state is the caller's
+    // responsibility; the buffer is in COMMON/PRESENT state on acquire).
+    ID3D12Resource* currentBackBuffer(uint32_t* acquiredIndex = nullptr);
+
+    // Presents the current back buffer. Returns false on device-lost class
+    // failures (caller must trigger recovery).
+    bool present(Status& status);
+    struct PresentTiming {
+        double beforeMs=0,callMs=0,bufferMs=0,afterMs=0;
+        HRESULT result=S_OK;
+    };
+    const PresentTiming& lastPresentTiming()const{return presentTiming_;}
+    // Display-side evidence: DXGI frame statistics deltas since the previous
+    // sample. presents = successful Present calls in the window; refreshes =
+    // vertical refreshes elapsed (SyncRefreshCount); displayed = refreshes at
+    // which a NEW presented frame was scanned out (PresentRefreshCount delta).
+    // presents - displayed = submissions that never reached the screen (with
+    // tearing/vsync off, dropped by flip). Unsupported (proxy swapchain or
+    // pre-first-present) leaves supported=false; nothing is invented.
+    // Raw DXGI counters, deltas over the sampling window. NONE of these is a
+    // count of frames the panel actually showed, and no combination of them
+    // yields one on a tearing flip-discard swapchain (measured 2026-09-22:
+    // with 273 Present calls per second on a 100 Hz panel, PresentCount also
+    // reads 273 while both refresh counters read 100). Use PresentMon for
+    // scanout. presents: our own Present() calls. displayed: DXGI PresentCount
+    // (completed presents). refreshes: SyncRefreshCount (vblanks elapsed).
+    // displayedRefresh: PresentRefreshCount (vblank index, also ~= refreshes).
+    struct FrameStatisticsDelta {
+        bool supported=false;
+        uint64_t presents=0,displayed=0,refreshes=0,displayedRefresh=0;
+        // GetLastPresentCount - last shown PresentCount at the sample, -1 if
+        // either query failed. Under Vsync this is the display queue depth;
+        // with Present(0,0) it also counts frames a newer one will replace.
+        int64_t ahead=-1;
+        HRESULT result=S_OK;
+    };
+    FrameStatisticsDelta sampleFrameStatistics();
+    // Present call -> the vblank that showed it, for VSync DXGI presents.
+    // Flip-model frame statistics name the last displayed present
+    // (PresentCount, same numbering as GetLastPresentCount) and its vblank
+    // (PresentRefreshCount); SyncQPCTime/SyncRefreshCount date that vblank.
+    // Sampled before every Present, summarised and cleared by the caller.
+    // compositionMode: DXGI_FRAME_PRESENTATION_MODE (0 composed, 1 overlay,
+    // 2 none, 3 composition failure), -1 when the query is unavailable.
+    struct DisplayLatencySummary {
+        uint64_t samples=0,replacedAtLeast=0;
+        double p50Ms=-1,p95Ms=-1,maxMs=-1;
+        int compositionMode=-1;
+    };
+    DisplayLatencySummary takeDisplayLatency();
+    // Host 100 ns (steady_clock). The last vblank in the frame statistics and the
+    // measured period; latch is how long before a vblank a Present still makes it:
+    // the shortest Present to scanout seen lately. Empty before any statistics.
+    struct RefreshGrid { int64_t lastVblank100ns=0; double period100ns=0,latch100ns=0; };
+    RefreshGrid refreshGrid()const;
+    double displayRefreshHz()const{return displayRefreshHz_;}
+    // The owner re-reads the monitor after a move or mode change.
+    void setDisplayRefreshHz(double hz){if(hz>=1.0)displayRefreshHz_=hz;}
+    bool configurePacing(bool enabled,bool vsync,bool tearing);
+    // Acquires one present of display-queue capacity (the frame latency
+    // object) while pacing; the next Present consumes it. Never blocks with
+    // ms=0. True when not pacing.
+    bool waitPresentationReady(unsigned ms);
+    bool presentationReady(){return waitPresentationReady(0);}
+    bool pacingActive()const{return pacing_;}
+
+    void resize(uint32_t width, uint32_t height);
+
+    uint32_t width() const { return width_; }
+    uint32_t height() const { return height_; }
+    // Actual swapchain buffer extent (equals width/height unless the DWM
+    // scaling fallback is active after a resize).
+    uint32_t bufferWidth() const { return bufferExtentW_; }
+    uint32_t bufferHeight() const { return bufferExtentH_; }
+    uint64_t presentCount() const { return presentCount_; }          // SUCCEEDED only
+    uint64_t attemptedPresentCount() const { return attemptedPresentCount_; }
+    uint64_t failedPresentCount() const { return failedPresentCount_; }
+    bool tearingSupported() const { return tearingSupported_; }
+    HWND hwnd() const { return hwnd_; }
+    IDXGISwapChain3* swapChain() const { return swapChain_.Get(); }
+    // Custom: HDR10 static metadata lives on IDXGISwapChain4. Queried lazily and
+    // re-queried whenever the swap chain is recreated; null when unsupported.
+    IDXGISwapChain4* swapChain4();
+    XessPresenter* xess() const { return xess_.get(); }
+    bool xessFailed() const { return xessFailed_; }
+
+    void shutdown();
+    // False while a failed ResizeBuffers is backing off (see resize()).
+    bool resizeDue() const;
+    // True when XeSS was requested but an injected overlay made us present natively.
+
+private:
+    static LRESULT CALLBACK wndProcThunk(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
+    bool refetchBackBuffers();
+    bool waitForQueueIdle();
+    void recreateSwapChain(UINT flags);
+
+    HWND hwnd_ = nullptr;
+    bool windowClassRegistered_ = false;
+    Desc desc_{};
+    uint32_t width_ = 0;
+    uint32_t height_ = 0;
+    uint64_t presentCount_ = 0;
+    uint64_t attemptedPresentCount_ = 0;
+    bool presentContractDirty_=true;
+    uint64_t failedPresentCount_ = 0;
+    uint32_t scBufferWidth_ = 0;
+    uint32_t scBufferHeight_ = 0;
+    uint32_t bufferExtentW_ = 0;
+    uint32_t bufferExtentH_ = 0;
+    bool tearingSupported_ = false;
+    UINT swapChainFlags_ = 0;
+    bool pendingResize_ = false;
+    // ResizeBuffers failures in a row and when the last one happened: retries back off
+    // instead of draining the queue every 100 ms while something holds the buffers.
+    uint32_t resizeFailures_ = 0;
+    uint64_t lastResizeFailureMs_ = 0;
+    bool xessFailed_ = false;
+    ID3D12Device* device_ = nullptr;
+    ID3D12CommandQueue* queue_ = nullptr;
+    ComPtr<IDXGIFactory2> factory_;
+    ComPtr<IDXGISwapChain3> swapChain_;
+    ComPtr<IDXGISwapChain4> swapChain4_; // custom: cached QI for SetHDRMetaData
+    std::unique_ptr<XessPresenter> xess_;
+    ComPtr<ID3D12Resource> backBuffers_[3];
+    UINT backBufferIndex_ = 0;
+    bool closed_ = false;
+    bool shutdownCalled_ = false;
+    HANDLE latencyHandle_=nullptr;
+    bool pacing_=false,capacityAcquired_=false;
+    PresentTiming presentTiming_{};
+    double displayRefreshHz_=0;
+    bool frameStatisticsBaseValid_=false;
+    uint64_t frameStatisticsBasePresents_=0;
+    UINT frameStatisticsBasePresentRefresh_=0,frameStatisticsBaseSyncRefresh_=0,frameStatisticsBaseDisplayed_=0;
+    void sampleDisplayLatency();
+    // replaceable: Present(0,0); only the frame a later sample names as shown
+    // is dated, a newer present may have replaced the ones in between.
+    struct PendingPresent { UINT id=0; int64_t qpc=0; bool replaceable=false; };
+    std::array<PendingPresent,16> pendingPresents_{};
+    unsigned pendingPresentNext_=0;
+    UINT lastDisplayedPresent_=0,lastSyncRefresh_=0,lastPresentRefresh_=0;
+    uint64_t replacedPresents_=0;
+    int64_t lastSyncQpc_=0;
+    double refreshQpc_=0,latchMs_=2;
+    bool displayLatencyEnabled_=true;
+    // The last Present allowed tearing: its scanout cannot be dated on the
+    // refresh grid, so takeDisplayLatency publishes the latch sample there.
+    bool lastPresentTore_=false;
+    std::vector<double> displayLatencyMs_;
+    // Grid-free samples: SyncQPCTime - the newest present's own QPC, i.e. when the
+    // frame the display just consumed actually went up. Valid with VRR too, where
+    // the fixed vblank grid the displayLatencyMs_ maths assumes does not exist.
+    std::vector<double> latchLatencyMs_;
+};
+
+} // namespace veyra::gfx

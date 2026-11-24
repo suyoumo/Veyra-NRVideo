@@ -1,0 +1,237 @@
+#pragma once
+#include "veyra/engine/EnhancementSettings.h"
+#include "veyra/engine/ExportFeaturePolicy.h"
+#include "veyra/pipeline/EnhanceGraph.h"
+#include "veyra/pipeline/ResolutionPlan.h"
+
+namespace veyra::engine {
+// Shared by graph creation and drained live-parameter updates. Disabled list
+// nodes stay in settings, but never allocate or evaluate an NR feature.
+inline void describeNrLayers(const EnhancementSettings& settings,pipeline::EnhanceGraphDesc& desc){
+    desc.nrRuntime=settings.nrRuntime;
+    desc.nrTemporal=settings.residual.correction.enabled?settings.residual.correction.usesHistory():settings.nrTemporal;
+    desc.nrAntiFlicker=settings.residual.correction.enabled?NrAntiFlicker::Flow:settings.nrAntiFlicker;
+    desc.model=settings.model;desc.residual=settings.residual;desc.protection=settings.protection;desc.exclusion=settings.exclusion;
+    desc.nrHoldStrength=settings.nrHoldStrength;desc.nrHoldTolerance=settings.nrHoldTolerance;
+    desc.nrReuse=settings.nr?settings.nrReuse:NrReuseMode::Off;
+    desc.nrLayersModel.clear();desc.nrLayersResidual.clear();
+    desc.nrLayersTemporal.clear();desc.nrLayersAntiFlicker.clear();desc.nrLayersProtection.clear();
+    desc.nrLayersSizePolicy={settings.nrPolicy};
+    if(!settings.nrLayerCount||!settings.nr)return;
+    const bool corrected=std::any_of(settings.nrLayers.begin(),settings.nrLayers.begin()+settings.nrLayerCount,
+        [](const auto& n){return n.enabled&&n.residual.correction.enabled;});
+    desc.nrLayersSizePolicy.clear();
+    for(uint32_t i=0;i<settings.nrLayerCount&&i<kMaxNrInstances;++i){
+        const auto& n=settings.nrLayers[i];
+        if(!n.enabled)continue;
+        desc.nrLayersModel.push_back(n.model);desc.nrLayersResidual.push_back(n.residual);
+        desc.nrLayersTemporal.push_back(n.usesTemporal());
+        // Untouched stacks retain the previous global-tier contract exactly.
+        // Controlled layers use Flow independently of the saved legacy tier.
+        if(corrected)desc.nrLayersAntiFlicker.push_back(n.residual.correction.enabled?NrAntiFlicker::Flow:n.antiFlicker);
+        desc.nrLayersSizePolicy.push_back(n.sizePolicy);
+        desc.nrLayersProtection.push_back(ProtectionSettings{});
+    }
+    // Protection is a single list stage after the complete NR stack.
+    if(!desc.nrLayersProtection.empty())desc.nrLayersProtection.back()=settings.protection;
+}
+// Stage selection for one graph build. Preview and export used to fill the
+// EnhanceGraphDesc in five separate places with slightly different formulas;
+// every build now goes through describeStages() so the rules live in one spot.
+// Anti-aliasing by parameter ordinal. An ordinal the settings do not hold is the
+// disabled default, so a description never carries a stale instance.
+inline void describeAntiAlias(const EnhancementSettings& settings,pipeline::EnhanceGraphDesc& desc){
+    desc.antiAlias[0]=settings.antiAlias;
+    for(uint32_t i=1;i<kMaxAntiAliasInstances;++i)
+        desc.antiAlias[i]=i-1<settings.additionalAntiAliasCount?settings.additionalAntiAlias[i-1]:AntiAliasSettings{};
+}
+// Beauty by parameter ordinal, like anti-aliasing; the detection values are the chain's.
+inline void describeBeauty(const EnhancementSettings& settings,pipeline::EnhanceGraphDesc& desc){
+    desc.beauty[0]=settings.beauty;
+    for(uint32_t i=1;i<kMaxBeautyInstances;++i)
+        desc.beauty[i]=i-1<settings.additionalBeautyCount?settings.additionalBeauty[i-1]:BeautySettings{};
+    desc.beautyDetection=settings.beautyDetection;
+}
+
+struct StageRequest {
+    bool nr=false,sr=false,fg=false;
+    uint32_t fgMultiplier=2;
+    uint32_t width=0,height=0;
+    bool stillImage=false;   // image preview/processing: no NR-first order
+    bool exportJob=false;    // selected NR size, bounded AMD NR, no present-sink FG/NR-first order
+    bool nvidiaAdapter=true;
+    bool amdNr=false;        // AMD adapter: NR runs on the lmxxf runtime (no NGX)
+    // Raw capture-card or screen frames: nothing compressed for native-size RTX Video SR to repair.
+    bool uncompressedSource=false;
+    const ChainRuntimeOrder* nodeOrder=nullptr; // paired with this settings transaction
+};
+
+// Double SR (user 2026-11-08): each pass uses DLSS SR, FSR or any RTX Video SR
+// family. It runs where both passes' backends exist - FSR on every adapter, the
+// others on NVIDIA - and not on a still image with an FSR pass (FSR skips still
+// images). Otherwise the base keeps its single pass, saved second fields intact.
+inline bool dualSrRuns(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false){
+    const auto runs=[nvidiaAdapter](uint32_t quality){return nvidiaAdapter||quality==kVideoSrFsr;};
+    return s.dualSrEnabled&&runs(s.videoSrQuality)&&runs(s.dualSrQuality)&&
+        !(stillImage&&(s.videoSrQuality==kVideoSrFsr||s.dualSrQuality==kVideoSrFsr));
+}
+inline pipeline::SrPrescale runningSrPrescale(const EnhancementSettings& s,bool nvidiaAdapter,bool stillImage=false){
+    return dualSrRuns(s,nvidiaAdapter,stillImage)?s.srPrescale:pipeline::SrPrescale::Off;
+}
+// Supersampling (user 2026-10-28): one RTX Video SR pass evaluates at its target
+// and the result is area-shrunk into srOutput before every later effect. Double
+// SR has its own second target, so the shrink is inactive there.
+inline pipeline::SrOutput runningSrOutput(const EnhancementSettings& s,bool nvidiaAdapter){
+    return nvidiaAdapter&&rtxVideoSr(s.videoSrQuality)&&!s.dualSrEnabled?s.srOutput:pipeline::SrOutput::Target;
+}
+
+// Fills the stage, size and parameter fields of `desc` from `settings`.
+// Source-format fields (hdrInput, rgbInput, packedInput, ...), hdrOutput and
+// host hooks are left untouched: the caller owns those.
+inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const EnhancementSettings& savedSettings,
+                                               pipeline::EnhanceGraphDesc& desc) {
+    desc.fixedExecutionPlan.reset();desc.fixedExecutionPlanError.clear();
+    desc.runtimeNodeOrder=request.nodeOrder!=nullptr;
+    if(savedSettings.nrLayerCount>savedSettings.nrLayers.size()||savedSettings.additionalColorCount>savedSettings.additionalColors.size()||
+       savedSettings.additionalAntiAliasCount>savedSettings.additionalAntiAlias.size()||
+       savedSettings.additionalBeautyCount>savedSettings.additionalBeauty.size()){
+        desc.fixedExecutionPlanError="too many runtime chain instances";return {};
+    }
+    std::optional<EnhancementSettings> exportSettings;
+    if(request.exportJob)exportSettings=freezeExportSettings(savedSettings);
+    const auto& settings=exportSettings?*exportSettings:savedSettings;
+    auto chain=toChain(settings);
+    bool lowLatency=!request.exportJob&&settings.lowLatency&&request.nr;
+    if(request.nodeOrder){
+        const auto restored=restoreRuntimeOrder(settings,*request.nodeOrder,chain);
+        if(!restored.accepted){desc.fixedExecutionPlanError=restored.message;return {};}
+        uint32_t nr=chain.nodeCount,sr=chain.nodeCount;
+        for(uint32_t i=0;i<chain.nodeCount;++i){
+            if(!chain.nodes[i].enabled)continue;
+            if(chain.nodes[i].type==EffectType::NrEnhance&&nr==chain.nodeCount)nr=i;
+            if(chain.nodes[i].type==EffectType::SuperResolution)sr=i;
+        }
+        lowLatency=request.nr&&nr<sr&&sr<chain.nodeCount;
+        if(lowLatency&&(request.stillImage||request.exportJob)){
+            desc.fixedExecutionPlanError="node NR-before-SR offline execution requires ordered dispatcher";return {};
+        }
+    }
+    const bool boundedAmd=request.exportJob&&!request.stillImage&&request.amdNr&&
+        currentNrRuntime(settings.nrRuntime)==NrRuntime::LmxxfAmd;
+    const auto policy=request.exportJob?exportNrSizePolicy(settings.nrRuntime,settings.nrPolicy):settings.nrPolicy;
+    const auto srPrescale=runningSrPrescale(settings,request.nvidiaAdapter,request.stillImage);
+    const auto srOutput=runningSrOutput(settings,request.nvidiaAdapter);
+    if(!pipeline::Extent{request.width,request.height}.valid()||!pipeline::validSrTarget(settings.srTarget)||
+       !pipeline::validNrSizePolicy(policy)||!pipeline::validSrPrescale(srPrescale)||!pipeline::validSrOutput(srOutput)){
+        // ResolutionPlan::make throws for these inputs. Report the same
+        // invalid contract before any graph allocation, including on reuse.
+        desc.fixedExecutionPlanError="invalid fixed-plan source extent, SR target or NR size policy";
+        return {};
+    }
+    // Preserve the existing offline base/flow/output contract. AMD keeps its
+    // existing 1080p guidance budget independently of the selected NR layer.
+    auto plan=pipeline::ResolutionPlan::make({request.width,request.height},request.sr,
+        boundedAmd?pipeline::NrSizePolicy::Realtime:policy,
+        (request.stillImage||request.exportJob)&&!boundedAmd,settings.revision,settings.srTarget,lowLatency,
+        request.amdNr&&currentNrRuntime(settings.nrRuntime)==NrRuntime::LmxxfAmd?1080u:0u,srPrescale,srOutput,
+        dualSrRuns(settings,request.nvidiaAdapter,request.stillImage),settings.dualSrTarget);
+    if(request.exportJob&&!request.stillImage)
+        plan.nr=exportNrProcessingExtent(plan.base,settings.nrRuntime,policy);
+    desc.sourceWidth=request.width;desc.sourceHeight=request.height;
+    desc.workWidth=plan.base.width;desc.workHeight=plan.base.height;
+    desc.srInputWidth=plan.srInput.width;desc.srInputHeight=plan.srInput.height;
+    desc.srOutputWidth=plan.srOutput.width;desc.srOutputHeight=plan.srOutput.height;
+    desc.dualSr=plan.dualSrApplied;desc.dualSrQuality=settings.dualSrQuality;
+    desc.firstSrWidth=plan.firstSrOutput.width;desc.firstSrHeight=plan.firstSrOutput.height;
+    desc.nrWidth=plan.nr.width;desc.nrHeight=plan.nr.height;
+    desc.flowWidth=plan.flow.width;desc.flowHeight=plan.flow.height;
+    // Standard RTX Video SR can restore compressed video at its original resolution
+    // (the Video Effects families only enlarge).
+    // ResolutionPlan::srApplied describes enlargement, not SDK execution. Raw capture has
+    // no compression artifacts: there a source already at the target skips SR as in 2.0.6
+    // (5090 field log 57: 4K->4K VSR cost ~8.7 ms a frame and pushed 60 fps over budget).
+    const bool nativeVideoRestore=request.sr&&!request.stillImage&&!request.uncompressedSource&&request.nvidiaAdapter&&
+        ngxVideoSr(settings.videoSrQuality);
+    desc.enableSr=(plan.srApplied||nativeVideoRestore)&&(request.nvidiaAdapter||settings.videoSrQuality==kVideoSrFsr);
+    desc.enableNr=request.nr&&(request.nvidiaAdapter||request.amdNr)&&(!settings.nrLayerCount||settings.activeNrLayerCount()>0);
+    desc.nrBeforeSr=!request.stillImage&&!request.exportJob&&lowLatency&&desc.enableNr&&desc.enableSr;
+    desc.enableNvofStandalone=desc.enableNr;
+    const bool temporalMotion=settings.usesNrTemporal();
+    desc.enableNvofStandalone=desc.enableNr&&(motionUsesFlow(settings.nrMotion)||temporalMotion);
+    desc.enableFg=request.fg&&(request.exportJob
+        ? exportFrameGenerationSupported(settings.frameGenerationBackend,request.nvidiaAdapter)
+        : request.nvidiaAdapter||crossVendorFrameGeneration(settings.frameGenerationBackend));
+    desc.fgMultiplier=request.fgMultiplier;
+    desc.videoSrQuality=settings.videoSrQuality;
+    desc.dlssSrModel=settings.dlssSrModel;
+    describeNrLayers(settings,desc);
+    desc.frameGenerationBackend=settings.frameGenerationBackend;
+    desc.vfgQuality=settings.vfgQuality;
+    desc.color=settings.color;
+    desc.additionalColors=settings.additionalColors;
+    desc.additionalColorCount=settings.additionalColorCount;
+    describeAntiAlias(settings,desc);
+    describeBeauty(settings,desc);
+    // A still picture or an export frame is judged on its own faces, never on a
+    // detection that is a few frames old.
+    // An export never writes a file that silently lacks a selected effect.
+    desc.beautyRequireDetector=request.exportJob;
+    desc.videoHdr=settings.videoHdr;
+    // Custom: static HDR output tuning (present blit curve + display metadata).
+    desc.hdrCurve=settings.hdrCurve;
+    desc.hdrMetadata=settings.hdrMetadata;
+    // Custom: the Dolby Vision follow rides with the curve. Every graph build goes
+    // through this function, so without it a rebuild (source open, backend
+    // recovery) silently dropped the switch while the curve survived.
+    desc.doviFollow=settings.doviFollow;
+    desc.doviFollowAverage=settings.doviFollowAverage;
+    desc.hdrOutputMode=settings.hdrOutputMode;
+    desc.fgMotion=settings.fgMotion;desc.srMotion=settings.srMotion;desc.nrMotion=settings.nrMotion;
+    desc.settingsRevision=settings.revision;
+    desc.flowQuality=settings.flow;
+    desc.contentRate=settings.content;
+    desc.opticalFlowBackend=settings.opticalFlowBackend;
+    desc.amdFlowHalfResolution=settings.amdFlowHalfResolution;desc.fgMotionRefine=settings.fgMotionRefine;desc.dlssgLite=settings.dlssgLite;desc.vfgAutoRegulate=settings.vfgAutoRegulate;desc.hudLock=settings.hudLock;
+    desc.nrLayersExtent.clear();
+    for(uint32_t i=0;i<chain.nodeCount;++i){
+        auto& node=chain.nodes[i];
+        // Request flags are authoritative for the legacy flat API. Retain a
+        // resolution step even when AI SR is unavailable: the existing graph
+        // still performs its ordinary source-to-work resize in that slot.
+        if(node.type==EffectType::SuperResolution)node.enabled=request.sr;
+        if(node.type==EffectType::NrEnhance)
+            node.enabled=desc.enableNr&&(!settings.nrLayerCount||node.enabled);
+        if(node.type==EffectType::Protection)node.enabled=node.enabled&&desc.enableNr;
+        if(node.type==EffectType::FrameGeneration)node.enabled=desc.enableFg;
+    }
+    ChainExecutionPlan execution;
+    const auto validation=compileChainExecutionPlan(chain,{{request.width,request.height},settings.srTarget,
+        request.stillImage,request.exportJob,boundedAmd,desc.dualSr?srPrescale:pipeline::SrPrescale::Off,
+        desc.dualSr?pipeline::SrOutput::Target:srOutput,desc.dualSr,settings.dualSrTarget},execution);
+    if(!validation.accepted){desc.fixedExecutionPlanError=validation.message;return plan;}
+    if(request.nodeOrder){
+        // Node order owns the first NR stage, even for an ordinary resize or
+        // same-size SR bypass. Each NR resource keeps its own compiled input.
+        uint32_t firstNr=execution.stepCount,firstSr=execution.stepCount;
+        for(uint32_t i=0;i<execution.stepCount;++i){
+            if(execution.steps[i].type==EffectType::NrEnhance&&firstNr==execution.stepCount)firstNr=i;
+            if(execution.steps[i].type==EffectType::SuperResolution)firstSr=i;
+        }
+        desc.nrBeforeSr=desc.enableNr&&firstSr<execution.stepCount&&firstNr<firstSr;
+    }
+    for(uint32_t i=0;i<execution.stepCount;++i)
+        if(execution.steps[i].type==EffectType::NrEnhance)desc.nrLayersExtent.push_back(execution.steps[i].processing);
+    // Preserve disabled-stage diagnostic dimensions; these allocate no NR
+    // feature. Active NR extents now come exclusively from the compiled plan.
+    if(!desc.enableNr)for(const auto size:desc.nrLayersSizePolicy){
+        desc.nrLayersExtent.push_back(request.exportJob&&!request.stillImage?
+            exportNrProcessingExtent(plan.base,settings.nrRuntime,size):
+            pipeline::ResolutionPlan::make({request.width,request.height},request.sr,size,request.stillImage,
+            settings.revision,settings.srTarget,lowLatency,
+                request.amdNr&&currentNrRuntime(settings.nrRuntime)==NrRuntime::LmxxfAmd?1080u:0u,srPrescale,srOutput,
+                desc.dualSr,settings.dualSrTarget).nr);
+    }
+    desc.fixedExecutionPlan=execution;
+    return plan;
+}
+}

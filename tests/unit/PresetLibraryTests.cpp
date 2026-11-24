@@ -1,0 +1,1510 @@
+// PresetLibrary: one store for chain/colour/frame-generation/audio content,
+// with per-preset contents, built-ins, and safe migration from the old stores.
+#include "veyra/engine/PresetLibrary.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string_view>
+
+using namespace veyra::engine;
+
+namespace {
+int failures = 0;
+void check(bool ok, const char* label) {
+    std::printf("%s %s\n", ok ? "PASS" : "FAIL", label);
+    if (!ok) ++failures;
+}
+std::filesystem::path scratch(const wchar_t* name) {
+    // Sidecars belong to this invocation only, including after a failed test.
+    struct ScratchDirectory {
+        std::filesystem::path path;
+        ScratchDirectory() {
+            const auto parent=std::filesystem::temp_directory_path();
+            const auto stamp=std::chrono::steady_clock::now().time_since_epoch().count();
+            for(unsigned attempt=0;;++attempt){
+                path=parent/(L"veyra-preset-library-tests-"+std::to_wstring(stamp)+L"-"+std::to_wstring(attempt));
+                if(std::filesystem::create_directory(path))break;
+            }
+        }
+        ~ScratchDirectory(){std::error_code ec;std::filesystem::remove_all(path,ec);}
+    };
+    static const ScratchDirectory dir;
+    auto path = dir.path / name;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return path;
+}
+EnhancementSettings sample() {
+    EnhancementSettings s;
+    s.nr = true; s.sr = true; s.multiplier = 4; s.color.enabled = true; s.color.exposure = 0.5f;
+    s.videoHdr.enabled = true; s.model.intensity = 0.6f; s.audioOffsetMs = 25;
+    s.audioSync = AudioSyncMode::Manual; s.exportBitrateMbps = 77; s.captureCompatible = true;
+    return s;
+}
+std::string readBytes(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(file), {});
+}
+// A legacy node header used the identical linear payload as list mode.
+// Change only the two mode fields, leaving all original serialized parameters.
+std::string legacyNodeLine(std::string line) {
+    std::istringstream input(line); std::string name, note; int value;
+    input >> std::quoted(name) >> std::quoted(note) >> std::ws;
+    const auto kind = size_t(input.tellg());
+    for (int i = 0; i < 8; ++i) input >> value;
+    input >> std::ws; const auto mode = size_t(input.tellg());
+    if (!input || kind >= line.size() || mode >= line.size()) return {};
+    line[kind] = line[mode] = '1'; return line;
+}
+} // namespace
+
+__declspec(noinline) void testNodeEditorSession() {
+    const auto path = scratch(L"node-editor-session.v1");
+    const auto sidecar = std::filesystem::path(path).concat(L".p3-editor");
+    std::filesystem::remove(sidecar);
+    auto session = std::make_unique<ChainSession>(ChainSession::initial(sample()));
+    check(session->select(ChainMode::Node), "editor session: initialize node mode");
+    ChainSessionStore writer(path);
+    check(writer.save(*session), "editor session: save original v1 rollback file");
+    const auto original = readBytes(path);
+    auto& configuration = session->configurations[1];
+    auto document = std::make_shared<NodeEditorDocument>();
+    document->nodes = configuration.chain;
+    check(document->layout.initialize(document->nodes).accepted, "editor session: initialize stable IDs");
+    uint32_t sourceId = 0;
+    for (uint32_t i = 0; i < document->nodes.nodeCount; ++i)
+        if (document->nodes.nodes[i].type == EffectType::Color) sourceId = document->layout.ids[i];
+    uint32_t copiedId = 0;
+    check(document->layout.duplicate(document->nodes, sourceId, copiedId).accepted,
+          "editor session: create detached enabled color copy");
+    auto& color = document->nodes.nodes[document->layout.indexOf(document->nodes, copiedId)].color;
+    color.exposure = 1.375f; color.mixerHue[2] = 17.5f; color.grading[1].hue = 215;
+    color.grading[1].saturation = 25; color.curves[0].points[1].y = 0.75f;
+    color.lutStrength = 37.5f; color.setLutName(L"saved-copy.cube");
+    check(document->layout.disconnect(document->nodes, NodeGraphLayout::Input).accepted,
+          "editor session: deliberately incomplete input wire");
+    configuration.editor = document;
+    configuration.selectedColour = document->layout.indexOf(document->nodes, copiedId);
+    check(uint32_t(configuration.selectedColour) >= configuration.chain.nodeCount,
+          "editor session: selected detached copy is absent from runtime");
+    check(session->valid() && writer.save(*session),
+          "editor session: incomplete document saves alongside last accepted runtime");
+    check(readBytes(path) == original && readBytes(sidecar).starts_with("VEYRA_CHAIN_SESSION 2"),
+          "editor session: new schema sidecar never overwrites v1 file");
+    auto restored = std::make_unique<ChainSession>(ChainSession::initial({}));
+    ChainSessionStore reopened(path);
+    check(reopened.load(*restored) && *restored == *session,
+          "editor session: fresh reader restores IDs edges enabled states and complete payloads");
+    check(restored->configurations[1].chain == configuration.chain &&
+          restored->configurations[1].editor && restored->configurations[1].editor.get() != document.get(),
+          "editor session: accepted runtime retained and restored snapshot is independent");
+    auto projection = std::make_unique<EffectChain>(configuration.chain);
+    check(!document->layout.project(document->nodes, *projection).accepted && *projection == configuration.chain,
+          "editor session: reloaded partial graph must not replace runtime");
+    const auto validBytes = readBytes(sidecar);
+    // Faults: duplicate ID, dangling edge, detached cycle, merge, and an
+    // duplicate singleton Protection node, including when detached.
+    for (int fault = 0; fault < 5; ++fault) {
+        auto damaged = std::make_unique<ChainSession>(*session);
+        auto graph = std::make_shared<NodeEditorDocument>(*document);
+        damaged->configurations[1].editor = graph;
+        const auto detached = graph->layout.indexOf(graph->nodes, copiedId);
+        if (fault == 0) graph->layout.ids[1] = graph->layout.ids[0];
+        if (fault == 1) graph->layout.next[0] = graph->layout.nextId + 100;
+        if (fault == 2) graph->layout.next[detached] = copiedId;
+        if (fault == 3) {
+            graph->layout.next[detached] = graph->layout.ids[0];
+            graph->layout.inputNext = graph->layout.ids[0];
+        }
+        if (fault == 4) graph->nodes.nodes[detached].type = EffectType::Protection;
+        check(!writer.save(*damaged) && readBytes(sidecar) == validBytes, __FUNCTION__);
+        // The duplicate singleton is rejected without rewriting either document.
+        if (fault == 4) continue;
+        std::istringstream source(validBytes);
+        std::string headers[4], runtimeBody, editorBody;
+        for (auto& line : headers) std::getline(source, line);
+        source >> std::quoted(runtimeBody);
+        uint32_t oldNextId, oldInput, oldCount;
+        source >> oldNextId >> oldInput >> oldCount;
+        for (uint32_t i = 0; i < oldCount; ++i) {
+            uint32_t oldId, oldEdge; int oldFlag;
+            source >> oldId >> oldEdge >> oldFlag;
+        }
+        source >> std::quoted(editorBody);
+        check(bool(source) && oldCount == graph->nodes.nodeCount, __FUNCTION__);
+        std::ostringstream bytes;
+        for (const auto& line : headers) bytes << line << char(10);
+        bytes << std::quoted(runtimeBody) << char(10);
+        bytes << graph->layout.nextId << ' ' << graph->layout.inputNext << ' ' << oldCount << char(10);
+        for (uint32_t i = 0; i < oldCount; ++i)
+            bytes << graph->layout.ids[i] << ' ' << graph->layout.next[i] << ' ' << graph->nodes.nodes[i].enabled << char(10);
+        bytes << std::quoted(editorBody) << char(10);
+        const auto damagedBytes = bytes.str();
+        auto retained = std::make_unique<ChainSession>(*session);
+        { std::ofstream file(sidecar, std::ios::binary | std::ios::trunc); file << damagedBytes; }
+        ChainSessionStore reader(path);
+        check(!reader.load(*retained) && *retained == *session && !reader.save(*session) &&
+              readBytes(sidecar) == damagedBytes && readBytes(path) == original, __FUNCTION__);
+        { std::ofstream file(sidecar, std::ios::binary | std::ios::trunc); file << validBytes; }
+    }
+    { std::ofstream file(sidecar, std::ios::binary | std::ios::trunc); file << validBytes; }
+    auto invalid = std::make_unique<ChainSession>(*session);
+    invalid->configurations[1].selectedColour = int(document->nodes.nodeCount);
+    check(!writer.save(*invalid) && readBytes(sidecar) == validBytes,
+          "editor session: out of editor range selection rejected atomically");
+    invalid->configurations[1].selectedColour = configuration.selectedNr;
+    if (configuration.selectedNr >= 0)
+        check(!writer.save(*invalid) && readBytes(sidecar) == validBytes,
+              "editor session: wrong selected node type rejected atomically");
+    *invalid = *session;
+    auto invalidDocument = std::make_shared<NodeEditorDocument>(*document);
+    invalidDocument->layout.ids[1] = invalidDocument->layout.ids[0];
+    invalid->configurations[1].editor = invalidDocument;
+    check(!writer.save(*invalid) && readBytes(sidecar) == validBytes && readBytes(path) == original,
+          "editor session: duplicate-ID save rejected atomically");
+    invalidDocument->layout = document->layout;
+    invalidDocument->nodes.nodes[0].color.exposure = 9999;
+    check(!writer.save(*invalid) && readBytes(sidecar) == validBytes,
+          "editor session: invalid detached parameters cannot overwrite session");
+    { std::ofstream file(sidecar, std::ios::binary | std::ios::trunc); file << validBytes << "unexpected"; }
+    ChainSessionStore corrupt(path);
+    check(!corrupt.load(*restored) && *restored == *session && !corrupt.save(*session),
+          "editor session: corrupt sidecar retained without falling back or half-loading");
+    std::filesystem::remove(sidecar);
+}
+
+__declspec(noinline) void testLegacyProtectionMigration() {
+    for (int position : {1, 2, 4, 6}) for (bool enabled : {false, true}) {
+        const auto path = scratch(L"legacy-protection-library.v1");
+        const auto sidecar = std::filesystem::path(path).concat(L".p3-node");
+        std::filesystem::remove(sidecar);
+        PresetLibrary writer(path); writer.load();
+        auto settings = sample(); settings.protection.enabled = enabled; settings.nrLayerCount = 4;
+        PresetEntry entry; entry.name = L"legacy-protection"; entry.chain = toChain(settings); entry.color = settings.color;
+        entry.chain.nodes[2].viewX = 481; entry.chain.nodes[2].nr.model.tone = .37f;
+        auto& fixture = entry.chain;
+        uint32_t index = 0;
+        while (fixture.nodes[index].type != EffectType::Protection) ++index;
+        const auto protection = fixture.nodes[index];
+        for (uint32_t i = index; i > uint32_t(position); --i) fixture.nodes[i] = fixture.nodes[i - 1];
+        fixture.nodes[position] = protection;
+        auto expected = fixture; expected.mode = ChainMode::Node;
+        check(writer.put(entry), "create historical library fixture through list serializer");
+        auto legacy = readBytes(path); const auto start = legacy.find("\"legacy-protection\"");
+        const auto end = legacy.find('\n', start);
+        legacy.replace(start, end - start, legacyNodeLine(legacy.substr(start, end - start)));
+        { std::ofstream file(path, std::ios::binary | std::ios::trunc); file << legacy; }
+        PresetLibrary migrated(path);
+        check(migrated.load() && migrated.error().empty(), "legacy node library loads without deleting protection");
+        const auto& restored = migrated.entries().back().chain;
+        check(restored == expected && restored.mode == ChainMode::Node && restored.countOf(EffectType::Protection) == 1 &&
+              restored.firstOf(EffectType::NrEnhance)->viewX == 481 &&
+              restored.firstOf(EffectType::NrEnhance)->nr.model.tone == .37f,
+              "library retains protection payload, layout and other parameters");
+        check(migrated.save() && !std::filesystem::exists(sidecar),
+              "saving a legacy node no longer creates a protection-removal sidecar");
+        PresetLibrary reopened(path);
+        check(reopened.load() && reopened.entries() == migrated.entries(), "restart prefers validated migrated library");
+    }
+    {
+        const auto path = scratch(L"legacy-protection-session.v1");
+        const auto sidecar = std::filesystem::path(path).concat(L".p3-node");
+        std::filesystem::remove(sidecar);
+        auto settings = sample(); settings.protection.enabled = true;
+        auto session = ChainSession::initial(settings); session.select(ChainMode::Node);
+        session.configurations[0].chain.nodes[2].viewX = 731;
+        ChainSessionStore writer(path); check(writer.save(session), "create session migration fixture");
+        std::istringstream input(readBytes(path));
+        std::string headers[4], body; for (auto& line : headers) std::getline(input, line); input >> std::quoted(body);
+        std::istringstream records(body); std::string magic, count, list, node;
+        std::getline(records, magic); std::getline(records, count); std::getline(records, list); std::getline(records, node);
+        node = list; node.replace(1, 4, "node"); node = legacyNodeLine(node);
+        body = magic + '\n' + count + '\n' + list + '\n' + node + '\n';
+        std::ostringstream bytes; for (const auto& line : headers) bytes << line << '\n'; bytes << std::quoted(body) << '\n';
+        const auto legacy = bytes.str();
+        { std::ofstream file(path, std::ios::binary | std::ios::trunc); file << legacy; }
+        ChainSessionStore migrated(path); auto restored = ChainSession::initial({});
+        check(migrated.load(restored) && migrated.error().empty(), "legacy session keeps its protection nodes");
+        check(restored.configurations[0].chain == session.configurations[0].chain &&
+              restored.configurations[1].chain.countOf(EffectType::Protection) == 1 &&
+              restored.configurations[1].chain.firstOf(EffectType::NrEnhance)->viewX == 731,
+              "session keeps list protection and node protection independent");
+        check(migrated.save(restored) && !std::filesystem::exists(sidecar),
+              "session saving does not silently strip the node mask");
+        ChainSessionStore reopened(path); auto restarted = ChainSession::initial({});
+        check(reopened.load(restarted) && restarted == restored, "new session process selects migrated sidecar");
+    }
+}
+
+
+// 2.0 (2026-09-29): the new interface ships no built-in presets, and a single
+// preset round-trips through a standalone file; an import never overwrites.
+void testNoBuiltinsAndSingleFile() {
+    const auto path = scratch(L"no-builtins.v1");
+    {
+        PresetLibrary withBuiltins(path);
+        check(withBuiltins.load() && withBuiltins.entries().size() == 4, "no-builtins: default library still has 4 built-ins");
+        PresetEntry mine; mine.name = L"mine"; mine.chain = toChain(sample());
+        check(withBuiltins.put(mine) && withBuiltins.setDefault(0) && withBuiltins.save(), "no-builtins: file with built-ins, default on a built-in");
+    }
+    PresetLibrary lib(path);
+    lib.setIncludeBuiltins(false);
+    check(lib.load(), "no-builtins: load");
+    check(lib.entries().size() == 1 && lib.entries()[0].name == L"mine" && !lib.entries()[0].builtin,
+          "no-builtins: built-in entries in the file are dropped, the user's own kept");
+    check(!lib.defaultIndex().has_value(), "no-builtins: a default that pointed at a built-in is cleared");
+    const auto file = scratch(L"single.vpreset");
+    check(lib.exportEntry(0, file) && std::filesystem::file_size(file) > 0, "single file: export");
+    std::wstring name;
+    check(lib.importFile(file, name) && name == L"mine 2" && lib.entries().size() == 2,
+          "single file: import of an existing name gets a numbered suffix");
+    check(lib.entries()[1].chain == lib.entries()[0].chain, "single file: imported chain equals the exported one");
+    { std::ofstream bad(file, std::ios::binary | std::ios::trunc); bad << "not a preset"; }
+    check(!lib.importFile(file, name) && lib.entries().size() == 2, "single file: a damaged file is refused, nothing added");
+    PresetLibrary empty(scratch(L"no-builtins-empty.v1"));
+    empty.setIncludeBuiltins(false);
+    check(empty.load() && empty.entries().empty(), "no-builtins: a fresh library starts empty");
+}
+
+__declspec(noinline) int testExistingPresets() {
+    // An editor preset must not canonicalise a hand-ordered chain. Exercise
+    // every contents combination, not just full presets or single grades.
+    {
+        auto baseSettings = sample();
+        baseSettings.additionalColorCount = 1;
+        baseSettings.additionalColors[0].enabled = true;
+        baseSettings.additionalColors[0].exposure = -0.75f;
+        auto base = toChain(baseSettings); base.mode = ChainMode::Node;
+        removeLegacyNodeProtection(base);
+        std::rotate(base.nodes.begin() + 1, base.nodes.begin() + 2, base.nodes.begin() + 4);
+        for (uint32_t i = 0; i < base.nodeCount; ++i) {
+            base.nodes[i].viewX = 37.0f + i * 113.0f;
+            base.nodes[i].viewY = 19.0f + i * 7.0f;
+        }
+        fromChain(base, baseSettings);
+        auto saved = sample(); saved.additionalColorCount = 5;
+        for (unsigned i = 0; i < 5; ++i) {
+            saved.additionalColors[i].enabled = i != 2;
+            saved.additionalColors[i].exposure = 0.2f * (i + 1);
+        }
+        saved.model.intensity = 0.33f; saved.color.exposure = 1.2f;
+        PresetEntry entry; entry.kind = ChainMode::Node;
+        entry.chain = toChain(saved); entry.chain.mode = ChainMode::Node;
+        removeLegacyNodeProtection(entry.chain);
+        entry.color = saved.color; entry.fg = {2, FrameGenerationBackend::XeSS};
+        entry.audioSync = AudioSyncMode::Manual; entry.audioOffsetMs = 73;
+        for (uint32_t i = 0; i < entry.chain.nodeCount; ++i) entry.chain.nodes[i].viewX = 800 + i * 31.0f;
+        bool masks = true, geometry = true, unrelated = true;
+        for (uint32_t mask = 0; mask <= kPresetLegacyContent; ++mask) {
+            entry.contents = mask; auto chain = base; auto settings = baseSettings;
+            auto expected = settings; PresetLibrary::apply(entry, expected);
+            const auto result = PresetLibrary::applyToChain(entry, chain, settings);
+            masks = masks && result.accepted && settings.color == expected.color &&
+                settings.additionalColorCount == expected.additionalColorCount &&
+                settings.additionalColors == expected.additionalColors &&
+                settings.multiplier == expected.multiplier &&
+                settings.frameGenerationBackend == expected.frameGenerationBackend &&
+                settings.audioOffsetMs == expected.audioOffsetMs && settings.audioSync == expected.audioSync;
+            unrelated = unrelated && settings.exportBitrateMbps == baseSettings.exportBitrateMbps &&
+                settings.captureCompatible == baseSettings.captureCompatible;
+            if (!(mask & presetContentMask(PresetContent::Chain))) {
+                for (uint32_t i = 0; i < base.nodeCount; ++i) {
+                    if (base.nodes[i].type == EffectType::Color) continue;
+                    const auto* actual = chain.firstOf(base.nodes[i].type);
+                    auto want = base.nodes[i];
+                    if (want.type == EffectType::FrameGeneration &&
+                        (mask & presetContentMask(PresetContent::FrameGeneration))) want.enabled = entry.fg.multiplier > 1;
+                    geometry = geometry && actual && *actual == want;
+                }
+                geometry = geometry && chain.nodes[0].viewX == base.nodes[0].viewX &&
+                    chain.nodes[3].type == EffectType::Color && chain.nodes[3].viewX == base.nodes[3].viewX;
+            } else if (mask & presetContentMask(PresetContent::Color)) {
+                for (uint32_t i = 0; i < chain.nodeCount; ++i)
+                    geometry = geometry && chain.nodes[i].type == entry.chain.nodes[i].type &&
+                        chain.nodes[i].viewX == entry.chain.nodes[i].viewX;
+            }
+            if (mask == presetContentMask(PresetContent::Audio))
+                geometry = geometry && chain == base && settings == expected;
+        }
+        check(masks, "all 16 editor content masks preserve legacy settings semantics and six grades");
+        check(geometry, "partial presets preserve hand order/layout and full presets restore saved layout");
+        check(unrelated, "editor presets do not overwrite capture or export settings");
+
+        entry.contents = presetContentMask(PresetContent::Color);
+        auto chain = base; auto settings = baseSettings;
+        check(PresetLibrary::applyToChain(entry, chain, settings).accepted && chain.countOf(EffectType::Color) == 6,
+              "colour-only can expand existing interleaved slots to six");
+        entry.chain = toChain(sample()); entry.chain.mode = ChainMode::Node;
+        removeLegacyNodeProtection(entry.chain);
+        check(PresetLibrary::applyToChain(entry, chain, settings).accepted && chain.countOf(EffectType::Color) == 1 &&
+              chain.firstOf(EffectType::NrEnhance)->viewX == base.firstOf(EffectType::NrEnhance)->viewX,
+              "colour-only can remove surplus grades without moving unrelated nodes");
+        entry.contents = presetContentMask(PresetContent::Chain);
+        chain = base; settings = baseSettings;
+        check(PresetLibrary::applyToChain(entry, chain, settings).accepted && chain.countOf(EffectType::Color) == 2 &&
+              settings.additionalColors == baseSettings.additionalColors,
+              "chain-only keeps every current grade even when saved topology has fewer slots");
+
+        entry.contents = kPresetLegacyContent; entry.kind = ChainMode::List;
+        chain = base; settings = baseSettings;
+        check(!PresetLibrary::applyToChain(entry, chain, settings).accepted && chain == base && settings == baseSettings,
+              "wrong preset mode rejects without mutation");
+        entry.kind = ChainMode::Node; entry.contents = presetContentMask(PresetContent::Color);
+        // Enabling a currently disabled colour slot after HDR is illegal.
+        entry.chain = toChain(baseSettings); entry.chain.mode = ChainMode::Node;
+        removeLegacyNodeProtection(entry.chain);
+        auto invalidBase = base;
+        std::swap(invalidBase.nodes[3], invalidBase.nodes[4]);
+        invalidBase.nodes[4].enabled = false;
+        fromChain(invalidBase, settings); const auto beforeSettings = settings; chain = invalidBase;
+        check(validateChain(chain).accepted && !PresetLibrary::applyToChain(entry, chain, settings).accepted &&
+              chain == invalidBase && settings == beforeSettings,
+              "colour activation that violates HDR tail order rejects atomically");
+    }
+    {
+        const auto path = scratch(L"legacy-single-color.v1");
+        auto settings = sample();
+        PresetEntry entry; entry.name = L"legacy-color";
+        entry.chain = toChain(settings); entry.color = settings.color;
+        entry.chain.nodes[0].viewX = 213;
+        PresetLibrary writer(path);
+        check(writer.load() && writer.put(entry), "legacy single-colour preset saves");
+        std::ifstream file(path); std::string magic; int version = 0; file >> magic >> version;
+        check(version == 1, "compatibility fixture really uses codec v1");
+        PresetLibrary reader(path);
+        check(reader.load(), "fresh library reads legacy single-colour preset");
+        const auto& restored = reader.entries().back();
+        const auto* color = restored.chain.firstOf(EffectType::Color);
+        check(color && color->color == entry.color, "v1 chain carries full legacy colour payload");
+        auto applied = EnhancementSettings{}; fromChain(restored.chain, applied);
+        check(applied.color == entry.color && restored.chain.nodes[0].viewX == 213,
+              "direct legacy chain projection preserves colour and layout");
+    }
+    // 1. Built-ins exist before anything is saved, and are read-only.
+    {
+        const auto path = scratch(L"builtins.v1");
+        PresetLibrary library(path);
+        check(library.load(), "load succeeds when the file is missing");
+        check(library.entries().size() == 4, "four built-in presets are present");
+        bool allBuiltin = true;
+        for (const auto& e : library.entries()) allBuiltin = allBuiltin && e.builtin;
+        check(allBuiltin, "built-ins are flagged read-only");
+        auto original = sample();
+        PresetLibrary::apply(library.entries().front(), original);
+        check(original.multiplier == 1 && !original.nr && !original.sr,
+              "original built-in disables frame generation and enhancement");
+        check(!library.erase(0), "a built-in cannot be erased");
+        check(!library.rename(0, L"改个名"), "a built-in cannot be renamed");
+        check(library.duplicate(0), "a built-in can be duplicated");
+        check(library.entries().size() == 5 && !library.entries()[1].builtin, "the copy is a normal preset");
+    }
+
+    // 2. A preset keeps only the parts it claims.
+    {
+        const auto path = scratch(L"contents.v1");
+        PresetLibrary library(path);
+        library.load();
+        auto settings = sample();
+        PresetEntry chainOnly;
+        chainOnly.name = L"只存链路";
+        chainOnly.contents = presetContentMask(PresetContent::Chain);
+        chainOnly.chain = toChain(settings);
+        check(library.put(chainOnly), "saving a chain-only preset succeeds");
+        if (!library.load()) { std::printf("      parse error: %ls\n", library.error().c_str()); }
+        check(library.load(), "reload succeeds");
+        auto target = sample();
+        target.color.exposure = -1.0f;      // must survive: colour is not in the preset
+        target.additionalColorCount = 1;
+        target.additionalColors[0].exposure = 1.25f;
+        target.audioOffsetMs = -50;          // must survive too
+        PresetLibrary::apply(library.entries().back(), target);
+        check(target.nr == settings.nr && target.sr == settings.sr && target.multiplier == settings.multiplier,
+              "chain-only apply restores the stages");
+        check(target.color.exposure == -1.0f, "chain-only apply leaves the colour grade alone");
+        check(target.additionalColorCount == 1 && target.additionalColors[0].exposure == 1.25f,
+              "chain-only apply leaves additional colour grades alone");
+        check(target.audioOffsetMs == -50, "chain-only apply leaves the audio offset alone");
+    }
+
+    // 3. Full preset round trip through the file.
+    {
+        const auto path = scratch(L"full.v1");
+        PresetLibrary library(path);
+        library.load();
+        auto settings = sample();
+        PresetEntry entry;
+        entry.name = L"全部";
+        entry.note = L"测试";
+        entry.kind = ChainMode::Node;
+        entry.contents = kPresetLegacyContent;
+        entry.chain = toChain(settings);
+        entry.chain.mode = ChainMode::Node;
+        removeLegacyNodeProtection(entry.chain);
+        entry.chain.nodes[2].nr.model.style = 2;
+        entry.chain.nodes[2].nr.temporal = true;
+        entry.color = settings.color;
+        entry.fg = {4, FrameGenerationBackend::Dlss};
+        entry.audioSync = AudioSyncMode::Manual;
+        entry.audioOffsetMs = 25;
+        check(library.put(entry), "saving a full preset succeeds");
+        check(library.load(), "reload succeeds");
+        const auto& loaded = library.entries().back();
+        check(loaded.name == L"全部" && loaded.note == L"测试", "name and note survive");
+        check(loaded.kind == ChainMode::Node && loaded.chain.mode == ChainMode::Node, "the kind survives");
+        check(loaded.contents == kPresetLegacyContent, "the content mask survives");
+        check(loaded.chain.nodeCount == entry.chain.nodeCount, "the node count survives");
+        check(loaded.chain.nodes[2].nr.model.style == 2 && loaded.chain.nodes[2].nr.temporal,
+              "per-layer NR parameters survive");
+        check(loaded.color.exposure == entry.color.exposure, "the colour grade survives");
+        check(loaded.fg.multiplier == 4, "the frame-generation multiplier survives");
+        check(loaded.audioOffsetMs == 25 && loaded.audioSync == AudioSyncMode::Manual, "the audio fields survive");
+        auto target = EnhancementSettings{};
+        target.exportBitrateMbps = 12;
+        PresetLibrary::apply(loaded, target);
+        check(target.exportBitrateMbps == 12, "applying a preset never touches export settings");
+        check(target.captureCompatible == false, "applying a preset never touches capture settings");
+    }
+
+    {
+        PresetLibrary library(scratch(L"six-colors.v2"));
+        check(library.load(), "multi-colour library initializes");
+        auto settings = sample();
+        settings.additionalColorCount = 5;
+        for (unsigned i = 0; i < 5; ++i) {
+            auto& color = settings.additionalColors[i];
+            color.enabled = i != 2;
+            color.exposure = float(i) * 0.25f;
+            color.setLutName(L"independent-" + std::to_wstring(i) + L".cube");
+        }
+        PresetEntry entry; entry.name = L"六调色";
+        entry.chain = toChain(settings); entry.color = settings.color;
+        check(library.put(entry) && library.load(), "six-colour preset reloads");
+        const auto& loaded = library.entries().back();
+        check(loaded.chain == entry.chain, "every colour node and LUT survive serialization");
+        auto target = EnhancementSettings{};
+        PresetLibrary::apply(loaded, target);
+        check(target.color == settings.color && target.additionalColorCount == 5 &&
+              target.additionalColors == settings.additionalColors, "all six colour settings apply");
+        auto colorOnly = loaded; colorOnly.contents = presetContentMask(PresetContent::Color);
+        target = {}; target.exportBitrateMbps = 12;
+        PresetLibrary::apply(colorOnly, target);
+        check(target.additionalColors == settings.additionalColors && target.additionalColorCount == 5 &&
+              !target.nr && !target.sr && target.exportBitrateMbps == 12, "colour-only restores six grades without other stages");
+    }
+
+    // Every colour node carries a full grade in v2. The file guard must allow
+    // all 64 entries even with dense curves and long UTF-8 LUT references.
+    {
+        const auto path = scratch(L"six-colors-capacity.v2");
+        PresetLibrary library(path);
+        bool capacity = library.load();
+        auto settings = sample(); settings.additionalColorCount = 5;
+        auto fill = [](ColorSettings& color) {
+            color.enabled = true; color.setLutName(std::wstring(220, L'色') + L".cube");
+            for (auto& curve : color.curves) {
+                curve.count = kColorCurvePoints;
+                for (int j = 0; j < kColorCurvePoints; ++j)
+                    curve.points[j] = {float(j) / 7.0f, float(j * j) / 49.0f};
+            }
+        };
+        fill(settings.color); for (auto& color : settings.additionalColors) fill(color);
+        PresetEntry entry; entry.chain = toChain(settings); entry.color = settings.color;
+        for (unsigned i = unsigned(library.entries().size()); i < 64 && capacity; ++i) {
+            entry.name = L"six-grade-" + std::to_wstring(i);
+            capacity = library.put(entry);
+        }
+        PresetLibrary loaded(path);
+        capacity = capacity && loaded.load() && loaded.entries().size() == 64;
+        for (const auto& preset : loaded.entries())
+            if (!preset.builtin) capacity = capacity && preset.chain == entry.chain && preset.color == entry.color;
+        check(capacity, "64 full-curve/Unicode six-grade library entries reload");
+    }
+
+    // 4. Management: rename, duplicate, erase, default.
+    {
+        const auto path = scratch(L"manage.v1");
+        PresetLibrary library(path);
+        library.load();
+        PresetEntry entry; entry.name = L"甲"; entry.contents = presetContentMask(PresetContent::Chain);
+        entry.chain = toChain(sample());
+        check(library.put(entry), "put 甲");
+        entry.name = L"乙";
+        check(library.put(entry), "put 乙");
+        const auto index = library.entries().size() - 1;
+        check(library.rename(index, L"丙"), "rename 乙 to 丙");
+        check(!library.rename(index, L"甲"), "rename refuses a duplicate name");
+        check(library.setDefault(index), "set default");
+        PresetLibrary reloaded(path);
+        check(reloaded.load(), "reload for management checks");
+        check(reloaded.defaultIndex().has_value() && reloaded.entries()[*reloaded.defaultIndex()].name == L"丙",
+              "the default preset survives a save/load cycle");
+        const auto before = reloaded.entries().size();
+        check(reloaded.duplicate(*reloaded.defaultIndex()), "duplicate the default");
+        check(reloaded.entries().size() == before + 1, "duplicate adds an entry");
+        check(reloaded.erase(*reloaded.defaultIndex()), "erase the default");
+        check(!reloaded.defaultIndex().has_value(), "erasing the default clears it");
+    }
+
+    {
+        const auto path = scratch(L"default-rollback.v1");
+        PresetLibrary library(path);
+        check(library.load(), "default rollback library initializes");
+        PresetEntry entry; entry.name = L"rollback"; entry.chain = toChain(sample());
+        check(library.put(entry), "default rollback fixture saves");
+        const auto index = library.entries().size() - 1;
+        check(library.setDefault(index), "default rollback fixture selects default");
+        const auto bytes = readBytes(path);
+        const auto temp = std::filesystem::path(path).concat(L".tmp");
+        std::filesystem::create_directory(temp);
+        { std::ofstream file(temp / L"sentinel"); file << "occupied"; }
+        check(!library.clearDefault() && library.defaultIndex() == index && readBytes(path) == bytes,
+              "failed default clear keeps memory and original file");
+        check(!library.setDefault(0) && library.defaultIndex() == index && readBytes(path) == bytes,
+              "failed default replacement keeps memory and original file");
+        std::filesystem::remove(temp / L"sentinel"); std::filesystem::remove(temp);
+        check(library.clearDefault() && !library.defaultIndex().has_value(), "default clear persists");
+        PresetLibrary reopened(path);
+        check(reopened.load() && !reopened.defaultIndex().has_value(), "cleared default survives restart");
+    }
+
+    // 5. Legacy import never overwrites and keeps the chain.
+    {
+        const auto path = scratch(L"legacy.v1");
+        PresetLibrary library(path);
+        library.load();
+        std::vector<PresetEntry> incoming;
+        PresetEntry nrOnly; nrOnly.name = L"夜间游戏"; nrOnly.contents = presetContentMask(PresetContent::Chain);
+        nrOnly.chain = toChain(sample());
+        incoming.push_back(nrOnly);
+        PresetEntry clashing; clashing.name = L"极致"; clashing.builtin = true;
+        clashing.contents = presetContentMask(PresetContent::Chain);
+        clashing.chain = toChain(EnhancementSettings{});
+        incoming.push_back(clashing);
+        check(library.importLegacy(incoming), "importing legacy presets succeeds");
+        const auto found = std::find_if(library.entries().begin(), library.entries().end(),
+            [](const PresetEntry& e) { return e.name == L"极致"; });
+        check(found != library.entries().end() && found->builtin, "a name clash keeps the existing preset");
+        check(std::any_of(library.entries().begin(), library.entries().end(),
+              [](const PresetEntry& e) { return e.name == L"夜间游戏"; }), "the imported preset is present");
+    }
+
+    {
+        const auto path = scratch(L"oversized.v2");
+        const size_t bytes = 2u * 1024u * 1024u + 1;
+        { std::ofstream f(path, std::ios::binary); f << std::string(bytes, 'x'); }
+        PresetLibrary library(path);
+        check(!library.load() && library.corrupt() && !library.save(), "oversized library is rejected and protected");
+        check(std::filesystem::file_size(path) == bytes, "oversized source remains unchanged");
+    }
+
+    // 6. A corrupt file is preserved, never overwritten.
+    {
+        const auto path = scratch(L"corrupt.v1");
+        { std::ofstream f(path, std::ios::binary); f << "VEYRA_PRESET_LIBRARY 99 nonsense\n"; }
+        PresetLibrary library(path);
+        check(!library.load(), "a corrupt library reports failure");
+        check(library.corrupt(), "the corruption flag is set");
+        check(!library.save(), "a corrupt library refuses to overwrite the file");
+        std::ifstream f(path, std::ios::binary);
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        check(content.find("nonsense") != std::string::npos, "the original file is untouched");
+    }
+
+    {
+        auto s=sample();s.nrLayerCount=4;s.additionalColorCount=1;s.additionalColors[0].exposure=.7f;
+        for(unsigned i=0;i<4;++i){auto& n=s.nrLayers[i];n.enabled=i!=1;
+            n.sizePolicy=static_cast<veyra::pipeline::NrSizePolicy>(i);n.model.tone=.2f*float(i+1);}
+        PresetEntry entry;entry.name=L"NR四层尺寸";entry.contents=kPresetLegacyContent;entry.chain=toChain(s);entry.color=s.color;
+        PresetLibrary library(scratch(L"nr-size.v3"));
+        check(library.load()&&library.put(entry)&&library.load(),"NR per-instance library v3 reloads");
+        check(library.entries().back().chain==entry.chain,"v3 preserves every node including multiple grades");
+        EnhancementSettings restored;PresetLibrary::apply(library.entries().back(),restored);
+        check(restored.nrLayerCount==4&&restored.nrLayers==s.nrLayers,"applying NR preset preserves disabled layers and size policies");
+    }
+    {
+        const auto path = scratch(L"chain-session.v1");
+        ChainSessionStore store(path);
+        auto session = ChainSession::initial(sample());
+        const auto initial = session;
+        check(store.load(session) && session == initial, "missing session preserves initial settings");
+        check(session.select(ChainMode::Node), "session initializes node configuration");
+        auto& node = session.configurations[1];
+        node.videoSrQuality = 4;
+        node.chain.firstOf(EffectType::NrEnhance)->nr.sizePolicy = veyra::pipeline::NrSizePolicy::Native;
+        node.chain.firstOf(EffectType::Color)->color.exposure = 1.7f;
+        node.chain.nodes[0].viewX = 341.25f;
+        node.selectedColour = 0;
+        check(store.save(session), "mode session writes validated snapshot");
+        auto restored = ChainSession::initial({});
+        ChainSessionStore reopened(path);
+        check(reopened.load(restored) && restored == session, "fresh store restores both chains parameters layout and active mode");
+        auto invalid = session; invalid.configurations[1].videoSrQuality = 99;
+        check(!reopened.save(invalid), "invalid session cannot replace valid file");
+        check(reopened.load(restored) && restored == session, "invalid save leaves last valid session intact");
+        const auto read = [&] { std::ifstream file(path, std::ios::binary); return std::string(std::istreambuf_iterator<char>(file), {}); };
+        const auto validBytes = read();
+        const auto temporary = std::filesystem::path(path).concat(L".tmp");
+        std::filesystem::create_directory(temporary);
+        { std::ofstream keep(temporary / L"sentinel"); keep << "occupied"; }
+        check(!reopened.save(session) && read() == validBytes, "write failure preserves original session bytes");
+        std::filesystem::remove(temporary / L"sentinel"); std::filesystem::remove(temporary);
+        { std::ofstream file(path, std::ios::binary | std::ios::trunc); file << "VEYRA_CHAIN_SESSION 999\ncorrupt"; }
+        ChainSessionStore corrupt(path);
+        const auto before = restored;
+        check(!corrupt.load(restored) && restored == before, "corrupt session does not partially mutate live state");
+        check(!corrupt.save(session) && read().find("999") != std::string::npos, "corrupt source is never overwritten");
+        { std::ofstream file(path, std::ios::binary | std::ios::trunc); file << validBytes << "trailing"; }
+        ChainSessionStore trailing(path);
+        check(!trailing.load(restored) && restored == before, "trailing session data is rejected transactionally");
+    }
+    std::printf(failures ? "preset library: %d FAILURES\n" : "preset library: all checks passed\n", failures);
+    return failures ? 1 : 0;
+}
+
+void testEditorPresetStorage() {
+    const auto path = scratch(L"editor-presets.v1");
+    const auto sidecar = std::filesystem::path(path).concat(L".p3-editor");
+    std::filesystem::remove(sidecar);
+    PresetLibrary library(path); check(library.load() && library.save(), "editor preset store: legacy baseline");
+    const auto oldBytes = readBytes(path);
+    auto settings = sample(); auto runtime = toChain(settings); runtime.mode = ChainMode::Node;
+    removeLegacyNodeProtection(runtime);
+    auto doc = std::make_shared<NodeEditorDocument>(); doc->nodes = runtime;
+    check(doc->layout.initialize(doc->nodes).accepted, "editor preset store: init");
+    uint32_t colorId = 0, duplicate = 0;
+    for (uint32_t i = 0; i < doc->nodes.nodeCount; ++i)
+        if (doc->nodes.nodes[i].type == EffectType::Color) colorId = doc->layout.ids[i];
+    check(doc->layout.duplicate(doc->nodes, colorId, duplicate).accepted &&
+          doc->layout.disconnect(doc->nodes, NodeGraphLayout::Input).accepted, "editor preset store: detached incomplete document");
+    doc->nodes.nodes[doc->layout.indexOf(doc->nodes, duplicate)].color.exposure = 2.25f;
+    PresetEntry entry; entry.name = L"editor-complete"; entry.kind = ChainMode::Node;
+    entry.chain = runtime; entry.color = settings.color; entry.fg = {settings.multiplier, settings.frameGenerationBackend};
+    entry.nodeConfiguration = ChainConfiguration::capture(runtime, settings); entry.nodeConfiguration->editor = doc;
+    check(library.put(entry) && readBytes(path) == oldBytes && readBytes(sidecar).starts_with("VEYRA_PRESET_LIBRARY 4"),
+          "editor preset store: sidecar saves without overwriting legacy");
+    PresetLibrary reopened(path); check(reopened.load(), "editor preset store: reopen");
+    const auto found = std::find_if(reopened.entries().begin(), reopened.entries().end(), [&](const auto& e) {return e.name == entry.name;});
+    check(found != reopened.entries().end() && *found == entry, "editor preset store: full configuration round trip");
+    NodeEditorDocument applied; applied.nodes.mode = ChainMode::Node;
+    check(applied.layout.initialize(applied.nodes).accepted && PresetLibrary::applyToEditor(entry, applied, settings).accepted &&
+          applied == *doc, "editor preset store: apply restores detached IDs payloads and edges");
+    const auto before = reopened.entries(); const auto bytes = readBytes(sidecar);
+    auto invalid = entry; invalid.name = L"invalid-editor"; auto badDoc = std::make_shared<NodeEditorDocument>(*doc);
+    badDoc->layout.ids[0] = 0; invalid.nodeConfiguration->editor = badDoc;
+    check(!reopened.put(invalid) && reopened.entries() == before && readBytes(sidecar) == bytes,
+          "editor preset store: failed save cannot poison memory or disk");
+}
+
+void testEditorPresetParts() {
+    auto values = sample();
+    auto document = std::make_unique<NodeEditorDocument>();
+    document->nodes = toChain(values); document->nodes.mode = ChainMode::Node;
+    removeLegacyNodeProtection(document->nodes);
+    check(document->layout.initialize(document->nodes).accepted, "editor preset: initialize");
+    uint32_t colorId = 0, nrId = 0, copied = 0;
+    for (uint32_t i = 0; i < document->nodes.nodeCount; ++i) {
+        if (document->nodes.nodes[i].type == EffectType::Color) colorId = document->layout.ids[i];
+        if (document->nodes.nodes[i].type == EffectType::NrEnhance) nrId = document->layout.ids[i];
+    }
+    check(document->layout.duplicate(document->nodes, colorId, copied).accepted, "editor preset: detached color after FG");
+    const auto original = std::make_unique<NodeEditorDocument>(*document);
+    PresetEntry audio; audio.kind = ChainMode::Node; audio.chain.mode = ChainMode::Node;
+    audio.contents = presetContentMask(PresetContent::Audio); audio.audioOffsetMs = 73;
+    check(PresetLibrary::applyToEditor(audio, *document, values).accepted && *document == *original &&
+          values.audioOffsetMs == 73, "editor preset: audio applies without flattening detached tail");
+    PresetEntry color; color.kind = ChainMode::Node; color.chain.mode = ChainMode::Node;
+    color.contents = presetContentMask(PresetContent::Color); color.color.enabled = true; color.color.exposure = 1.25f;
+    color.chain.nodeCount = 3;
+    for (uint32_t i = 0; i < 3; ++i) {
+        auto& n = color.chain.nodes[i]; n.type = EffectType::Color; n.enabled = true;
+        n.color.enabled = true; n.color.exposure = float(i + 1) / 4;
+    }
+    check(PresetLibrary::applyToEditor(color, *document, values).accepted &&
+          document->nodes.countOf(EffectType::Color) == 3, "editor preset: grow color slots");
+    const int nr = document->layout.indexOf(document->nodes, nrId);
+    check(nr >= 0 && document->nodes.nodes[nr] == original->nodes.nodes[original->layout.indexOf(original->nodes, nrId)] &&
+          document->layout.inputNext == original->layout.inputNext, "editor preset: unrelated NR identity payload and source edge retained");
+    auto runtime = std::make_unique<EffectChain>();
+    check(document->layout.project(document->nodes, *runtime).accepted && runtime->countOf(EffectType::Color) == 1 &&
+          document->layout.indexOf(document->nodes, copied) >= 0, "editor preset: added color follows detached slot without entering runtime");
+    color.chain.nodeCount = 1;
+    check(PresetLibrary::applyToEditor(color, *document, values).accepted && document->nodes.countOf(EffectType::Color) == 1 &&
+          document->layout.indexOf(document->nodes, colorId) >= 0 && document->layout.indexOf(document->nodes, copied) < 0,
+          "editor preset: shrink keeps surviving stable ID");
+    check(document->layout.disconnect(document->nodes, NodeGraphLayout::Input).accepted, "editor preset: disconnect source");
+    const auto accepted = values; color.color.exposure = 2.5f;
+    check(PresetLibrary::applyToEditor(color, *document, values).accepted && values == accepted &&
+          document->nodes.nodes[document->layout.indexOf(document->nodes, colorId)].color.exposure == 2.5f &&
+          document->layout.inputNext == NodeGraphLayout::Input, "editor preset: disconnected color changes draft only");
+    const auto beforeBad = std::make_unique<NodeEditorDocument>(*document);
+    color.color.exposure = 1000;
+    check(!PresetLibrary::applyToEditor(color, *document, values).accepted && *document == *beforeBad && values == accepted,
+          "editor preset: invalid detached parameter rolls back document and settings");
+    PresetEntry fg; fg.kind = ChainMode::Node; fg.chain.mode = ChainMode::Node;
+    fg.contents = presetContentMask(PresetContent::FrameGeneration); fg.fg.multiplier = 9;
+    check(!PresetLibrary::applyToEditor(fg, *document, values).accepted && *document == *beforeBad && values == accepted,
+          "editor preset: invalid detached FG multiplier rolls back");
+    PresetEntry whole; whole.kind = ChainMode::Node; whole.chain = original->nodes;
+    --whole.chain.nodeCount; whole.contents = kPresetLegacyContent; whole.color = accepted.color;
+    whole.fg.multiplier = accepted.multiplier;
+    check(PresetLibrary::applyToEditor(whole, *document, values).accepted &&
+          document->layout.project(document->nodes, *runtime).accepted, "editor preset: full replacement accepts incomplete prior editor");
+    auto noFg = std::make_unique<NodeEditorDocument>(); noFg->nodes.mode = ChainMode::Node;
+    check(noFg->layout.initialize(noFg->nodes).accepted, "editor preset: empty graph");
+    fg.fg.multiplier = 2; values = EnhancementSettings{};
+    check(PresetLibrary::applyToEditor(fg, *noFg, values).accepted && values.multiplier == 2 &&
+          noFg->nodes.countOf(EffectType::FrameGeneration) == 1 && noFg->layout.project(noFg->nodes, *runtime).accepted,
+          "editor preset: new FG attaches at complete tail");
+}
+
+__declspec(noinline) void testEditorGlobalSettings() {
+    const auto path = scratch(L"editor-global-settings.v1");
+    const auto editorPath = std::filesystem::path(path).concat(L".p3-editor");
+    const auto draftPath = std::filesystem::path(editorPath).concat(L".p3-globals");
+    std::filesystem::remove(editorPath); std::filesystem::remove(draftPath);
+    auto initial = sample(); initial.multiplier = 6;
+    auto session = std::make_unique<ChainSession>(ChainSession::initial(initial));
+    check(session->select(ChainMode::Node), "globals: initialize session");
+    ChainSessionStore writer(path);
+    check(writer.save(*session), "globals: write v1");
+    const auto v1 = readBytes(path);
+    auto document = std::make_shared<NodeEditorDocument>();
+    auto& c = session->configurations[1];
+    document->nodes = c.chain; document->layout.initialize(document->nodes);
+    document->layout.disconnect(document->nodes, NodeGraphLayout::Input);
+    c.editor = document;
+    check(writer.save(*session), "globals: write legacy editor v2");
+    const auto v2 = readBytes(editorPath);
+    document->globals = static_cast<const ChainGlobalSettings&>(c);
+    document->globals->srTarget = veyra::pipeline::SrTarget::Qhd;
+    document->globals->videoSrQuality = 3;
+    document->nodes.fgMultiplier = 4;
+    document->globals->fgBackend = FrameGenerationBackend::XeSS;
+    document->globals->opticalFlowBackend = OpticalFlowBackend(1);
+    const auto runtimeGlobals = static_cast<const ChainGlobalSettings&>(c);
+    check(session->valid() && writer.save(*session), "globals: write disconnected draft v3");
+    check(readBytes(path) == v1 && readBytes(editorPath) == v2 &&
+          readBytes(draftPath).starts_with("VEYRA_CHAIN_SESSION 3"), "globals: preserve both legacy files");
+    auto restored = std::make_unique<ChainSession>();
+    ChainSessionStore reader(path);
+    check(reader.load(*restored) && *restored == *session, "globals: reopen exact runtime and draft");
+    check(static_cast<const ChainGlobalSettings&>(restored->configurations[1]) == runtimeGlobals &&
+          *restored->configurations[1].editor->globals != runtimeGlobals, "globals: draft never replaces accepted runtime");
+    const auto bytes = readBytes(draftPath);
+    document->globals->videoSrQuality = 99;
+    check(!writer.save(*session) && readBytes(draftPath) == bytes, "globals: invalid detached quality rejected atomically");
+    document->globals->videoSrQuality = 3;
+    document->nodes.fgMultiplier = 6;
+    check(!session->valid(), "globals: XeSS draft rejects six times even while disconnected");
+    document->nodes.fgMultiplier = 4;
+    auto entry = std::make_unique<PresetEntry>();
+    entry->name = L"globals"; entry->kind = ChainMode::Node; entry->contents = kPresetLegacyContent;
+    entry->chain = c.chain; entry->nodeConfiguration = c; entry->fg = {4, FrameGenerationBackend::XeSS};
+    const auto presetPath = scratch(L"editor-global-preset.v1");
+    const auto presetEditor = std::filesystem::path(presetPath).concat(L".p3-editor");
+    const auto presetDraft = std::filesystem::path(presetEditor).concat(L".p3-globals");
+    std::filesystem::remove(presetEditor); std::filesystem::remove(presetDraft);
+    PresetLibrary library(presetPath); library.load();
+    check(library.put(*entry) && readBytes(presetDraft).starts_with("VEYRA_PRESET_LIBRARY 5"),
+          "globals: preset v5 writes independent file");
+    PresetLibrary reopened(presetPath);
+    check(reopened.load(), "globals: reload preset v5");
+    const auto found = std::find_if(reopened.entries().begin(), reopened.entries().end(),
+        [](const auto& e) { return e.name == L"globals"; });
+    check(found != reopened.entries().end() && found->nodeConfiguration == entry->nodeConfiguration,
+          "globals: preset v5 keeps runtime and draft separately");
+    auto target = std::make_unique<NodeEditorDocument>(); target->nodes.mode = ChainMode::Node;
+    target->layout.initialize(target->nodes);
+    auto values = initial;
+    check(PresetLibrary::applyToEditor(*entry, *target, values).accepted &&
+          target->globals == document->globals && target->layout == document->layout,
+          "globals: complete preset restores disconnected draft globals");
+    auto invalid = std::make_unique<ChainSession>(*restored);
+    const auto retained = std::make_unique<ChainSession>(*invalid);
+    { std::ofstream file(draftPath, std::ios::binary | std::ios::trunc); file << bytes << "garbage"; }
+    ChainSessionStore corrupt(path);
+    check(!corrupt.load(*invalid) && *invalid == *retained && !corrupt.save(*session),
+          "globals: corrupt v3 decode does not partly mutate output");
+    std::filesystem::remove(draftPath); std::filesystem::remove(editorPath);
+    std::filesystem::remove(presetDraft); std::filesystem::remove(presetEditor);
+}
+
+void testFsrBackendStorage() {
+    for(const auto backend : {FrameGenerationBackend::Fsr, FrameGenerationBackend::Fsr4}) {
+        auto settings=sample();settings.multiplier=2;settings.frameGenerationBackend=backend;
+        const auto path=scratch(backend==FrameGenerationBackend::Fsr?L"fsr3-library.v1":L"fsr4-library.v1");
+        PresetLibrary writer(path);writer.setIncludeBuiltins(false);
+        PresetEntry entry;entry.name=L"FSR FG";entry.contents=presetContentMask(PresetContent::FrameGeneration);
+        entry.chain=toChain(settings);entry.fg={2,backend};
+        check(writer.load()&&writer.put(entry), "FSR preset: save distinct backend");
+        PresetLibrary reader(path);reader.setIncludeBuiltins(false);
+        check(reader.load()&&reader.entries().size()==1&&reader.entries()[0].fg==entry.fg,
+              "FSR preset: reopen preserves backend and multiplier");
+        auto destination=sample();
+        if(!reader.entries().empty())PresetLibrary::apply(reader.entries()[0],destination);
+        check(destination.frameGenerationBackend==backend&&destination.multiplier==2&&destination.validate().empty(),
+              "FSR preset: apply validates without DLSS relabeling");
+        entry.name=L"invalid FSR 4X";entry.fg.multiplier=4;
+        const auto retained=readBytes(path);
+        check(!writer.put(entry)&&readBytes(path)==retained, "FSR preset: illegal multiplier rejected atomically");
+
+        const auto sessionPath=scratch(backend==FrameGenerationBackend::Fsr?L"fsr3-session.v1":L"fsr4-session.v1");
+        const auto session=std::make_unique<ChainSession>(ChainSession::initial(settings));
+        check(session->select(ChainMode::Node), "FSR session: select node mode");
+        ChainSessionStore sessionWriter(sessionPath);
+        auto restored=std::make_unique<ChainSession>(ChainSession::initial({}));
+        ChainSessionStore sessionReader(sessionPath);
+        check(sessionWriter.save(*session)&&sessionReader.load(*restored)&&*restored==*session,
+              "FSR session: list and node configurations reopen independently");
+    }
+}
+
+__declspec(noinline) void testRenderingChoices(){
+    auto s=sample();s.videoHdr.enabled=false;s.srTarget=veyra::pipeline::SrTarget::Uhd6K;
+    s.hdrOutputMode=HdrOutputMode::ScRgb;s.fgMotion=s.srMotion=s.nrMotion=MotionSource::Zero;
+    const auto path=scratch(L"field-rendering.v1");
+    std::filesystem::remove(std::filesystem::path(path).concat(L".field-render"));
+    PresetLibrary writer(path);writer.setIncludeBuiltins(false);
+    PresetEntry e;e.name=L"rendering";e.kind=ChainMode::List;e.chain=toChain(s);e.globals=ChainGlobalSettings::capture(s);e.fg={s.multiplier,s.frameGenerationBackend};
+    check(writer.load()&&writer.put(e),"rendering: save shared globals in list preset");
+    PresetLibrary reader(path);reader.setIncludeBuiltins(false);
+    check(reader.load()&&reader.entries().size()==1&&reader.entries()[0]==e,"rendering: library roundtrip");
+    auto applied=sample();PresetLibrary::apply(e,applied);
+    check(applied.srTarget==s.srTarget&&applied.hdrOutputMode==s.hdrOutputMode&&applied.nrMotion==s.nrMotion&&applied.srMotion==s.srMotion&&applied.fgMotion==s.fgMotion,"rendering: list applies resolution HDR and motion");
+    e.contents=presetContentMask(PresetContent::Color);auto untouched=sample();auto before=untouched;PresetLibrary::apply(e,untouched);
+    check(ChainGlobalSettings::capture(untouched)==ChainGlobalSettings::capture(before),"rendering: color-only preset leaves shared choices intact");
+    const auto sessionPath=scratch(L"field-rendering-session.v1");
+    std::filesystem::remove(std::filesystem::path(sessionPath).concat(L".field-render"));
+    std::filesystem::remove(std::filesystem::path(sessionPath).concat(L".field-render.p3-globals"));
+    auto session=std::make_unique<ChainSession>(ChainSession::initial(s));
+    auto restored=std::make_unique<ChainSession>();ChainSessionStore sw(sessionPath),sr(sessionPath);
+    check(sw.save(*session)&&sr.load(*restored)&&*session==*restored,"rendering: v4 session without editor restores");
+    check(session->select(ChainMode::Node),"rendering: select node mode");
+    auto doc=std::make_shared<NodeEditorDocument>();doc->nodes=session->configurations[1].chain;doc->layout.initialize(doc->nodes);doc->globals=ChainGlobalSettings::capture(s);
+    session->configurations[1].editor=doc;
+    check(sw.save(*session),"rendering: v4 session with editor saves");
+    ChainSessionStore nr(sessionPath);check(nr.load(*restored)&&*session==*restored,"rendering: v4 editor globals restore exactly");
+}
+void testNrVariants() {
+    for (const auto runtime : {NrRuntime::Original, NrRuntime::Ampere, NrRuntime::NvidiaOriginal, NrRuntime::LmxxfAmd}) {
+        auto settings=sample(); settings.nrRuntime=runtime;
+        const auto path=scratch((L"nr-"+std::to_wstring(int(runtime))+L".v1").c_str());
+        PresetLibrary writer(path); writer.setIncludeBuiltins(false);
+        PresetEntry entry; entry.name=L"NR variant"; entry.chain=toChain(settings);
+        entry.color=settings.color; // v1 stores the shared colour payload outside the chain.
+        entry.fg={settings.multiplier,settings.frameGenerationBackend};
+        check(writer.load()&&writer.put(entry), "NR variant: save preset");
+        for(unsigned i=0;i<entry.chain.nodeCount;++i)entry.chain.nodes[i].nr.runtime=currentNrRuntime(entry.chain.nodes[i].nr.runtime);
+        PresetLibrary reader(path); reader.setIncludeBuiltins(false);
+        check(reader.load()&&reader.entries().size()==1&&reader.entries()[0]==entry,
+              "NR variant: preset retains exact DLL selection");
+        const auto sessionPath=scratch((L"nr-session-"+std::to_wstring(int(runtime))+L".v1").c_str());
+        auto session=std::make_unique<ChainSession>(ChainSession::initial(settings));
+        check(session->select(ChainMode::Node), "NR variant: initialize node session");
+        for(auto& c:session->configurations)for(unsigned i=0;i<c.chain.nodeCount;++i)c.chain.nodes[i].nr.runtime=currentNrRuntime(c.chain.nodes[i].nr.runtime);
+        ChainSessionStore store(sessionPath);
+        auto restored=std::make_unique<ChainSession>(ChainSession::initial({}));
+        check(store.save(*session)&&store.load(*restored)&&*restored==*session,
+              "NR variant: list and node sessions retain exact DLL selection");
+    }
+}
+void testNrCorrectionStorage() {
+    // Exercise the public store/session/chain paths, including hidden manual
+    // values while the switch is off. Never rely on serialising a test struct.
+    for(unsigned mode=0;mode<3;++mode)for(bool extended:{false,true}){
+        EnhancementSettings s;s.nr=true;s.nrLayerCount=2;
+        for(unsigned i=0;i<s.nrLayerCount;++i){auto& n=s.nrLayers[i];
+            n.enabled=true;n.residual.total=5-float(i);
+            n.residual.correction={mode!=0,mode!=2,.35f+float(i)*.1f,.2f,.7f,.5f,.65f};
+            if(extended){auto& c=n.residual.correction;c.neutral=.8f-float(i)*.1f;c.colorKeep=.7f;c.lumaKeep=.3f;c.shadow=.6f;c.autoAmount=.75f;}
+        }
+        s.residual=s.nrLayers[0].residual;
+        const auto suffix=extended?L"-extended":L"";
+        const auto path=scratch((L"nr-correction-"+std::to_wstring(mode)+suffix+L".v1").c_str());
+        PresetLibrary writer(path);writer.setIncludeBuiltins(false);
+        PresetEntry entry;entry.name=L"strength five";entry.chain=toChain(s);
+        check(writer.load()&&writer.put(entry),"NR correction: preset save");
+        check(readBytes(path).starts_with(extended?"VEYRA_PRESET_LIBRARY 9\n":"VEYRA_PRESET_LIBRARY 8\n"),"NR correction: lowest compatible schema");
+        PresetLibrary reader(path);reader.setIncludeBuiltins(false);
+        check(reader.load()&&reader.entries().size()==1&&reader.entries()[0]==entry,
+              "NR correction: enabled/mode/manual values survive reload");
+        auto session=std::make_unique<ChainSession>(ChainSession::initial(s));
+        check(session->select(ChainMode::Node),"NR correction: node session initializes");
+        ChainSessionStore store(scratch((L"nr-correction-session-"+std::to_wstring(mode)+suffix+L".v1").c_str()));
+        auto restored=std::make_unique<ChainSession>(ChainSession::initial({}));
+        check(store.save(*session)&&store.load(*restored)&&*restored==*session,
+              "NR correction: list/node and editor session roundtrip");
+        auto actual=std::make_unique<EnhancementSettings>();
+        fromChain(entry.chain,*actual);
+        check(actual->validate().empty()&&actual->nrLayers[0].residual==s.nrLayers[0].residual&&
+              actual->nrLayers[1].residual==s.nrLayers[1].residual,"NR correction: shared settings carry both layers");
+    }
+    EnhancementSettings invalid;invalid.residual.total=5.001f;
+    check(!invalid.validate().empty(),"NR correction: above five rejected");
+    invalid.residual.total=5;invalid.residual.color=2.001f;
+    check(!invalid.validate().empty(),"NR correction: component gain retains old limit");
+    invalid.residual.color=1;invalid.residual.correction.highlight=1.01f;
+    check(!invalid.validate().empty(),"NR correction: invalid protection rejected even while disabled");
+    invalid.residual.correction={};invalid.residual.correction.neutral=1.001f;
+    check(!invalid.validate().empty(),"NR correction: neutral value range enforced");
+    invalid.residual.correction={};invalid.residual.correction.autoAmount=-.1f;
+    check(!invalid.validate().empty(),"NR correction: automatic amount range enforced");
+}
+__declspec(noinline) void testFlowStorage() {
+    const auto path=scratch(L"shared-flow.v1");
+    const auto sidecar=std::filesystem::path(path).concat(L".flow");
+    std::filesystem::remove(sidecar);
+    PresetLibrary writer(path);writer.setIncludeBuiltins(false);
+    PresetEntry old;old.name=L"old chain";old.chain=toChain(sample());
+    check(writer.load()&&writer.put(old),"flow storage: seed original legacy library");
+    const auto original=readBytes(path);
+    PresetEntry entry;entry.name=L"shared flow";entry.chain=toChain(sample());
+    entry.contents=presetContentMask(PresetContent::Flow);
+    entry.flow=PresetFlowSettings{OpticalFlowBackend::AmdFidelityFx,FlowQuality::Quality,true,ContentRate::Capture60To30};
+    check(writer.put(entry),"flow storage: save into unified preset library");
+    check(readBytes(path)==original&&readBytes(sidecar).starts_with("VEYRA_PRESET_LIBRARY 10\n"),
+          "flow storage: v10 sidecar preserves original library bytes");
+    PresetLibrary reader(path);reader.setIncludeBuiltins(false);
+    check(reader.load()&&reader.entries().size()==2&&reader.entries()[0]==old&&reader.entries()[1]==entry,
+          "flow storage: legacy and shared-flow entries reload together");
+    const auto exported=scratch(L"shared-flow-export.v10");
+    check(reader.exportEntry(1,exported),"flow storage: export unified preset");
+    std::wstring imported;
+    check(reader.importFile(exported,imported)&&reader.entries().back().flow==entry.flow&&imported!=entry.name,
+          "flow storage: import retains all shared fields and avoids name collision");
+    const auto good=readBytes(sidecar);
+    auto invalid=entry;invalid.flow->content=ContentRate(99);
+    check(!reader.put(invalid,true)&&readBytes(sidecar)==good,"flow storage: invalid cadence cannot overwrite library");
+    invalid=entry;invalid.flow->backend=OpticalFlowBackend(99);
+    check(!reader.put(invalid,true)&&readBytes(sidecar)==good,"flow storage: invalid backend cannot overwrite library");
+    invalid=entry;invalid.flow->quality=FlowQuality(99);
+    check(!reader.put(invalid,true)&&readBytes(sidecar)==good,"flow storage: invalid quality cannot overwrite library");
+    std::string truncated=readBytes(exported);truncated.erase(truncated.find_last_of(' '));
+    {std::ofstream f(exported,std::ios::binary|std::ios::trunc);f<<truncated;}
+    check(!reader.importFile(exported,imported)&&readBytes(sidecar)==good,"flow storage: truncated flow tail is rejected");
+    check(reader.setDefault(1),"flow storage: default points at shared preset");
+    PresetLibrary reload(path);reload.setIncludeBuiltins(false);
+    check(reload.load()&&reload.defaultIndex()==1&&reload.entries()[1]==entry,"flow storage: default and fields survive fresh reader");
+    for(unsigned variant=0;variant<2;++variant){
+        const auto base=scratch((L"flow-migrate-"+std::to_wstring(6+variant)+L".v1").c_str());
+        const auto legacyPath=std::filesystem::path(base).concat(variant?L".vfg":L".field-render");
+        const auto upgraded=std::filesystem::path(legacyPath).concat(L".flow");
+        std::filesystem::remove(legacyPath);std::filesystem::remove(upgraded);
+        auto legacy=std::make_unique<PresetEntry>(old);legacy->globals=ChainGlobalSettings{};
+        if(variant){legacy->fg={2,FrameGenerationBackend::Vfg,1};legacy->globals->fgBackend=FrameGenerationBackend::Vfg;}
+        PresetLibrary prior(base);prior.setIncludeBuiltins(false);
+        check(prior.load()&&prior.put(*legacy),"flow migration: create actual v6/v7 sidecar library");
+        const auto originalBytes=readBytes(legacyPath);
+        check(!originalBytes.empty()&&prior.put(entry)&&readBytes(legacyPath)==originalBytes,
+              "flow migration: new shared snapshot preserves v6/v7 sidecar bytes");
+        PresetLibrary fresh(base);fresh.setIncludeBuiltins(false);
+        check(fresh.load()&&fresh.entries().size()==2&&fresh.entries()[0]==*legacy&&fresh.entries()[1]==entry,
+              "flow migration: fresh base-path reader finds upgraded rendering/VFG library");
+    }
+}
+__declspec(noinline) void testFlowApplication() {
+    auto source=sample();source.flow=FlowQuality::Quality;source.opticalFlowBackend=OpticalFlowBackend::AmdFidelityFx;
+    source.amdFlowHalfResolution=true;source.content=ContentRate::Capture60To30;
+    PresetEntry entry;entry.name=L"shared flow";entry.chain=toChain(source);
+    entry.color=source.color;entry.globals=ChainGlobalSettings::capture(source);entry.fg={4,FrameGenerationBackend::Dlss,1};
+    entry.audioSync=source.audioSync;entry.audioOffsetMs=source.audioOffsetMs;entry.flow=PresetFlowSettings::capture(source);
+    for(uint32_t mask=0;mask<=kPresetAllContent;++mask){
+        auto target=sample();target.flow=FlowQuality::Performance;target.content=ContentRate::Auto;
+        target.opticalFlowBackend=OpticalFlowBackend::GpuDis;target.amdFlowHalfResolution=false;
+        const auto before=PresetFlowSettings::capture(target);entry.contents=mask;
+        auto chain=toChain(target);const auto result=PresetLibrary::applyToChain(entry,chain,target);
+        check(result.accepted&&PresetFlowSettings::capture(target)==((mask&16)?*entry.flow:before),
+              "flow apply: independent scope across all 32 list content masks");
+        check(target.exportBitrateMbps==77&&target.captureCompatible,"flow apply: source/export preferences stay intact");
+    }
+    entry.contents=16;
+    for(int backend=0;backend<3;++backend)for(int quality=0;quality<3;++quality)for(int cadence=0;cadence<6;++cadence){
+        entry.flow=PresetFlowSettings{OpticalFlowBackend(backend),FlowQuality(quality),backend==1,ContentRate(cadence)};
+        auto target=sample();auto expected=target;entry.flow->apply(expected);
+        auto chain=toChain(target);const auto originalChain=chain;
+        check(PresetLibrary::applyToChain(entry,chain,target).accepted&&target==expected&&chain==originalChain,
+              "flow apply: every backend/quality/cadence restores without changing other settings");
+    }
+    entry.kind=ChainMode::Node;entry.chain.mode=ChainMode::Node;
+    removeLegacyNodeProtection(entry.chain);
+    entry.flow=PresetFlowSettings::capture(source);
+    for(uint32_t mask=0;mask<=kPresetAllContent;++mask){
+        auto target=sample();target.flow=FlowQuality::Performance;target.content=ContentRate::Auto;
+        target.opticalFlowBackend=OpticalFlowBackend::GpuDis;
+        auto doc=std::make_unique<NodeEditorDocument>();doc->nodes=toChain(target);doc->nodes.mode=ChainMode::Node;
+        removeLegacyNodeProtection(doc->nodes);
+        check(doc->layout.initialize(doc->nodes).accepted,"flow editor: initialize stable IDs");
+        doc->globals=ChainGlobalSettings::capture(target);const auto before=PresetFlowSettings::capture(target);entry.contents=mask;
+        check(PresetLibrary::applyToEditor(entry,*doc,target).accepted&&
+              PresetFlowSettings::capture(target)==((mask&16)?*entry.flow:before)&&
+              doc->globals->flow==target.flow&&doc->globals->opticalFlowBackend==target.opticalFlowBackend,
+              "flow editor: independent scope across all 32 node content masks");
+    }
+    entry.kind=ChainMode::List;entry.chain.mode=ChainMode::List;entry.contents=1;entry.flow.reset();
+    auto legacy=sample();PresetLibrary::apply(entry,legacy);
+    check(legacy.flow==source.flow&&legacy.opticalFlowBackend==source.opticalFlowBackend&&legacy.content==ContentRate::Transport,
+          "flow apply: v1-v9 chain globals retain existing behavior");
+}
+__declspec(noinline) void testDlssSrModels() {
+    EnhancementSettings source;source.nr=false;source.sr=true;
+    const auto libraryPath=scratch(L"dlss-model-library.v1");
+    const auto legacyLibrary=std::filesystem::path(libraryPath).concat(L".field-render");
+    PresetLibrary writer(libraryPath);writer.setIncludeBuiltins(false);
+    PresetEntry entry;entry.name=L"SR models";entry.kind=ChainMode::List;
+    entry.contents=presetContentMask(PresetContent::Chain);entry.chain=toChain(source);
+    entry.globals=ChainGlobalSettings::capture(source);
+    check(writer.load()&&writer.put(entry),"DLSS presets: save original K library");
+    const auto rollback=readBytes(legacyLibrary);
+    check(!rollback.empty()&&rollback.starts_with("VEYRA_PRESET_LIBRARY 6"),"DLSS presets: K keeps the old format");
+    for(unsigned model=1;model<kDlssSrModelCount;++model){
+        entry.globals->dlssSrModel=model;
+        check(writer.put(entry,true),"DLSS presets: save M/L model");
+        check(readBytes(legacyLibrary)==rollback,"DLSS presets: original library is retained for rollback");
+        PresetLibrary reader(libraryPath);reader.setIncludeBuiltins(false);
+        check(reader.load()&&reader.entries().size()==1&&reader.entries()[0].globals->dlssSrModel==model,
+              "DLSS presets: fresh reader finds the model sidecar");
+        auto applied=source;
+        PresetLibrary::apply(reader.entries()[0],applied);
+        check(applied.dlssSrModel==model,
+              "DLSS presets: applying the chain restores its model");
+        auto colourOnly=reader.entries()[0];colourOnly.contents=presetContentMask(PresetContent::Color);
+        applied.dlssSrModel=0;
+        PresetLibrary::apply(colourOnly,applied);
+        check(applied.dlssSrModel==0,
+              "DLSS presets: colour-only application leaves the SR model alone");
+    }
+    const auto exported=scratch(L"dlss-model-export.v12");
+    check(writer.exportEntry(0,exported),"DLSS presets: export selected model");
+    const auto encoded=readBytes(exported);check(encoded.starts_with("VEYRA_PRESET_LIBRARY 12"),"DLSS presets: new model declares v12");
+    PresetLibrary imported(scratch(L"dlss-model-import.v1"));imported.setIncludeBuiltins(false);std::wstring name;
+    check(imported.load()&&imported.importFile(exported,name)&&imported.entries()[0].globals->dlssSrModel==2,
+          "DLSS presets: import preserves the selected model");
+    // Invalid model at the end of the rendering block must not corrupt a good library.
+    entry.name=L"invalid model";entry.globals->dlssSrModel=kDlssSrModelCount;
+    check(!writer.put(entry),"DLSS presets: invalid model is rejected atomically");
+
+    const auto sessionPath=scratch(L"dlss-model-session.v1");
+    auto session=std::make_unique<ChainSession>(ChainSession::initial(source));
+    check(session->select(ChainMode::Node),"DLSS session: initialize independent node configuration");
+    ChainSessionStore sessions(sessionPath);
+    check(sessions.save(*session),"DLSS session: save K rollback file");
+    const auto sessionRollback=readBytes(sessionPath);
+    session->configurations[0].dlssSrModel=1;
+    session->configurations[1].dlssSrModel=2;
+    auto document=std::make_shared<NodeEditorDocument>();document->nodes=session->configurations[1].chain;
+    check(document->layout.initialize(document->nodes).accepted,"DLSS session: create node editor document");
+    document->globals=static_cast<const ChainGlobalSettings&>(session->configurations[1]);
+    document->globals->dlssSrModel=1;session->configurations[1].editor=document;
+    check(sessions.save(*session)&&readBytes(sessionPath)==sessionRollback,"DLSS session: save new format beside original");
+    auto restored=std::make_unique<ChainSession>();ChainSessionStore reopened(sessionPath);
+    check(reopened.load(*restored)&&*restored==*session,"DLSS session: List, Node and editor draft round-trip independently");
+    // Opting back into K keeps using the sidecar, avoiding stale-model resurrection.
+    session->configurations[0].dlssSrModel=session->configurations[1].dlssSrModel=document->globals->dlssSrModel=0;
+    check(sessions.save(*session),"DLSS session: return to K");
+    ChainSessionStore finalReader(sessionPath);
+    check(finalReader.load(*restored)&&*restored==*session,"DLSS session: saved K wins over old M/L choices");
+}
+// Three-step SR (2026-10-28): library v16 / session v11 in .sr-stage files; the
+// older files keep their bytes for a 2.1.1 rollback.
+__declspec(noinline) void testDualSrStorage() {
+    const auto path=scratch(L"dual-library.v1");
+    PresetLibrary writer(path);writer.setIncludeBuiltins(false);
+    auto e=std::make_unique<PresetEntry>();e->name=L"base";e->chain=toChain(sample());
+    check(writer.load()&&writer.put(*e),"dual storage seeds an ordinary library");
+    const auto original=readBytes(path);
+    auto s=sample();s.dualSrEnabled=true;s.srPrescale=veyra::pipeline::SrPrescale::P1080;s.dualSrTarget=veyra::pipeline::SrTarget::Uhd8K;s.dualSrQuality=2;
+    e->name=L"two passes";e->globals=ChainGlobalSettings::capture(s);
+    check(writer.put(*e)&&readBytes(path)==original,"dual library preserves the original file");
+    check(readBytes(std::filesystem::path(path).concat(L".dual-sr")).starts_with("VEYRA_PRESET_LIBRARY 17"),"dual library uses the independent v17 sidecar");
+    PresetLibrary reader(path);reader.setIncludeBuiltins(false);auto out=sample();
+    const bool loaded=reader.load()&&reader.entries().size()==2;
+    if(loaded)PresetLibrary::apply(reader.entries()[1],out);
+    check(loaded&&out.dualSrEnabled&&out.dualSrTarget==s.dualSrTarget&&out.dualSrQuality==2,"library reload restores both SR stages");
+    const auto sessionPath=scratch(L"dual-session.v1");auto session=std::make_unique<ChainSession>(ChainSession::initial(sample()));
+    ChainSessionStore sessions(sessionPath);check(sessions.save(*session),"dual session seeds ordinary configuration");
+    const auto old=readBytes(sessionPath);session->configurations[0]=ChainConfiguration::capture(toChain(s),s,-1,-1);
+    check(sessions.save(*session)&&readBytes(sessionPath)==old,"dual session preserves the older file");
+    check(readBytes(std::filesystem::path(sessionPath).concat(L".dual-sr")).starts_with("VEYRA_CHAIN_SESSION 12"),"dual session uses v12 sidecar");
+    auto back=std::make_unique<ChainSession>();ChainSessionStore reload(sessionPath);
+    check(reload.load(*back)&&back->configurations[0].dualSrEnabled&&back->configurations[0].dualSrQuality==2&&back->configurations[0].dualSrTarget==s.dualSrTarget,"session reload preserves independent second target and quality");
+}
+__declspec(noinline) void testSrStageStorage() {
+    EnhancementSettings source;source.nr=false;source.sr=true;source.videoSrQuality=3;
+    const auto libraryPath=scratch(L"sr-stage-library.v1");
+    const auto legacyLibrary=std::filesystem::path(libraryPath).concat(L".field-render");
+    for(const auto* suffix:{L".field-render",L".field-render.sr-stage",L".sr-stage"})std::filesystem::remove(std::filesystem::path(libraryPath).concat(suffix));
+    PresetLibrary writer(libraryPath);writer.setIncludeBuiltins(false);
+    PresetEntry entry;entry.name=L"SR stage";entry.kind=ChainMode::List;
+    entry.contents=presetContentMask(PresetContent::Chain);entry.chain=toChain(source);
+    entry.globals=ChainGlobalSettings::capture(source);
+    check(writer.load()&&writer.put(entry),"SR stage presets: save a single-step library");
+    const auto rollback=readBytes(legacyLibrary);
+    check(!rollback.empty()&&rollback.starts_with("VEYRA_PRESET_LIBRARY 6"),"SR stage presets: single step keeps the old format");
+    entry.globals->srPrescale=veyra::pipeline::SrPrescale::P1080;entry.globals->srOutput=veyra::pipeline::SrOutput::Uhd4K;
+    check(writer.put(entry,true),"SR stage presets: save prescale and output");
+    check(readBytes(legacyLibrary)==rollback,"SR stage presets: original library is retained for rollback");
+    PresetLibrary reader(libraryPath);reader.setIncludeBuiltins(false);
+    check(reader.load()&&reader.entries().size()==1&&reader.entries()[0].globals->srPrescale==veyra::pipeline::SrPrescale::P1080&&
+          reader.entries()[0].globals->srOutput==veyra::pipeline::SrOutput::Uhd4K,"SR stage presets: fresh reader finds the sidecar");
+    auto applied=source;PresetLibrary::apply(reader.entries()[0],applied);
+    check(applied.srPrescale==veyra::pipeline::SrPrescale::P1080&&applied.srOutput==veyra::pipeline::SrOutput::Uhd4K,"SR stage presets: applying the chain restores both");
+    const auto exported=scratch(L"sr-stage-export.v16");
+    check(writer.exportEntry(0,exported)&&readBytes(exported).starts_with("VEYRA_PRESET_LIBRARY 16"),"SR stage presets: export declares v16");
+    entry.name=L"invalid stage";entry.globals->srPrescale=veyra::pipeline::SrPrescale(5);
+    check(!writer.put(entry),"SR stage presets: an invalid prescale is rejected atomically");
+
+    const auto sessionPath=scratch(L"sr-stage-session.v1");
+    for(const auto* suffix:{L".sr-stage",L".p3-editor",L".p3-editor.p3-globals",L".p3-editor.sr-stage"})std::filesystem::remove(std::filesystem::path(sessionPath).concat(suffix));
+    std::filesystem::remove(sessionPath);
+    auto session=std::make_unique<ChainSession>(ChainSession::initial(source));
+    check(session->select(ChainMode::Node),"SR stage session: initialize independent node configuration");
+    ChainSessionStore sessions(sessionPath);
+    check(sessions.save(*session),"SR stage session: save single-step rollback file");
+    const auto sessionRollback=readBytes(sessionPath);
+    session->configurations[0].srPrescale=veyra::pipeline::srPrescaleForPercent(75);
+    session->configurations[1].srOutput=veyra::pipeline::SrOutput::Source;
+    check(sessions.save(*session)&&readBytes(sessionPath)==sessionRollback,"SR stage session: save the new format beside the original");
+    check(readBytes(std::filesystem::path(sessionPath).concat(L".sr-stage")).starts_with("VEYRA_CHAIN_SESSION 11"),"SR stage session: the sidecar declares v11");
+    auto restored=std::make_unique<ChainSession>();ChainSessionStore reopened(sessionPath);
+    check(reopened.load(*restored)&&*restored==*session,"SR stage session: List and Node values round-trip independently");
+}
+// E0 (2026-10-18): library v14 / session v9 carry anti-aliasing nodes and chains
+// past 16 nodes in their own files; older readers keep their bytes.
+__declspec(noinline) void testBeautyNodeStorage() {
+    const auto path = scratch(L"beauty-library.v1");
+    const auto sidecar = std::filesystem::path(path).concat(L".beauty");
+    for (const auto* suffix : {L".beauty", L".effects", L".effects.beauty"}) std::filesystem::remove(std::filesystem::path(path).concat(suffix));
+    PresetLibrary writer(path); writer.setIncludeBuiltins(false);
+    auto old = std::make_unique<PresetEntry>(); old->name = L"before beauty"; old->chain = toChain(sample());
+    check(writer.load() && writer.put(*old), "beauty storage: seed a library without beauty");
+    const auto original = readBytes(path);
+    check(!original.starts_with("VEYRA_PRESET_LIBRARY 15") && !std::filesystem::exists(sidecar),
+          "beauty storage: untouched beauty keeps the older format");
+    auto settings = sample();
+    settings.beauty.enabled = true; settings.beauty.restore = true; settings.beauty.restoreStrength = 0.8f; settings.beauty.feather = 0.12f;
+    settings.beauty.smooth = true; settings.beauty.smoothAmount = 0.55f; settings.beauty.radius = 6.5f; settings.beauty.scope = BeautyScope::AllSkin;
+    settings.beauty.minConfidence = 0.7f; settings.beauty.lumaMin = 0.06f;
+    settings.additionalBeautyCount = 1;
+    settings.additionalBeauty[0].enabled = false; settings.additionalBeauty[0].restore = true; settings.additionalBeauty[0].restoreScope = BeautyRestoreScope::Skin;
+    settings.beautyDetection.quality = 2; settings.beautyDetection.maxFaces = 3; settings.beautyDetection.stability = 0.25f;
+    check(settings.validate().empty(), "beauty storage: two beauty layers validate");
+    auto entry = std::make_unique<PresetEntry>(); entry->name = L"beauty"; entry->chain = toChain(settings);
+    check(writer.put(*entry), "beauty storage: save a chain with beauty");
+    check(readBytes(path) == original && readBytes(sidecar).starts_with("VEYRA_PRESET_LIBRARY 15\n"),
+          "beauty storage: v15 goes to its own file and keeps the older library intact");
+    {
+        PresetLibrary reader(path); reader.setIncludeBuiltins(false);
+        check(reader.load() && reader.entries().size() == 2 && reader.entries()[1].chain == entry->chain,
+              "beauty storage: both layers and the shared detection reload exactly");
+        auto applied = sample(); PresetLibrary::apply(reader.entries()[1], applied);
+        check(applied.beauty == settings.beauty && applied.additionalBeautyCount == 1 && applied.additionalBeauty[0] == settings.additionalBeauty[0] &&
+              applied.beautyDetection == settings.beautyDetection, "beauty storage: applying the chain restores beauty");
+        auto plain = sample(); PresetLibrary::apply(reader.entries()[0], plain);
+        check(plain.beauty == BeautySettings{} && plain.additionalBeautyCount == 0, "beauty storage: an older chain applies without beauty");
+    }
+    // A v14 reader (anti-aliasing build) cannot take the beauty payload; it refuses the file.
+    auto downgraded = readBytes(sidecar);
+    downgraded.replace(0, std::string("VEYRA_PRESET_LIBRARY 15").size(), "VEYRA_PRESET_LIBRARY 14");
+    const auto downgradedPath = scratch(L"beauty-downgraded.v1");
+    { std::ofstream f(downgradedPath, std::ios::binary); f << downgraded; }
+    {
+        PresetLibrary reader(downgradedPath); reader.setIncludeBuiltins(false);
+        check(!reader.load() || reader.entries().empty(), "beauty storage: beauty payloads under a v14 header are refused");
+    }
+    const auto sessionPath = scratch(L"beauty-session.v1");
+    for (const auto* suffix : {L".beauty", L".effects"}) std::filesystem::remove(std::filesystem::path(sessionPath).concat(suffix));
+    auto session = std::make_unique<ChainSession>(ChainSession::initial(sample()));
+    ChainSessionStore sessions(sessionPath);
+    check(sessions.save(*session), "beauty session: save the older format first");
+    const auto rollback = readBytes(sessionPath);
+    session->configurations[0].chain = toChain(settings);
+    check(sessions.save(*session) && readBytes(sessionPath) == rollback &&
+          readBytes(std::filesystem::path(sessionPath).concat(L".beauty")).starts_with("VEYRA_CHAIN_SESSION 10"),
+          "beauty session: v10 goes to its own file");
+    auto restored = std::make_unique<ChainSession>();
+    ChainSessionStore reload(sessionPath);
+    check(reload.load(*restored) && restored->configurations[0].chain == session->configurations[0].chain,
+          "beauty session: the list chain with beauty reloads exactly");
+}
+
+__declspec(noinline) void testEffectNodeStorage() {
+    const auto path = scratch(L"effects-library.v1");
+    const auto sidecar = std::filesystem::path(path).concat(L".effects");
+    std::filesystem::remove(sidecar);
+    PresetLibrary writer(path); writer.setIncludeBuiltins(false);
+    auto old = std::make_unique<PresetEntry>(); old->name = L"before effects"; old->chain = toChain(sample());
+    check(writer.load() && writer.put(*old), "effects storage: seed a library without anti-aliasing");
+    const auto original = readBytes(path);
+    check(!original.starts_with("VEYRA_PRESET_LIBRARY 14") && !std::filesystem::exists(sidecar),
+          "effects storage: untouched anti-aliasing keeps the older format");
+    auto settings = sample();
+    settings.antiAlias.enabled = true; settings.antiAlias.method = AntiAliasMethod::Mlaa; settings.antiAlias.quality = 0;
+    settings.antiAlias.mlaaThreshold = 0.15f; settings.antiAlias.mlaaStrength = 0.7f;
+    auto entry = std::make_unique<PresetEntry>(); entry->name = L"anti-aliased"; entry->chain = toChain(settings);
+    check(writer.put(*entry), "effects storage: save an anti-aliasing chain");
+    check(readBytes(path) == original && readBytes(sidecar).starts_with("VEYRA_PRESET_LIBRARY 14\n"),
+          "effects storage: v14 goes to its own file and keeps the older library intact");
+    {
+        PresetLibrary reader(path); reader.setIncludeBuiltins(false);
+        check(reader.load() && reader.entries().size() == 2 && reader.entries()[1].chain == entry->chain,
+              "effects storage: anti-aliasing parameters reload exactly");
+        auto applied = sample(); PresetLibrary::apply(reader.entries()[1], applied);
+        check(applied.antiAlias == settings.antiAlias, "effects storage: applying the chain restores anti-aliasing");
+        auto plain = sample(); PresetLibrary::apply(reader.entries()[0], plain);
+        check(plain.antiAlias == AntiAliasSettings{}, "effects storage: an older chain applies without anti-aliasing");
+    }
+    // A v13 header cannot smuggle the new node type; a newer version is refused outright.
+    auto downgraded = readBytes(sidecar);
+    downgraded.replace(0, std::string("VEYRA_PRESET_LIBRARY 14").size(), "VEYRA_PRESET_LIBRARY 13");
+    const auto downgradedPath = scratch(L"effects-downgraded.v1");
+    { std::ofstream f(downgradedPath, std::ios::binary); f << downgraded; }
+    {
+        PresetLibrary reader(downgradedPath); reader.setIncludeBuiltins(false);
+        check(!reader.load() || reader.entries().empty(), "effects storage: anti-aliasing nodes under a v13 header are refused");
+    }
+    auto future = readBytes(sidecar);
+    future.replace(0, std::string("VEYRA_PRESET_LIBRARY 14").size(), "VEYRA_PRESET_LIBRARY 16");
+    const auto futurePath = scratch(L"effects-future.v1");
+    { std::ofstream f(futurePath, std::ios::binary); f << future; }
+    {
+        PresetLibrary reader(futurePath); reader.setIncludeBuiltins(false);
+        check(!reader.load() || reader.entries().empty(), "effects storage: an unknown newer version is refused");
+    }
+    // A node chain past the old 16-node limit.
+    auto wide = std::make_unique<PresetEntry>(); wide->name = L"wide nodes"; wide->kind = ChainMode::Node;
+    wide->chain.mode = ChainMode::Node;
+    const auto add = [&](EffectType type, uint32_t count) {
+        for (uint32_t i = 0; i < count; ++i) {
+            auto& node = wide->chain.nodes[wide->chain.nodeCount++]; node.type = type; node.enabled = true;
+            node.viewX = float(wide->chain.nodeCount) * 10.0f;
+            if (type == EffectType::Color) { node.color.enabled = true; node.color.exposure = 0.1f * float(i); }
+            if (type == EffectType::AntiAliasing) { node.aa.enabled = true; node.aa.method = AntiAliasMethod(i % 3); node.aa.quality = 0; }
+        }
+    };
+    add(EffectType::Color, kMaxColorInstances); add(EffectType::AntiAliasing, kMaxAntiAliasInstances);
+    add(EffectType::SuperResolution, 1); add(EffectType::NrEnhance, kMaxNrInstances); add(EffectType::Beauty, 3);
+    add(EffectType::VideoHdr, 1); add(EffectType::FrameGeneration, 1);
+    check(wide->chain.nodeCount == 18 && writer.put(*wide), "effects storage: save an 18-node chain");
+    {
+        PresetLibrary reader(path); reader.setIncludeBuiltins(false);
+        check(reader.load() && reader.entries().size() == 3 && reader.entries()[2].chain == wide->chain,
+              "effects storage: an 18-node chain reloads exactly");
+    }
+
+    const auto sessionPath = scratch(L"effects-session.v1");
+    std::filesystem::remove(std::filesystem::path(sessionPath).concat(L".effects"));
+    auto session = std::make_unique<ChainSession>(ChainSession::initial(sample()));
+    ChainSessionStore sessions(sessionPath);
+    check(sessions.save(*session), "effects session: save the older format first");
+    const auto rollback = readBytes(sessionPath);
+    session->configurations[0].chain = toChain(settings);
+    check(sessions.save(*session) && readBytes(sessionPath) == rollback &&
+          readBytes(std::filesystem::path(sessionPath).concat(L".effects")).starts_with("VEYRA_CHAIN_SESSION 9"),
+          "effects session: v9 goes to its own file beside the older session");
+    auto restored = std::make_unique<ChainSession>();
+    ChainSessionStore reopened(sessionPath);
+    check(reopened.load(*restored) && *restored == *session, "effects session: anti-aliasing round-trips through the session");
+}
+
+// DLAA (method 3, 2026-11-08): readers up to library v19 / session v14 refuse the
+// value, so a library or session holding it gets its own version and file.
+__declspec(noinline) void testDlaaStorage() {
+    AntiAliasSettings dlaa; dlaa.enabled = true; dlaa.method = AntiAliasMethod::Dlaa; dlaa.quality = 0;
+    check(dlaa.validate().empty() && dlaa.usesDlaa(), "dlaa: method 3 with no tier is valid");
+    auto tiered = dlaa; tiered.quality = 1;
+    check(!tiered.validate().empty(), "dlaa: a quality tier is refused (DLAA has none)");
+    auto temporal = dlaa; temporal.temporal = AntiAliasTemporal::T2x;
+    check(!temporal.validate().empty(), "dlaa: the experimental SMAA accumulation is refused");
+    {
+        std::ostringstream o; o.imbue(std::locale::classic()); writeAntiAlias(o, dlaa);
+        std::istringstream in(o.str()); in.imbue(std::locale::classic()); AntiAliasSettings back;
+        check(readAntiAlias(in, back) && back == dlaa, "dlaa: the node block round-trips");
+        std::istringstream four("1 4 0 0.08 1 0 0.5 8"); four.imbue(std::locale::classic()); AntiAliasSettings bad;
+        check(!readAntiAlias(four, bad), "dlaa: method 4 stays refused");
+    }
+    const auto path = scratch(L"dlaa-library.v1");
+    const auto sidecar = std::filesystem::path(path).concat(L".dlaa");
+    std::filesystem::remove(sidecar);
+    PresetLibrary writer(path); writer.setIncludeBuiltins(false);
+    auto settings = sample();
+    settings.antiAlias.enabled = true; settings.antiAlias.method = AntiAliasMethod::Mlaa; settings.antiAlias.quality = 0;
+    auto mlaa = std::make_unique<PresetEntry>(); mlaa->name = L"mlaa"; mlaa->chain = toChain(settings);
+    check(writer.load() && writer.put(*mlaa), "dlaa storage: seed a library with an MLAA node");
+    const auto original = readBytes(path);
+    const auto before = std::filesystem::path(path).concat(L".effects");
+    const auto seeded = std::filesystem::exists(before) ? readBytes(before) : original;
+    check(!seeded.starts_with("VEYRA_PRESET_LIBRARY 20") && !std::filesystem::exists(sidecar), "dlaa storage: no DLAA keeps the older version and files");
+    settings.antiAlias = dlaa;
+    auto entry = std::make_unique<PresetEntry>(); entry->name = L"dlaa"; entry->chain = toChain(settings);
+    check(writer.put(*entry), "dlaa storage: save a DLAA chain");
+    const auto written = std::filesystem::exists(std::filesystem::path(before).concat(L".dlaa")) ? std::filesystem::path(before).concat(L".dlaa") : sidecar;
+    check(readBytes(written).starts_with("VEYRA_PRESET_LIBRARY 20\n") && readBytes(path) == original &&
+          (!std::filesystem::exists(before) || readBytes(before) == seeded),
+          "dlaa storage: v20 goes to its own file and the older libraries stay intact");
+    {
+        PresetLibrary reader(path); reader.setIncludeBuiltins(false);
+        check(reader.load() && reader.entries().size() == 2 && reader.entries()[1].chain == entry->chain,
+              "dlaa storage: the DLAA chain reloads exactly");
+        auto applied = sample(); PresetLibrary::apply(reader.entries()[1], applied);
+        check(applied.antiAlias == dlaa, "dlaa storage: applying the chain restores DLAA");
+    }
+    // A v19 header cannot carry method 3.
+    auto downgraded = readBytes(written);
+    downgraded.replace(0, std::string("VEYRA_PRESET_LIBRARY 20").size(), "VEYRA_PRESET_LIBRARY 19");
+    const auto downgradedPath = scratch(L"dlaa-downgraded.v1");
+    { std::ofstream f(downgradedPath, std::ios::binary); f << downgraded; }
+    {
+        PresetLibrary reader(downgradedPath); reader.setIncludeBuiltins(false);
+        check(!reader.load() || reader.entries().size() < 2, "dlaa storage: DLAA under a v19 header is refused");
+    }
+    const auto sessionPath = scratch(L"dlaa-session.v1");
+    std::filesystem::remove(std::filesystem::path(sessionPath).concat(L".dlaa"));
+    auto session = std::make_unique<ChainSession>(ChainSession::initial(sample()));
+    ChainSessionStore sessions(sessionPath);
+    check(sessions.save(*session), "dlaa session: save the older format first");
+    const auto rollback = readBytes(sessionPath);
+    session->configurations[0].chain = toChain(settings);
+    check(sessions.save(*session) && readBytes(sessionPath) == rollback &&
+          readBytes(std::filesystem::path(sessionPath).concat(L".dlaa")).starts_with("VEYRA_CHAIN_SESSION 15"),
+          "dlaa session: v15 goes to its own file beside the older session");
+    auto restored = std::make_unique<ChainSession>();
+    ChainSessionStore reopened(sessionPath);
+    check(reopened.load(*restored) && *restored == *session, "dlaa session: DLAA round-trips through the session");
+}
+__declspec(noinline) void testOutputControlStorage() {
+    EnhancementSettings settings;settings.nr=true;settings.multiplier=3;
+    settings.exclusion.enabled=true;settings.exclusion.featherPixels=29;
+    settings.exclusion.regions[0]={.1f,.2f,.6f,.8f,true};
+    settings.nrHoldStrength=.67f;settings.nrHoldTolerance=.03f;
+    auto session=std::make_unique<ChainSession>(ChainSession::initial(settings));
+    check(session->select(ChainMode::Node),"output controls: initialize node mode");
+    auto editor=std::make_shared<NodeEditorDocument>();
+    editor->nodes=session->configurations[1].chain;
+    check(editor->layout.initialize(editor->nodes).accepted,"output controls: stable IDs");
+    editor->layout.inputNext=0; // unfinished wiring must still save every parameter
+    editor->nodes.firstOf(EffectType::NrStabilizer)->viewX=543;
+    session->configurations[1].editor=editor;
+    const auto sessionPath=scratch(L"output-controls-session.v1");
+    ChainSessionStore writer(sessionPath);
+    auto baseline=std::make_unique<ChainSession>(ChainSession::initial({}));
+    check(writer.save(*baseline),"output controls: old session rollback point");
+    const auto original=readBytes(sessionPath);
+    const auto sessionSidecar=std::filesystem::path(sessionPath).concat(L".output-controls");
+    check(writer.save(*session)&&readBytes(sessionPath)==original&&
+          readBytes(sessionSidecar).starts_with("VEYRA_CHAIN_SESSION 16"),
+          "output controls: session16 sidecar preserves old session");
+    auto restored=std::make_unique<ChainSession>();ChainSessionStore reader(sessionPath);
+    check(reader.load(*restored)&&*restored==*session,
+          "output controls: detached mask and stabilizer payloads survive restart");
+    check(writer.save(*baseline),"output controls: remove nodes after upgrade");
+    ChainSessionStore rereader(sessionPath);
+    check(rereader.load(*restored)&&*restored==*baseline,
+          "output controls: subsequent deletion stays in the preferred sidecar");
+    const auto libraryPath=scratch(L"output-controls-library.v1");
+    PresetLibrary library(libraryPath);library.setIncludeBuiltins(false);library.load();
+    PresetEntry entry;entry.name=L"output controls";entry.kind=ChainMode::Node;
+    entry.chain=baseline->configurations[0].chain;entry.chain.mode=ChainMode::Node;
+    check(library.put(entry),"output controls: old library rollback point");
+    const auto libraryOriginal=readBytes(libraryPath);
+    entry.chain=session->configurations[1].chain;entry.nodeConfiguration=session->configurations[1];
+    const auto librarySidecar=std::filesystem::path(libraryPath).concat(L".output-controls");
+    check(library.put(entry,true)&&readBytes(libraryPath)==libraryOriginal&&
+          readBytes(librarySidecar).starts_with("VEYRA_PRESET_LIBRARY 21"),
+          "output controls: library21 with editor uses one upgrade sidecar");
+    PresetLibrary reopened(libraryPath);reopened.setIncludeBuiltins(false);
+    check(reopened.load()&&reopened.entries().size()==1&&reopened.entries()[0]==entry,
+          "output controls: library restores editor IDs, masks and hold values");
+    entry.nodeConfiguration.reset();entry.chain=baseline->configurations[0].chain;entry.chain.mode=ChainMode::Node;
+    check(library.put(entry,true),"output controls: remove library controls");
+    PresetLibrary finalReader(libraryPath);finalReader.setIncludeBuiltins(false);
+    check(finalReader.load()&&finalReader.entries().size()==1&&finalReader.entries()[0]==entry,
+          "output controls: deleting all new nodes also survives restart");
+}
+__declspec(noinline) void testDedupModeMigration() {
+    check(int(ContentRate::Transport)==0&&int(ContentRate::Auto)==1&&int(ContentRate::Capture60To30)==5,
+          "dedup migration: persisted off/auto/half IDs remain 0/1/5");
+    check(EnhancementSettings{}.content==ContentRate::Transport,
+          "dedup migration: fresh settings still keep duplicate removal off");
+    for(int stored=0;stored<=5;++stored){
+        const auto path=scratch((L"legacy-content-"+std::to_wstring(stored)+L".v1").c_str());
+        PresetLibrary writer(path);writer.setIncludeBuiltins(false);check(writer.load(),"dedup migration: create fixture");
+        PresetEntry entry;entry.name=L"legacy content";entry.contents=presetContentMask(PresetContent::Flow);
+        entry.chain=toChain({});
+        entry.flow=PresetFlowSettings{OpticalFlowBackend::AmdFidelityFx,FlowQuality::Quality,true,ContentRate(stored)};
+        check(writer.put(entry),"dedup migration: write historical numeric mode");
+        const auto original=readBytes(path);
+        PresetLibrary reader(path);reader.setIncludeBuiltins(false);
+        const bool loaded=reader.load()&&reader.entries().size()==1;
+        check(loaded,"dedup migration: historical preset is readable");
+        if(!loaded)continue;
+        check(reader.entries()[0].flow->content==ContentRate(stored)&&readBytes(path)==original,
+              "dedup migration: reading preserves the old file and its numeric payload");
+        EnhancementSettings target;target.audioOffsetMs=37;target.color.enabled=true;target.color.exposure=.25f;
+        auto chain=toChain(target);
+        const auto result=PresetLibrary::applyToChain(reader.entries()[0],chain,target);
+        const int expected=stored==0?0:stored==5?5:1;
+        check(result.accepted&&int(target.content)==expected,
+              "dedup migration: applied legacy modes become auto; off and 60-to-30 stay exact");
+        check(target.audioOffsetMs==37&&target.color.exposure==.25f&&
+              target.opticalFlowBackend==OpticalFlowBackend::AmdFidelityFx&&target.flow==FlowQuality::Quality&&target.amdFlowHalfResolution,
+              "dedup migration: unrelated controls and other selected flow controls survive");
+        check(int(PresetFlowSettings::capture(target).content)==expected,
+              "dedup migration: newly captured presets contain the current mode");
+        auto invalid=reader.entries()[0];invalid.flow->content=ContentRate(99);
+        check(!reader.put(invalid,true)&&readBytes(path)==original,
+              "dedup migration: an unknown mode is refused without overwriting the valid preset");
+    }
+}
+__declspec(noinline) void testAutomaticMultiplierCompatibility() {
+    auto session = std::make_unique<ChainSession>(ChainSession::initial(sample()));
+    check(session->select(ChainMode::Node), "auto FG: initialize editor mode");
+    auto editor=std::make_shared<NodeEditorDocument>();
+    editor->nodes=session->configurations[1].chain;
+    check(editor->layout.initialize(editor->nodes).accepted,"auto FG: initialize editor layout");
+    editor->globals=static_cast<const ChainGlobalSettings&>(session->configurations[1]);
+    editor->nodes.fgAutoMultiplier=true;
+    session->configurations[1].editor=editor;
+    session->configurations[0].chain.fgAutoMultiplier=true;
+    const auto path=scratch(L"auto-fg-session.v1");
+    ChainSessionStore writer(path);
+    check(writer.save(*session),"auto FG: session v17 with independent editor serializes");
+    auto restored=std::make_unique<ChainSession>();ChainSessionStore reader(path);
+    check(reader.load(*restored)&&*restored==*session,"auto FG: list and editor flags survive restart");
+    PresetLibrary library(scratch(L"auto-fg-library.v1"));library.setIncludeBuiltins(false);library.load();
+    PresetEntry entry;entry.name=L"auto FG";entry.kind=ChainMode::Node;
+    entry.chain=session->configurations[1].chain;entry.nodeConfiguration=session->configurations[1];
+    check(library.put(entry),"auto FG: preset with editor v17 serializes");
+}
+int main(int argc,char** argv) {
+    if(argc==2&&std::string_view(argv[1])=="--dedup-migration"){
+        testDedupModeMigration();testFlowStorage();testFlowApplication();return failures?1:0;
+    }
+    testDedupModeMigration();
+    testAutomaticMultiplierCompatibility();
+    testOutputControlStorage();
+    testEffectNodeStorage();
+    testDlaaStorage();
+    testBeautyNodeStorage();
+    testDlssSrModels();
+    testSrStageStorage();
+    testDualSrStorage();
+    testFlowStorage();
+    testFlowApplication();
+    testNrCorrectionStorage();
+    testNrVariants();
+    testRenderingChoices();
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    testLegacyProtectionMigration();
+    testNodeEditorSession();
+    testEditorPresetParts();
+    testEditorPresetStorage();
+    testEditorGlobalSettings();
+    testNoBuiltinsAndSingleFile();
+    testFsrBackendStorage();
+    return testExistingPresets();
+}

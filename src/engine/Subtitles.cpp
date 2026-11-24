@@ -1,0 +1,1024 @@
+#include "veyra/engine/Subtitles.h"
+#include "veyra/engine/SubtitleCacheBudget.h"
+#include "veyra/media/NetworkInput.h"
+#include <cstdlib>
+#include "veyra/Log.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <cstring>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <limits>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavcodec/codec_desc.h>
+#include <libavformat/avformat.h>
+#include <libavutil/error.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/mathematics.h>
+#include <libavutil/opt.h>
+#include <libswresample/swresample.h>
+}
+
+namespace veyra::engine {
+namespace {
+constexpr size_t kMaxSubtitleFileBytes=16u*1024u*1024u;
+constexpr size_t kMaxCues=120000;
+
+std::wstring wide(const std::string& s){
+    if(s.empty())return {};
+    const int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),int(s.size()),nullptr,0);
+    if(n<=0)return {};
+    std::wstring r(size_t(n),L'\0');
+    MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),int(s.size()),r.data(),n);
+    return r;
+}
+std::string utf8(const std::wstring& s){
+    if(s.empty())return {};
+    const int n=WideCharToMultiByte(CP_UTF8,0,s.data(),int(s.size()),nullptr,0,nullptr,nullptr);
+    if(n<=0)return {};
+    std::string r(size_t(n),'\0');
+    WideCharToMultiByte(CP_UTF8,0,s.data(),int(s.size()),r.data(),n,nullptr,nullptr);
+    return r;
+}
+
+bool readTextFile(const std::wstring& path,std::wstring& out){
+    std::ifstream in(std::filesystem::path(path),std::ios::binary);
+    if(!in)return false;
+    in.seekg(0,std::ios::end);
+    const auto size=in.tellg();
+    if(size<=0||size>std::streamoff(kMaxSubtitleFileBytes))return false;
+    in.seekg(0);
+    std::string data(size_t(size),'\0');
+    in.read(data.data(),std::streamsize(data.size()));
+    if(!in)return false;
+    if(data.size()>2&&uint8_t(data[0])==0xFF&&uint8_t(data[1])==0xFE){
+        out.clear();out.reserve(data.size()/2);
+        for(size_t i=2;i+1<data.size();i+=2)out.push_back(wchar_t(uint8_t(data[i])|uint8_t(data[i+1])<<8));
+        return true;
+    }
+    const char* start=data.data();size_t length=data.size();
+    if(length>=3&&uint8_t(start[0])==0xEF&&uint8_t(start[1])==0xBB&&uint8_t(start[2])==0xBF){start+=3;length-=3;}
+    out=wide(std::string(start,length));
+    return !out.empty();
+}
+
+std::wstring trim(std::wstring s){
+    const auto first=s.find_first_not_of(L" \t\r\n");
+    if(first==std::wstring::npos)return {};
+    const auto last=s.find_last_not_of(L" \t\r\n");
+    return s.substr(first,last-first+1);
+}
+std::wstring lower(std::wstring s){for(auto& c:s)c=wchar_t(towlower(c));return s;}
+
+// "00:01:02,345" / "0:00:01.23" / "00:01:02.345" -> seconds
+bool parseClock(const std::wstring& text,double& seconds){
+    int h=0,m=0;double s=0;
+    wchar_t tail=0;
+    if(swscanf_s(text.c_str(),L"%d:%d:%lf%c",&h,&m,&s,&tail,1)==3){seconds=h*3600.0+m*60.0+s;return true;}
+    return false;
+}
+
+// ASS colours are &HAABBGGRR with 00 = opaque.
+uint32_t assColor(const std::wstring& field,uint32_t fallback){
+    std::wstring value=trim(field);
+    if(value.empty())return fallback;
+    if(value[0]==L'&')value=value.substr(1);
+    if(!value.empty()&&(value[0]==L'H'||value[0]==L'h'))value=value.substr(1);
+    if(!value.empty()&&value.back()==L'&')value.pop_back();
+    if(value.empty())return fallback;
+    wchar_t* end=nullptr;
+    const unsigned long raw=wcstoul(value.c_str(),&end,16);
+    if(end==value.c_str())return fallback;
+    const uint32_t b=raw&0xFF,r=(raw>>16)&0xFF,g=(raw>>8)&0xFF,a=(raw>>24)&0xFF;
+    const uint32_t alpha=(raw>>24)?(255u-(a&0xFF)):255u; // 00 = fully opaque
+    return (alpha<<24)|(r<<16)|(g<<8)|b;
+}
+
+// Removes ASS override blocks and turns the escaped line breaks into '\n'.
+std::wstring cleanAssText(const std::wstring& raw,int& alignOverride,double& posX,double& posY){
+    std::wstring out;out.reserve(raw.size());
+    bool inBlock=false;
+    for(size_t i=0;i<raw.size();++i){
+        const wchar_t c=raw[i];
+        if(!inBlock&&c==L'{'){inBlock=true;
+            const auto end=raw.find(L'}',i);
+            const std::wstring block=end==std::wstring::npos?raw.substr(i):raw.substr(i,end-i+1);
+            const auto an=block.find(L"\\an");
+            if(an!=std::wstring::npos&&an+3<block.size()&&block[an+3]>=L'1'&&block[an+3]<=L'9')alignOverride=block[an+3]-L'0';
+            const auto pos=block.find(L"\\pos(");
+            if(pos!=std::wstring::npos){
+                const auto close=block.find(L')',pos);
+                if(close!=std::wstring::npos){
+                    const auto numbers=block.substr(pos+5,close-pos-5);
+                    const auto comma=numbers.find(L',');
+                    if(comma!=std::wstring::npos){
+                        posX=wcstod(numbers.substr(0,comma).c_str(),nullptr);
+                        posY=wcstod(numbers.substr(comma+1).c_str(),nullptr);
+                    }
+                }
+            }
+            i=end==std::wstring::npos?raw.size()-1:end;
+            inBlock=false;
+            continue;
+        }
+        if(c==L'\\'&&i+1<raw.size()){
+            const wchar_t next=raw[++i];
+            if(next==L'N'||next==L'n')out.push_back(L'\n');
+            else if(next==L'h')out.push_back(L' ');
+            else out.push_back(next);
+            continue;
+        }
+        out.push_back(c);
+    }
+    return trim(out);
+}
+
+SubtitleTrack parseSrt(const std::wstring& data,const std::wstring& name){
+    SubtitleTrack track;track.name=name;track.codec=L"SubRip";
+    track.styles.push_back(SubtitleStyle{});
+    std::wistringstream lines(data);std::wstring line;
+    while(std::getline(lines,line)&&track.cues.size()<kMaxCues){
+        int h=0,m=0,s=0,ms=0,h2=0,m2=0,s2=0,ms2=0;
+        if(swscanf_s(line.c_str(),L"%d:%d:%d,%d --> %d:%d:%d,%d",&h,&m,&s,&ms,&h2,&m2,&s2,&ms2)!=8)continue;
+        SubtitleCue cue;
+        cue.begin=h*3600.0+m*60.0+s+ms/1000.0;
+        cue.end=h2*3600.0+m2*60.0+s2+ms2/1000.0;
+        while(std::getline(lines,line)){
+            if(!line.empty()&&line.back()==L'\r')line.pop_back();
+            if(trim(line).empty())break;
+            if(!cue.text.empty())cue.text+=L'\n';
+            cue.text+=line;
+        }
+        cue.text=trim(cue.text);
+        if(cue.end>cue.begin&&!cue.text.empty())track.cues.push_back(std::move(cue));
+    }
+    return track;
+}
+
+SubtitleTrack parseAss(const std::wstring& data,const std::wstring& name,bool ssa){
+    SubtitleTrack track;track.name=name;track.codec=ssa?L"SSA":L"ASS";
+    track.styles.push_back(SubtitleStyle{});
+    std::map<std::wstring,int> styleIndex;
+    std::wistringstream lines(data);std::wstring line;
+    enum class Section {None,Script,Styles,Events} section=Section::None;
+    std::vector<std::wstring> styleFields,eventFields;
+    // Format lines list every field; value lines keep commas inside the last
+    // field (ASS dialogue text is allowed to contain commas).
+    auto split=[&](const std::wstring& source,const std::vector<std::wstring>& fields,std::vector<std::wstring>& out){
+        out.clear();
+        size_t start=0;
+        const size_t limit=fields.empty()?source.size():fields.size();
+        for(size_t i=0;i<source.size()&&out.size()+1<limit;++i){
+            if(source[i]!=L',')continue;
+            out.push_back(trim(source.substr(start,i-start)));
+            start=i+1;
+        }
+        out.push_back(trim(source.substr(start)));
+        return !out.empty();
+    };
+    while(std::getline(lines,line)){
+        line=trim(line);
+        if(line.empty())continue;
+        if(line.front()==L'['){
+            const auto marker=lower(line);
+            section=marker.find(L"[script info]")!=std::wstring::npos?Section::Script
+                   :marker.find(L"[v4+ styles]")!=std::wstring::npos?Section::Styles
+                   :marker.find(L"[v4 styles]")!=std::wstring::npos?Section::Styles
+                   :marker.find(L"[events]")!=std::wstring::npos?Section::Events:Section::None;
+            continue;
+        }
+        if(section==Section::Script){
+            const auto colon=line.find(L':');
+            if(colon==std::wstring::npos)continue;
+            const auto key=trim(line.substr(0,colon));
+            const auto value=trim(line.substr(colon+1));
+            if(key==L"PlayResX")track.scriptWidth=std::max(1.0,wcstod(value.c_str(),nullptr));
+            else if(key==L"PlayResY")track.scriptHeight=std::max(1.0,wcstod(value.c_str(),nullptr));
+            continue;
+        }
+        if(section==Section::Styles){
+            const auto colon=line.find(L':');
+            if(colon==std::wstring::npos)continue;
+            const auto kind=trim(line.substr(0,colon));
+            const auto rest=line.substr(colon+1);
+            if(kind==L"Format"){split(rest,{},styleFields);continue;}
+            if(kind!=L"Style")continue;
+            std::vector<std::wstring> values;
+            if(styleFields.size()<4||!split(rest,styleFields,values))continue;
+            SubtitleStyle style;style.font=L"Microsoft YaHei UI";
+            auto field=[&](const wchar_t* key)->std::wstring{
+                for(size_t i=0;i<styleFields.size()&&i<values.size();++i)if(styleFields[i]==key)return values[i];
+                return {};
+            };
+            const auto styleName=field(L"Name");
+            if(auto font=field(L"Fontname");!font.empty())style.font=font;
+            if(auto size=field(L"Fontsize");!size.empty())style.size=wcstod(size.c_str(),nullptr);
+            style.primary=assColor(field(L"PrimaryColour"),style.primary);
+            style.outline=assColor(field(L"OutlineColour"),style.outline);
+            style.back=assColor(field(L"BackColour"),style.back);
+            if(auto width=field(L"Outline");!width.empty())style.outlineWidth=wcstod(width.c_str(),nullptr);
+            if(auto shadow=field(L"Shadow");!shadow.empty())style.shadow=wcstod(shadow.c_str(),nullptr);
+            if(auto align=field(L"Alignment");!align.empty()){const int value=_wtoi(align.c_str());style.alignment=value>0?value:2;}
+            if(auto bold=field(L"Bold");!bold.empty())style.bold=_wtoi(bold.c_str())!=0;
+            if(auto italic=field(L"Italic");!italic.empty())style.italic=_wtoi(italic.c_str())!=0;
+            if(auto margin=field(L"MarginL");!margin.empty())style.marginL=wcstod(margin.c_str(),nullptr);
+            if(auto margin=field(L"MarginR");!margin.empty())style.marginR=wcstod(margin.c_str(),nullptr);
+            if(auto margin=field(L"MarginV");!margin.empty())style.marginV=wcstod(margin.c_str(),nullptr);
+            styleIndex[styleName]=int(track.styles.size());
+            track.styles.push_back(std::move(style));
+            continue;
+        }
+        if(section==Section::Events){
+            const auto colon=line.find(L':');
+            if(colon==std::wstring::npos)continue;
+            const auto kind=trim(line.substr(0,colon));
+            const auto rest=line.substr(colon+1);
+            if(kind==L"Format"){split(rest,{},eventFields);continue;}
+            if(kind!=L"Dialogue"&&kind!=L"Comment")continue;
+            if(kind==L"Comment")continue;
+            std::vector<std::wstring> values;
+            if(eventFields.size()<4||!split(rest,eventFields,values))continue;
+            auto field=[&](const wchar_t* key)->std::wstring{
+                for(size_t i=0;i<eventFields.size()&&i<values.size();++i)if(eventFields[i]==key)return values[i];
+                return {};
+            };
+            SubtitleCue cue;
+            if(!parseClock(trim(field(L"Start")),cue.begin)||!parseClock(trim(field(L"End")),cue.end))continue;
+            const auto styleName=field(L"Style");
+            const auto found=styleIndex.find(styleName);
+            cue.style=found!=styleIndex.end()?found->second:0;
+            const auto text=field(L"Text");
+            cue.text=cleanAssText(text,cue.alignOverride,cue.posX,cue.posY);
+            if(cue.end>cue.begin&&!cue.text.empty()&&track.cues.size()<kMaxCues)track.cues.push_back(std::move(cue));
+        }
+    }
+    return track;
+}
+
+// FFmpeg AVSubtitleRect::ass is ReadOrder,Layer,Style,Name,MarginL,MarginR,
+// MarginV,Effect,Text. Consume exactly the eight header separators: commas in
+// Text are authored punctuation, never another header field.
+std::wstring stripDialoguePrefix(const std::wstring& raw){
+    size_t start=0;
+    for(int field=0;field<8;++field){
+        const auto comma=raw.find(L',',start);
+        if(comma==std::wstring::npos)return raw;
+        start=comma+1;
+    }
+    return raw.substr(start);
+}
+
+SubtitleTrack parseVtt(const std::wstring& data,const std::wstring& name){
+    SubtitleTrack track;track.name=name;track.codec=L"WebVTT";
+    track.styles.push_back(SubtitleStyle{});
+    std::wistringstream lines(data);std::wstring line;
+    while(std::getline(lines,line)&&track.cues.size()<kMaxCues){
+        if(line.find(L"-->")==std::wstring::npos)continue;
+        const auto arrow=line.find(L"-->");
+        const auto begin=trim(line.substr(0,arrow));
+        auto rest=trim(line.substr(arrow+3));
+        const auto space=rest.find(L' ');
+        const auto end=space==std::wstring::npos?rest:rest.substr(0,space);
+        SubtitleCue cue;
+        if(!parseClock(begin,cue.begin)||!parseClock(end,cue.end))continue;
+        while(std::getline(lines,line)){
+            if(line.find(L"-->")!=std::wstring::npos){std::wistringstream back(line);break;}
+            if(trim(line).empty())break;
+            if(!line.empty()&&line.back()==L'\r')line.pop_back();
+            if(!cue.text.empty())cue.text+=L'\n';
+            cue.text+=line;
+        }
+        cue.text=trim(cue.text);
+        if(cue.end>cue.begin&&!cue.text.empty())track.cues.push_back(std::move(cue));
+    }
+    return track;
+}
+
+double rms(const float* samples,size_t count){
+    if(count==0)return 0;
+    double sum=0;
+    for(size_t i=0;i<count;++i)sum+=double(samples[i])*samples[i];
+    return std::sqrt(sum/double(count));
+}
+} // namespace
+
+void SubtitleTrack::rebuildIndex(){
+    std::stable_sort(cues.begin(),cues.end(),[](const SubtitleCue& a,const SubtitleCue& b){return a.begin<b.begin;});
+    starts.clear();starts.reserve(cues.size());
+    for(const auto& cue:cues)starts.push_back(cue.begin);
+}
+
+bool isTextSubtitleCodec(const std::wstring& codec){
+    auto name=lower(codec);
+    if(name==L"srt")name=L"subrip";
+    const auto* descriptor=avcodec_descriptor_get_by_name(utf8(name).c_str());
+    return descriptor&&(descriptor->props&AV_CODEC_PROP_TEXT_SUB)&&avcodec_find_decoder(descriptor->id);
+}
+
+static SubtitleTrack loadTextSubtitleFile(const std::wstring& path){
+    std::wstring data;
+    if(!readTextFile(path,data)){
+        return {};
+    }
+    std::wstring extension=lower(std::filesystem::path(path).extension().wstring());
+    const std::wstring name=std::filesystem::path(path).filename().wstring();
+    const auto head=data.substr(0,std::min<size_t>(data.size(),512));
+    const auto headLower=lower(head);
+    SubtitleTrack track;
+    if(extension==L".ass"||extension==L".ssa")track=parseAss(data,name,extension==L".ssa");
+    else if(extension==L".vtt"||headLower.find(L"webvtt")!=std::wstring::npos)track=parseVtt(data,name);
+    else if(headLower.find(L"[script info]")!=std::wstring::npos||headLower.find(L"dialogue:")!=std::wstring::npos)track=parseAss(data,name,false);
+    else track=parseSrt(data,name);
+    if(extension==L".ass"||extension==L".ssa"||headLower.find(L"[script info]")!=std::wstring::npos){
+        auto ass=std::make_shared<SubtitleAssData>();
+        ass->script=utf8(data);ass->source=L"file:"+path;
+        track.ass=std::move(ass);
+    }
+    track.rebuildIndex();   // cue lookup is binary searched, so it needs the index
+    return track;
+}
+
+SubtitleTrack loadSubtitleFile(const std::wstring& path){
+    auto tracks=loadExternalSubtitleTracks(path);
+    for(auto& track:tracks)if(track.usable())return std::move(track);
+    return tracks.empty()?SubtitleTrack{}:std::move(tracks.front());
+}
+
+std::vector<const SubtitleCue*> cuesAt(const SubtitleTrack& track,double seconds,size_t limit){
+    std::vector<const SubtitleCue*> found;
+    if(track.starts.empty())return found;
+    auto it=std::upper_bound(track.starts.begin(),track.starts.end(),seconds);
+    if(it==track.starts.begin())return found;
+    size_t index=size_t(it-track.starts.begin())-1;
+    const size_t budget=std::min<size_t>(index+1,256);
+    for(size_t scanned=0;scanned<budget;++scanned){
+        const auto& cue=track.cues[index];
+        if(cue.begin<=seconds&&seconds<cue.end){
+            found.push_back(&cue);
+            if(found.size()>=limit)break;
+        }
+        if(index==0)break;
+        if(seconds-track.cues[index].begin>3600.0)break;
+        --index;
+    }
+    std::reverse(found.begin(),found.end());
+    return found;
+}
+
+std::wstring textAt(const SubtitleTrack& track,double seconds){
+    const auto cues=cuesAt(track,seconds,3);
+    std::wstring text;
+    for(const auto* cue:cues){
+        if(cue->text.empty())continue;
+        if(!text.empty())text+=L'\n';
+        text+=cue->text;
+    }
+    return text;
+}
+
+std::vector<SubtitleCue> loadSrt(const std::wstring& path){
+    auto track=loadSubtitleFile(path);
+    track.rebuildIndex();
+    return track.cues;
+}
+
+std::wstring subtitleAt(const std::vector<SubtitleCue>& cues,double seconds){
+    for(const auto& cue:cues)if(cue.begin<=seconds&&seconds<cue.end)return cue.text;
+    return {};
+}
+
+std::vector<uint32_t> SubtitleBitmap::pixels()const{
+    if(width<=0||height<=0||width>8192||height>8192)return {};
+    const size_t count=size_t(width)*height;
+    std::vector<uint32_t> result;result.reserve(count);
+    for(const auto run:runs){const auto n=run>>8;if(!n||n>count-result.size())return {};result.insert(result.end(),n,palette[run&255]);}
+    if(result.size()!=count)return {};
+    return result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// A file on a server (UNC share / mapped drive) read by the subtitle scan (#48 C5). Playback reads
+// the same file through the shared demux session, so the scan must not compete with it: the caller
+// opens the file only after playback has its start buffer, every read waits while the gate is false
+// (playback short of data), and reads are paced to a bounded rate. Container demuxers read every
+// block of the file to find subtitle packets, so this is the whole file's worth of traffic.
+// VEYRA_TEST_SLOW_IO=<MB/s>[,<ms per read>] slows it like a slow NAS, as it does for playback.
+// ---------------------------------------------------------------------------------------------
+namespace {
+constexpr double kServerScanMBps=40.0;
+std::atomic<uint64_t> g_serverScanBytes{0};
+bool serverFilePath(const std::wstring& path){
+    static const bool forced=GetEnvironmentVariableW(L"VEYRA_TEST_FORCE_REMOTE_PATH",nullptr,0)>0;   // tests: a local file stands in for a NAS
+    return forced||media::remoteMediaPath(path);
+}
+struct ScanAvio {
+    static constexpr int kBuffer=64*1024;
+    HANDLE handle=INVALID_HANDLE_VALUE;AVIOContext* avio=nullptr;
+    const std::atomic<bool>* gate=nullptr;std::stop_token stop;
+    int64_t size=-1;double mbps=kServerScanMBps;int latencyMs=0;int64_t startNs=0;double paced=0;
+    ScanAvio()=default;
+    ScanAvio(const ScanAvio&)=delete;ScanAvio& operator=(const ScanAvio&)=delete;
+    ~ScanAvio(){
+        if(avio){av_freep(&avio->buffer);avio_context_free(&avio);}
+        if(handle!=INVALID_HANDLE_VALUE)CloseHandle(handle);
+    }
+    static int64_t nowNs(){return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+    bool open(const std::wstring& file,const std::atomic<bool>* readGate,std::stop_token token){
+        gate=readGate;stop=std::move(token);
+        handle=CreateFileW(file.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
+        if(handle==INVALID_HANDLE_VALUE)return false;
+        LARGE_INTEGER length{};if(GetFileSizeEx(handle,&length))size=length.QuadPart;
+        wchar_t text[64]{};
+        if(const DWORD n=GetEnvironmentVariableW(L"VEYRA_TEST_SLOW_IO",text,64);n>0&&n<64){
+            wchar_t* end=nullptr;const double slow=std::wcstod(text,&end);
+            if(slow>0)mbps=std::min(mbps,slow);
+            if(end&&*end==L',')latencyMs=std::max(0,_wtoi(end+1));
+        }
+        auto* buffer=static_cast<uint8_t*>(av_malloc(kBuffer));
+        if(!buffer)return false;
+        avio=avio_alloc_context(buffer,kBuffer,0,this,&ScanAvio::readPacket,nullptr,&ScanAvio::seek);
+        if(!avio){av_free(buffer);return false;}
+        startNs=nowNs();
+        return true;
+    }
+    // False once the scan is cancelled.
+    bool pause(int ms)const{
+        for(int waited=0;waited<ms;waited+=10){
+            if(stop.stop_requested())return false;
+            Sleep(DWORD(std::min(10,ms-waited)));
+        }
+        return !stop.stop_requested();
+    }
+    bool waitGate()const{
+        while(gate&&!gate->load()){
+            if(stop.stop_requested())return false;
+            Sleep(50);
+        }
+        return !stop.stop_requested();
+    }
+    static int readPacket(void* opaque,uint8_t* buffer,int size){
+        auto& self=*static_cast<ScanAvio*>(opaque);
+        if(!self.waitGate())return AVERROR_EXIT;
+        if(self.latencyMs>0&&!self.pause(self.latencyMs))return AVERROR_EXIT;
+        DWORD got=0;
+        if(!ReadFile(self.handle,buffer,DWORD(std::min(size,kBuffer)),&got,nullptr))return AVERROR(EIO);
+        if(got==0)return AVERROR_EOF;
+        g_serverScanBytes.fetch_add(got);
+        // Pacing: the bytes read so far may not run ahead of the allowed rate; idle time earns at most a second.
+        self.paced+=got;
+        const double allowed=self.paced/(self.mbps*1048576.0);
+        const double elapsed=double(nowNs()-self.startNs)/1e9;
+        if(allowed>elapsed&&!self.pause(int((allowed-elapsed)*1000.0)))return AVERROR_EXIT;
+        if(elapsed>allowed+1.0){self.startNs=nowNs();self.paced=0;}
+        return int(got);
+    }
+    static int64_t seek(void* opaque,int64_t offset,int whence){
+        auto& self=*static_cast<ScanAvio*>(opaque);
+        if(whence&AVSEEK_SIZE)return self.size;
+        whence&=~AVSEEK_FORCE;
+        if(self.latencyMs>0)self.pause(self.latencyMs);
+        LARGE_INTEGER target{},result{};
+        target.QuadPart=offset;
+        const DWORD method=whence==SEEK_SET?FILE_BEGIN:whence==SEEK_CUR?FILE_CURRENT:FILE_END;
+        if(!SetFilePointerEx(self.handle,target,&result,method))return AVERROR(EIO);
+        return result.QuadPart;
+    }
+};
+
+} // namespace
+
+static std::vector<SubtitleTrack> loadDemuxedSubtitleTracks(const std::wstring& path,std::stop_token stop,
+    const std::function<void(const std::vector<SubtitleTrack>&)>& metadata,const AVInputFormat* format=nullptr,
+    const std::atomic<bool>* serverGate=nullptr){
+    std::vector<SubtitleTrack> tracks;
+    if(stop.stop_requested())return tracks;
+    const auto started=std::chrono::steady_clock::now();
+    ScanAvio serverFile;   // outlives the demuxer below (members are released in reverse order)
+    if(serverGate){
+        // Deferred: the server is not touched until playback has its buffer.
+        while(!serverGate->load()){
+            if(stop.stop_requested())return tracks;
+            Sleep(100);
+        }
+        log::info("subtitle",std::format("server file scan starts (playback buffered) file={} rate<={:.0f}MB/s",
+            utf8(std::filesystem::path(path).filename().wstring()),kServerScanMBps));
+        if(!serverFile.open(path,serverGate,stop)){
+            log::warn("subtitle",std::format("server file open failed file={}",utf8(std::filesystem::path(path).filename().wstring())));
+            return tracks;
+        }
+    }
+    AVFormatContext* input=avformat_alloc_context();
+    if(!input)return tracks;
+    input->interrupt_callback={[](void* opaque){return static_cast<std::stop_token*>(opaque)->stop_requested()?1:0;},&stop};
+    if(serverGate){input->pb=serverFile.avio;input->flags|=AVFMT_FLAG_CUSTOM_IO;}
+    struct InputCleanup {AVFormatContext*& input;~InputCleanup(){avformat_close_input(&input);}} cleanup{input};
+    const auto utf8Path=utf8(path);
+    const int openResult=avformat_open_input(&input,utf8Path.c_str(),format,nullptr);
+    if(openResult<0||!input){
+        log::warn("subtitle",std::format("open failed ret={} file={}",openResult,utf8(std::filesystem::path(path).filename().wstring())));
+        return tracks;
+    }
+    const int infoResult=avformat_find_stream_info(input,nullptr);
+    if(infoResult<0){
+        log::warn("subtitle",std::format("stream info failed ret={}",infoResult));
+        return tracks;
+    }
+    log::info("subtitle",std::format("scan file={} demuxer={} zlib={}",utf8(std::filesystem::path(path).filename().wstring()),
+        input->iformat?input->iformat->name:"",std::strstr(avformat_configuration(),"--enable-zlib")!=nullptr));
+    struct DecoderCleanup {void operator()(AVCodecContext* context)const{avcodec_free_context(&context);}};
+    std::vector<std::unique_ptr<AVCodecContext,DecoderCleanup>> decoders;
+    std::vector<int> streamToTrack(input->nb_streams,-1);
+    // Matroska font attachments: ASS effect subtitles usually depend on them.
+    std::vector<SubtitleAssData::Font> attachedFonts;size_t attachedFontBytes=0;
+    for(unsigned streamIndex=0;streamIndex<input->nb_streams;++streamIndex){
+        const AVStream* stream=input->streams[streamIndex];
+        if(stream->codecpar->codec_type!=AVMEDIA_TYPE_ATTACHMENT||!stream->codecpar->extradata||stream->codecpar->extradata_size<=0)continue;
+        const AVDictionaryEntry* mime=stream->metadata?av_dict_get(stream->metadata,"mimetype",nullptr,0):nullptr;
+        const AVDictionaryEntry* file=stream->metadata?av_dict_get(stream->metadata,"filename",nullptr,0):nullptr;
+        const std::string mimeType=mime&&mime->value?mime->value:"";std::string fileName=file&&file->value?file->value:"";
+        std::string lowerName=fileName;for(auto& c:lowerName)c=char(std::tolower(static_cast<unsigned char>(c)));
+        const bool font=mimeType.find("font")!=std::string::npos||mimeType=="application/x-truetype-font"||mimeType=="application/vnd.ms-opentype"||
+            lowerName.ends_with(".ttf")||lowerName.ends_with(".otf")||lowerName.ends_with(".ttc");
+        const size_t size=size_t(stream->codecpar->extradata_size);
+        if(!font||size>64u*1024u*1024u||attachedFontBytes+size>256u*1024u*1024u)continue;
+        attachedFontBytes+=size;
+        attachedFonts.push_back({fileName,std::vector<char>(reinterpret_cast<const char*>(stream->codecpar->extradata),reinterpret_cast<const char*>(stream->codecpar->extradata)+size)});
+    }
+    if(!attachedFonts.empty())log::info("subtitle",std::format("container fonts attached={} bytes={}",attachedFonts.size(),attachedFontBytes));
+    const auto sharedFonts=std::make_shared<const std::vector<SubtitleAssData::Font>>(std::move(attachedFonts));
+    std::vector<std::shared_ptr<SubtitleAssData>> assWork;
+    for(unsigned streamIndex=0;streamIndex<input->nb_streams;++streamIndex){
+        if(stop.stop_requested())return {};
+        AVStream* stream=input->streams[streamIndex];
+        if(stream->codecpar->codec_type!=AVMEDIA_TYPE_SUBTITLE)continue;
+        SubtitleTrack track;
+        track.embedded=true;
+        track.streamIndex=int(streamIndex);
+        const char* codecName=avcodec_get_name(stream->codecpar->codec_id);
+        track.codec=wide(codecName?codecName:"");
+        if(stream->metadata){
+            if(const AVDictionaryEntry* language=av_dict_get(stream->metadata,"language",nullptr,0))track.language=wide(language->value);
+            if(const AVDictionaryEntry* title=av_dict_get(stream->metadata,"title",nullptr,0))track.name=wide(title->value);
+        }
+        if(track.name.empty())track.name=track.language.empty()?std::format(L"字幕轨 {}",tracks.size()+1):track.language;
+        track.styles.push_back(SubtitleStyle{});
+        streamToTrack[streamIndex]=int(tracks.size());
+        decoders.emplace_back();
+        const auto codec=stream->codecpar->codec_id;
+        const auto* descriptor=avcodec_descriptor_get(codec);
+        if(!descriptor||!(descriptor->props&(AV_CODEC_PROP_TEXT_SUB|AV_CODEC_PROP_BITMAP_SUB))){
+            track.note=L"暂不支持此字幕格式";
+            log::info("subtitle",std::format("embedded track {} codec={} listed as unsupported",streamIndex,codecName?codecName:""));
+            tracks.push_back(std::move(track));
+            continue;
+        }
+        const AVCodec* decoder=avcodec_find_decoder(stream->codecpar->codec_id);
+        AVCodecContext* context=decoder?avcodec_alloc_context3(decoder):nullptr;
+        if(context){context->pkt_timebase=stream->time_base;}
+        int initResult=!context?AVERROR(ENOMEM):avcodec_parameters_to_context(context,stream->codecpar);
+        if(initResult>=0)initResult=avcodec_open2(context,decoder,nullptr);
+        if(!decoder||initResult<0){
+            track.note=decoder?L"字幕解码器初始化失败":L"缺少此字幕格式的解码器";
+            log::warn("subtitle",std::format("decoder init stream={} codec={} present={} ret={}",streamIndex,codecName?codecName:"",decoder!=nullptr,initResult));
+            if(context)avcodec_free_context(&context);
+            tracks.push_back(std::move(track));
+            continue;
+        }
+        decoders.back().reset(context);
+        track.note=L"正在读取字幕";
+        if((codec==AV_CODEC_ID_ASS||codec==AV_CODEC_ID_SSA)&&context->subtitle_header&&context->subtitle_header_size>0){
+            auto ass=std::make_shared<SubtitleAssData>();
+            ass->header.assign(reinterpret_cast<const char*>(context->subtitle_header),size_t(context->subtitle_header_size));
+            ass->fonts=sharedFonts;ass->source=std::format(L"embedded:{}#{}",path,streamIndex);
+            if(assWork.size()<=tracks.size())assWork.resize(tracks.size()+1);
+            assWork[tracks.size()]=ass;track.ass=ass;
+        }
+        tracks.push_back(std::move(track));
+    }
+    assWork.resize(tracks.size());
+    // Published copies must never alias the vectors this loop still appends to.
+    auto snapshotAss=[&]{for(size_t i=0;i<tracks.size();++i)if(assWork[i])tracks[i].ass=std::make_shared<const SubtitleAssData>(*assWork[i]);};
+    snapshotAss();
+    if(metadata&&!stop.stop_requested())metadata(tracks);
+    if(std::none_of(decoders.begin(),decoders.end(),[](const auto& decoder){return bool(decoder);}))return tracks;
+    AVPacket* packet=av_packet_alloc();
+    struct PacketCleanup {AVPacket*& packet;~PacketCleanup(){av_packet_free(&packet);}} packetCleanup{packet};
+    const char* cacheSetting=std::getenv("VEYRA_SUBTITLE_CACHE_MB");
+    const size_t maxCacheBytes=size_t(subtitleCacheBudgetBytes(cacheSetting?std::string_view(cacheSetting):std::string_view{}));
+    log::info("subtitle",std::format("compressed cue cache budgetBytes={} (on demand, not preallocated)",maxCacheBytes));
+    size_t cacheBytes=0,totalCues=0;uint64_t packets=0;
+    struct DecodeStats {uint64_t packets=0,displays=0,errors=0,rejected=0;int lastError=0;};
+    std::vector<DecodeStats> stats(tracks.size());
+    int videoWidth=1920,videoHeight=1080;
+    for(unsigned i=0;i<input->nb_streams;++i)if(input->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_VIDEO){
+        videoWidth=std::max(1,input->streams[i]->codecpar->width);videoHeight=std::max(1,input->streams[i]->codecpar->height);break;
+    }
+    auto nextPublish=std::chrono::steady_clock::now()+std::chrono::milliseconds(250);
+    int readResult=0;
+    while(packet&&!stop.stop_requested()&&(readResult=av_read_frame(input,packet))>=0){
+            ++packets;
+            const int index=packet->stream_index>=0&&size_t(packet->stream_index)<streamToTrack.size()?streamToTrack[packet->stream_index]:-1;
+            if(index<0||!decoders[index]){av_packet_unref(packet);continue;}
+            auto& track=tracks[index];auto* context=decoders[index].get();
+            auto& stat=stats[index];++stat.packets;
+            const bool firstCue=track.cues.empty();
+            const double timeBase=av_q2d(input->streams[packet->stream_index]->time_base);
+            AVSubtitle subtitle{};
+            int got=0;
+            const int decodeResult=avcodec_decode_subtitle2(context,&subtitle,&got,packet);
+            if(decodeResult<0){
+                ++stat.errors;stat.lastError=decodeResult;
+                if(stat.errors<=3){char detail[AV_ERROR_MAX_STRING_SIZE]{};av_strerror(decodeResult,detail,sizeof(detail));
+                    log::warn("subtitle",std::format("decode failed stream={} codec={} ret={} detail={} pts={} size={}",
+                        track.streamIndex,utf8(track.codec),decodeResult,detail,packet->pts,packet->size));}
+            }
+            if(decodeResult<0||!got){avsubtitle_free(&subtitle);av_packet_unref(packet);continue;}
+            ++stat.displays;
+            const double packetSeconds=(subtitle.pts!=AV_NOPTS_VALUE?double(subtitle.pts)/AV_TIME_BASE:
+                packet->pts==AV_NOPTS_VALUE?0:double(packet->pts)*timeBase);
+            const auto* descriptor=avcodec_descriptor_get(context->codec_id);
+            const bool bitmapCodec=descriptor&&(descriptor->props&AV_CODEC_PROP_BITMAP_SUB);
+            if(bitmapCodec){
+                const double begin=packetSeconds+double(subtitle.start_display_time)/1000.0;
+                // A new display set (including an empty clear set) replaces the old one.
+                if(!track.cues.empty()&&begin>=track.cues.back().begin){
+                    if(begin==track.cues.back().begin)track.cues.pop_back();
+                    else track.cues.back().end=std::min(track.cues.back().end,begin);
+                }
+                auto frame=std::make_shared<SubtitleBitmapFrame>();
+                frame->width=context->width>0?context->width:videoWidth;
+                frame->height=context->height>0?context->height:videoHeight;
+                size_t bytes=sizeof(SubtitleCue)+sizeof(SubtitleBitmapFrame);
+                bool valid=bytes<=maxCacheBytes-cacheBytes&&subtitle.num_rects<=256;
+                for(unsigned r=0;r<subtitle.num_rects&&valid;++r){
+                    const auto* rect=subtitle.rects[r];
+                    if(!rect||rect->type!=SUBTITLE_BITMAP)continue;
+                    if(rect->w<=0||rect->h<=0||rect->w>8192||rect->h>8192||!rect->data[0]||!rect->data[1]||rect->linesize[0]<rect->w||rect->nb_colors<1||rect->nb_colors>256){valid=false;break;}
+                    if(sizeof(SubtitleBitmap)>maxCacheBytes-cacheBytes-bytes){valid=false;break;}
+                    const size_t runBudget=(maxCacheBytes-cacheBytes-bytes-sizeof(SubtitleBitmap))/sizeof(uint32_t);
+                    SubtitleBitmap image;image.x=rect->x;image.y=rect->y;image.width=rect->w;image.height=rect->h;
+                    for(int p=0;p<rect->nb_colors;++p){
+                        uint32_t c=0;std::memcpy(&c,rect->data[1]+p*4,4);const uint32_t a=c>>24;
+                        image.palette[p]=(a<<24)|((((c>>16)&255)*a/255)<<16)|((((c>>8)&255)*a/255)<<8)|((c&255)*a/255);
+                    }
+                    for(int y=0;y<rect->h&&valid;++y)for(int x=0;x<rect->w;++x){
+                        const uint8_t pixel=rect->data[0][size_t(y)*rect->linesize[0]+x];
+                        if(pixel>=rect->nb_colors){valid=false;break;}
+                        if(!image.runs.empty()&&(image.runs.back()&255)==pixel&&(image.runs.back()>>8)<0xFFFFFF)image.runs.back()+=256;
+                        else {if(image.runs.size()>=runBudget){valid=false;break;}image.runs.push_back(256u|pixel);}
+                    }
+                    if(!valid)break;
+                    bytes+=sizeof(SubtitleBitmap)+image.runs.size()*sizeof(uint32_t);
+                    frame->images.push_back(std::move(image));
+                }
+                if(valid&&!frame->images.empty()){
+                    SubtitleCue cue;cue.begin=begin;
+                    cue.end=subtitle.end_display_time>subtitle.start_display_time&&subtitle.end_display_time!=UINT32_MAX?
+                        packetSeconds+double(subtitle.end_display_time)/1000.0:std::numeric_limits<double>::infinity();
+                    // Matroska BlockDuration is authoritative even when PGS has
+                    // no later clear set (the decoder itself has no end time).
+                    if(context->codec_id==AV_CODEC_ID_HDMV_PGS_SUBTITLE&&packet->duration>0&&packet->pts!=AV_NOPTS_VALUE){
+                        const double end=(double(packet->pts)+double(packet->duration))*timeBase;
+                        if(end>begin)cue.end=std::min(cue.end,end);
+                    }
+                    cue.bitmap=std::move(frame);
+                    if(totalCues<kMaxCues&&bytes<=maxCacheBytes-cacheBytes){cacheBytes+=bytes;++totalCues;track.cues.push_back(std::move(cue));}
+                    else track.note=L"字幕缓存已达上限，后续字幕未加载";
+                }else if(!valid){track.note=L"图形字幕数据无效或超出缓存上限";
+                    if(++stat.rejected<=3)log::warn("subtitle",std::format("bitmap display rejected stream={} cachedBytes={} budgetBytes={}: invalid rectangle or cache budget",track.streamIndex,cacheBytes,maxCacheBytes));}
+            }
+            for(unsigned rect=0;rect<subtitle.num_rects;++rect){
+                const auto* entry=subtitle.rects[rect];
+                if(!entry)continue;
+                std::wstring text;
+                int alignOverride=0;double posX=-1,posY=-1;
+                if(assWork[index]&&entry->ass&&*entry->ass&&subtitle.end_display_time>subtitle.start_display_time){
+                    const size_t bytes=std::strlen(entry->ass);
+                    if(bytes<=maxCacheBytes-cacheBytes){
+                        cacheBytes+=bytes;
+                        assWork[index]->events.push_back({int64_t(std::llround(packetSeconds*1000.0))+int64_t(subtitle.start_display_time),
+                            int64_t(subtitle.end_display_time-subtitle.start_display_time),std::string(entry->ass,bytes)});
+                    }
+                }
+                const std::wstring raw=entry->ass&&*entry->ass?wide(entry->ass):(entry->text&&*entry->text?wide(entry->text):std::wstring{});
+                if(!raw.empty())text=cleanAssText(entry->ass&&*entry->ass?stripDialoguePrefix(raw):raw,alignOverride,posX,posY);
+                if(text.empty())continue;
+                SubtitleCue cue;
+                cue.begin=packetSeconds+double(subtitle.start_display_time)/1000.0;
+                cue.end=subtitle.end_display_time>subtitle.start_display_time?packetSeconds+double(subtitle.end_display_time)/1000.0:cue.begin+3.0;
+                cue.text=std::move(text);
+                cue.alignOverride=alignOverride;cue.posX=posX;cue.posY=posY;
+                const size_t bytes=sizeof(SubtitleCue)+sizeof(double)+cue.text.size()*sizeof(wchar_t);
+                if(cue.end>cue.begin){
+                    if(totalCues>=kMaxCues||bytes>maxCacheBytes-cacheBytes){track.note=L"字幕缓存已达上限，后续字幕未加载";continue;}
+                    cacheBytes+=bytes;++totalCues;track.cues.push_back(std::move(cue));
+                }
+            }
+            avsubtitle_free(&subtitle);
+            av_packet_unref(packet);
+            if(!track.cues.empty()&&track.note==L"正在读取字幕")track.note.clear();
+            if(metadata&&((firstCue&&!track.cues.empty())||std::chrono::steady_clock::now()>=nextPublish)){
+                for(auto& t:tracks)t.rebuildIndex();
+                snapshotAss();
+                metadata(tracks);
+                nextPublish=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+            }
+    }
+    if(stop.stop_requested())return {};
+    if(readResult<0&&readResult!=AVERROR_EOF)log::warn("subtitle",std::format("scan read failed ret={}",readResult));
+    snapshotAss();
+    for(size_t i=0;i<tracks.size();++i){
+        auto& track=tracks[i];const auto& stat=stats[i];
+        if(track.note==L"正在读取字幕"){
+            if(stat.errors)track.note=L"字幕数据解码失败（请查看日志）";
+            else if(!stat.packets)track.note=L"没有读到字幕数据（请检查封装或压缩支持）";
+            else track.note=L"未解码出可显示的字幕";
+        }
+        track.rebuildIndex();
+        log::info("subtitle",std::format("track stream={} codec={} packets={} displays={} errors={} rejected={} lastRet={} cues={} note={}",
+            track.streamIndex,utf8(track.codec),stat.packets,stat.displays,stat.errors,stat.rejected,stat.lastError,track.cues.size(),utf8(track.note)));
+    }
+    log::info("subtitle",std::format("single-pass complete tracks={} packets={} cues={} cacheBytes={} elapsedMs={:.3f}",tracks.size(),packets,totalCues,cacheBytes,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count()));
+    return tracks;
+}
+
+std::vector<SubtitleTrack> loadEmbeddedSubtitleTracks(const std::wstring& path,std::stop_token stop,
+    const std::function<void(const std::vector<SubtitleTrack>&)>& metadata,const std::atomic<bool>* serverGate){
+    return loadDemuxedSubtitleTracks(path,stop,metadata,nullptr,serverGate);
+}
+
+bool subtitleServerFile(const std::wstring& path){return serverFilePath(path);}
+uint64_t subtitleServerScanBytes(){return g_serverScanBytes.load();}
+
+std::vector<SubtitleTrack> loadExternalSubtitleTracks(const std::wstring& path,std::stop_token stop,
+    const std::function<void(const std::vector<SubtitleTrack>&)>& metadata){
+    if(stop.stop_requested())return {};
+    auto source=std::filesystem::path(path);
+    const auto extension=lower(source.extension().wstring());
+    auto failure=[&](const wchar_t* note){
+        SubtitleTrack track;track.name=source.filename().wstring();track.note=note;
+        log::warn("subtitle",std::format("external file={} note={}",utf8(track.name),utf8(track.note)));
+        return std::vector<SubtitleTrack>{std::move(track)};
+    };
+    std::error_code ec;
+    if(!std::filesystem::is_regular_file(source,ec))return failure(L"字幕文件不存在或无法读取");
+    // Keep the existing text-file memory bound when falling back to FFmpeg:
+    // several text demuxers queue the entire file while reading the header.
+    bool binarySub=false;
+    if(extension==L".sub"){
+        std::ifstream input(source,std::ios::binary);unsigned char head[3]{};
+        input.read(reinterpret_cast<char*>(head),sizeof(head));
+        binarySub=head[0]==0&&head[1]==0&&head[2]==1;
+    }
+    if(binarySub){
+        source.replace_extension(L".idx");
+        if(!std::filesystem::is_regular_file(source,ec))return failure(L"VobSub 需要同名 .idx 和 .sub 文件，请加载 .idx");
+    }
+    if(extension!=L".sup"&&extension!=L".pgs"){
+        const auto bytes=std::filesystem::file_size(source,ec);
+        if(!ec&&bytes>kMaxSubtitleFileBytes)return failure(L"文本字幕超过 16 MiB 上限");
+    }
+    if(extension==L".idx"){
+        auto companion=source;companion.replace_extension(L".sub");
+        if(!std::filesystem::is_regular_file(companion,ec))return failure(L"VobSub 需要同名 .idx 和 .sub 文件，请加载 .idx");
+    }
+    // .sub is ambiguous: MicroDVD text or the binary half of VobSub. Prefer
+    // the existing text parser when it recognizes content; otherwise demux.
+    const bool bitmapFile=extension==L".sup"||extension==L".pgs"||extension==L".idx"||binarySub;
+    if(!bitmapFile){
+        auto track=loadTextSubtitleFile(path);
+        if(stop.stop_requested())return {};
+        if(track.usable())return {std::move(track)};
+    }
+    auto externalize=[&](std::vector<SubtitleTrack> tracks){
+        for(auto& track:tracks){
+            track.embedded=false;
+            track.name=source.filename().wstring()+(track.language.empty()?L"":L" · "+track.language);
+        }
+        return tracks;
+    };
+    const char* demuxer=extension==L".sup"||extension==L".pgs"?"sup":
+        extension==L".idx"||binarySub?"vobsub":extension==L".mpl"?"mpl2":
+        extension==L".smi"||extension==L".sami"?"sami":extension==L".stl"?"stl":
+        extension==L".sbv"?"subviewer":nullptr;
+    // Small, valid MPL2 files otherwise fail FFmpeg's multi-line probe and can
+    // be mistaken for LRC. The explicit file type chooses its existing reader.
+    auto tracks=loadDemuxedSubtitleTracks(source.wstring(),stop,[&](const auto& listing){
+        if(metadata)metadata(externalize(listing));
+    },demuxer?av_find_input_format(demuxer):nullptr);
+    if(stop.stop_requested())return {};
+    if(tracks.empty())return failure(L"文件格式不支持、数据损坏或没有字幕内容");
+    return externalize(std::move(tracks));
+}
+
+struct SubtitleLoader::Impl {
+    std::mutex mutex;
+    std::condition_variable_any wake;
+    std::wstring pending;
+    uint64_t generation=0;
+    bool requested=false;
+    bool pendingExternal=false;
+    std::stop_source cancel;
+    std::shared_ptr<const std::atomic<bool>> gate;   // see setReadGate
+    std::optional<Result> ready;
+    std::jthread worker;
+    Impl():worker([this](std::stop_token shutdown){
+        while(!shutdown.stop_requested()){
+            std::unique_lock lock(mutex);
+            if(!wake.wait(lock,shutdown,[&]{return requested;}))break;
+            const auto path=std::move(pending);const auto id=generation;const auto stop=cancel.get_token();
+            const bool externalFile=pendingExternal;requested=false;
+            const auto readGate=gate;
+            lock.unlock();
+            auto publish=[&](std::vector<SubtitleTrack> tracks,bool complete){
+                std::lock_guard guard(mutex);
+                if(id==generation&&!stop.stop_requested())ready=Result{id,complete,std::move(tracks)};
+            };
+            try{
+                std::vector<SubtitleTrack> external;
+                if(path.empty()||path.starts_with(L"capture:")||path.starts_with(L"capture2:")||path.starts_with(L"remoteplay:")||path.starts_with(L"moonlight:")||path.starts_with(L"xbox:")||path.starts_with(L"screen:")){publish({},true);continue;}
+                if(externalFile){
+                    auto tracks=loadExternalSubtitleTracks(path,stop,[&](const auto& listing){publish(listing,false);});
+                    publish(std::move(tracks),true);continue;
+                }
+                for(const wchar_t* extension:{L".srt",L".ass",L".ssa",L".vtt",L".sup",L".pgs",L".idx",L".sub",L".smi",L".sami",L".mpl",L".sbv",L".stl"}){
+                    if(stop.stop_requested())break;
+                    auto candidate=std::filesystem::path(path);candidate.replace_extension(extension);
+                    std::error_code ec;if(!std::filesystem::exists(candidate,ec))continue;
+                    auto tracks=loadExternalSubtitleTracks(candidate.wstring(),stop);
+                    if(std::none_of(tracks.begin(),tracks.end(),[](const auto& t){return t.usable();}))continue;
+                    external=std::move(tracks);break;
+                }
+                if(!external.empty())publish(external,false);
+                // A file on a server that playback is reading too: deferred and paced (#48 C5).
+                const std::atomic<bool>* serverGate=readGate&&serverFilePath(path)?readGate.get():nullptr;
+                auto embedded=loadEmbeddedSubtitleTracks(path,stop,[&](const auto& tracks){auto listing=external;listing.insert(listing.end(),tracks.begin(),tracks.end());publish(std::move(listing),false);},serverGate);
+                for(auto& track:embedded)external.push_back(std::move(track));
+                publish(std::move(external),true);
+            }catch(const std::exception& e){log::error("subtitle",std::format("loader failed: {}",e.what()));publish({},true);}
+        }
+    }){}
+    ~Impl(){cancel.request_stop();worker.request_stop();wake.notify_all();worker.join();}
+};
+SubtitleLoader::SubtitleLoader():p_(std::make_unique<Impl>()){}
+SubtitleLoader::~SubtitleLoader()=default;
+void SubtitleLoader::setReadGate(std::shared_ptr<const std::atomic<bool>> gate){std::lock_guard lock(p_->mutex);p_->gate=std::move(gate);}
+uint64_t SubtitleLoader::request(std::wstring path){return request(std::move(path),false);}
+uint64_t SubtitleLoader::requestFile(std::wstring path){return request(std::move(path),true);}
+uint64_t SubtitleLoader::request(std::wstring path,bool external){
+    std::lock_guard lock(p_->mutex);p_->cancel.request_stop();p_->cancel=std::stop_source{};
+    p_->pending=std::move(path);p_->pendingExternal=external;p_->requested=true;p_->ready.reset();++p_->generation;p_->wake.notify_all();return p_->generation;
+}
+std::optional<SubtitleLoader::Result> SubtitleLoader::poll(){std::lock_guard lock(p_->mutex);auto result=std::move(p_->ready);p_->ready.reset();return result;}
+
+SubtitleAlignResult alignSubtitleToAudio(const std::wstring& mediaPath,const SubtitleTrack& track,int maxShiftSeconds,std::stop_token stop){
+    SubtitleAlignResult result;
+    if(track.cues.empty()){result.detail=L"没有可用的字幕内容";return result;}
+    AVFormatContext* input=nullptr;
+    const auto utf8Path=utf8(mediaPath);
+    if(avformat_open_input(&input,utf8Path.c_str(),nullptr,nullptr)<0||!input){result.detail=L"无法打开媒体";return result;}
+    if(avformat_find_stream_info(input,nullptr)<0){avformat_close_input(&input);result.detail=L"无法读取媒体信息";return result;}
+    const int audioIndex=av_find_best_stream(input,AVMEDIA_TYPE_AUDIO,-1,-1,nullptr,0);
+    if(audioIndex<0){avformat_close_input(&input);result.detail=L"该文件没有音轨，无法自动对齐";return result;}
+    AVStream* stream=input->streams[audioIndex];
+    const AVCodec* decoder=avcodec_find_decoder(stream->codecpar->codec_id);
+    AVCodecContext* context=decoder?avcodec_alloc_context3(decoder):nullptr;
+    if(!decoder||!context||avcodec_parameters_to_context(context,stream->codecpar)<0||avcodec_open2(context,decoder,nullptr)<0){
+        if(context)avcodec_free_context(&context);
+        avformat_close_input(&input);
+        result.detail=L"音轨解码器不可用";
+        log::info("subtitle",std::format("auto align skipped: {}",utf8(result.detail)));
+        return result;
+    }
+    constexpr int kSampleRate=8000;
+    constexpr double kStepSeconds=0.02; // 20ms analysis grid
+    AVChannelLayout mono=AV_CHANNEL_LAYOUT_MONO;
+    SwrContext* resampler=nullptr;
+    AVChannelLayout inputLayout{};
+    int inputFormat=-1,inputRate=0;
+    // DVB recordings switch between 5.1 and stereo at ad breaks; a resampler built
+    // for the old layout reads planes the new frames do not have. Rebuild on change.
+    const auto configure=[&](const AVChannelLayout& layout,int format,int rate){
+        swr_free(&resampler);
+        av_channel_layout_uninit(&inputLayout);
+        if(av_channel_layout_copy(&inputLayout,&layout)<0)av_channel_layout_default(&inputLayout,layout.nb_channels>0?layout.nb_channels:2);
+        inputFormat=format;inputRate=rate;
+        if(swr_alloc_set_opts2(&resampler,&mono,AV_SAMPLE_FMT_FLT,kSampleRate,&inputLayout,AVSampleFormat(format),rate,0,nullptr)>=0&&resampler&&swr_init(resampler)>=0)return true;
+        swr_free(&resampler);
+        return false;
+    };
+    if(!configure(context->ch_layout,context->sample_fmt,context->sample_rate)){
+        av_channel_layout_uninit(&inputLayout);
+        avcodec_free_context(&context);
+        avformat_close_input(&input);
+        result.detail=L"音频重采样初始化失败";
+        log::info("subtitle",std::format("auto align skipped: {}",utf8(result.detail)));
+        return result;
+    }
+    std::vector<float> envelope;
+    std::vector<float> converted;
+    std::vector<float> carry;
+    AVPacket* packet=av_packet_alloc();
+    AVFrame* frame=av_frame_alloc();
+    const double limitSeconds=1800.0;
+    while(packet&&frame&&resampler&&!stop.stop_requested()&&av_read_frame(input,packet)>=0){
+        if(packet->stream_index!=audioIndex){av_packet_unref(packet);continue;}
+        if(avcodec_send_packet(context,packet)<0){av_packet_unref(packet);continue;}
+        av_packet_unref(packet);
+        while(avcodec_receive_frame(context,frame)>=0){
+            if((frame->format!=inputFormat||frame->sample_rate!=inputRate||av_channel_layout_compare(&frame->ch_layout,&inputLayout)!=0)
+               &&!configure(frame->ch_layout,frame->format,frame->sample_rate)){
+                log::warn("subtitle",std::format("auto align: resampler rebuild failed channels={} rate={}; using the audio before it",frame->ch_layout.nb_channels,frame->sample_rate));
+                break;
+            }
+            const int maxOut=int(swr_get_out_samples(resampler,frame->nb_samples));
+            if(maxOut<=0)continue;
+            converted.resize(size_t(maxOut));
+            uint8_t* output=reinterpret_cast<uint8_t*>(converted.data());
+            const int produced=swr_convert(resampler,&output,maxOut,const_cast<const uint8_t**>(frame->extended_data),frame->nb_samples);
+            if(produced<=0)continue;
+            const size_t samplesPerStep=size_t(kSampleRate*kStepSeconds);
+            carry.insert(carry.end(),converted.begin(),converted.begin()+produced);
+            while(carry.size()>=samplesPerStep){
+                envelope.push_back(float(rms(carry.data(),samplesPerStep)));
+                carry.erase(carry.begin(),carry.begin()+std::ptrdiff_t(samplesPerStep));
+            }
+            if(envelope.size()*kStepSeconds>limitSeconds)break;
+        }
+        if(envelope.size()*kStepSeconds>limitSeconds)break;
+    }
+    if(packet)av_packet_free(&packet);
+    if(frame)av_frame_free(&frame);
+    swr_free(&resampler);
+    av_channel_layout_uninit(&inputLayout);
+    avcodec_free_context(&context);
+    avformat_close_input(&input);
+    if(envelope.size()<int(5.0/kStepSeconds)){
+        result.detail=L"音轨太短，无法自动对齐";
+        log::info("subtitle",std::format("auto align skipped: {}",utf8(result.detail)));
+        return result;
+    }
+    std::vector<float> sorted=envelope;
+    std::sort(sorted.begin(),sorted.end());
+    const float loud=sorted[size_t(double(sorted.size())*0.9)];
+    const float threshold=std::max(1e-5f,loud*0.2f);   // anything clearly above silence counts as speech
+    std::vector<uint8_t> audioActive(envelope.size());
+    for(size_t i=0;i<envelope.size();++i)audioActive[i]=envelope[i]>threshold?1:0;
+    const double mediaSeconds=double(envelope.size())*kStepSeconds;
+    std::vector<uint8_t> subtitleActive(envelope.size());
+    for(const auto& cue:track.cues){
+        const double begin=cue.begin+double(track.offsetMs)/1000.0;
+        const double end=cue.end+double(track.offsetMs)/1000.0;
+        if(end<=0||begin>=mediaSeconds)continue;
+        const size_t first=size_t(std::max(0.0,begin)/kStepSeconds);
+        const size_t last=std::min<size_t>(subtitleActive.size(),size_t(std::max(0.0,end)/kStepSeconds)+1);
+        for(size_t i=first;i<last;++i)subtitleActive[i]=1;
+    }
+    size_t subtitleCount=0;
+    for(auto value:subtitleActive)subtitleCount+=value;
+    size_t audioCount=0;
+    for(auto value:audioActive)audioCount+=value;
+    if(subtitleCount<20){
+        result.detail=L"字幕有效时长太短，无法可靠对齐";
+        log::info("subtitle",std::format("auto align skipped: {}",utf8(result.detail)));
+        return result;
+    }
+    const int maxShiftSteps=int(double(maxShiftSeconds)/kStepSeconds);
+    double bestScore=-1;int bestShift=0;
+    for(int shift=-maxShiftSteps;shift<=maxShiftSteps;++shift){
+        size_t matches=0,considered=0;
+        for(size_t i=0;i<subtitleActive.size();++i){
+            if(!subtitleActive[i])continue;
+            const long target=long(i)+shift;
+            if(target<0||target>=long(audioActive.size()))continue;
+            ++considered;
+            if(audioActive[size_t(target)])++matches;
+        }
+        // Overlap gate plus a global F1 denominator: a shift that pushes most
+        // cues out of the analysed span cannot win on a handful of matches.
+        if(considered<double(subtitleCount)*0.5)continue;
+        const double score=2.0*double(matches)/double(std::max<size_t>(1,subtitleCount+audioCount));
+        const double penalty=double(std::abs(shift))/double(maxShiftSteps+1)*0.02; // prefer small shifts on ties
+        if(score-penalty>bestScore){bestScore=score-penalty;bestShift=shift;}
+    }
+    result.ok=bestScore>0.25;
+    result.offsetMs=int(std::lround(bestShift*kStepSeconds*1000.0));
+    result.score=bestScore;
+    result.detail=result.ok?std::format(L"相关性 {:.2f}，建议偏移 {} ms",bestScore,result.offsetMs)
+                          :std::format(L"相关性只有 {:.2f}，未找到可靠偏移（字幕可能与视频不匹配）",bestScore);
+    log::info("subtitle",std::format("auto align media={} cues={} shift={}ms score={:.3f} ok={}",std::filesystem::path(mediaPath).filename().string(),track.cues.size(),result.offsetMs,result.score,result.ok));
+    return result;
+}
+} // namespace veyra::engine

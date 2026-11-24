@@ -1,0 +1,538 @@
+// WGC lifecycle adapted from robmikh/Win32CaptureSample SimpleCapture.cpp,
+// commit 49fefe79fd9b11025f0b5eb91783a98888516070, MIT, (c) 2019 Robert Mikhayelyan.
+// Veyra changes: polling latest frames, leased shared textures/fences, crop,
+// timestamp contract, DXGI compatibility ingress and shared enhancement graph.
+#include "veyra/source/ScreenCaptureSource.h"
+#include "veyra/source/VirtualDesktop.h"
+#include "veyra/Log.h"
+#include <d3d11_4.h>
+#include <dxgi1_6.h>
+#include <dwmapi.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+#include <winrt/Windows.Foundation.Metadata.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <climits>
+#include <format>
+#include <sstream>
+#include <mutex>
+#include <utility>
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/buffer.h>
+}
+
+namespace veyra::source {
+using Microsoft::WRL::ComPtr;
+using namespace winrt::Windows::Graphics::Capture;
+using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
+namespace {
+int64_t host100ns(){return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()/100;}
+int64_t qpc100ns(){LARGE_INTEGER q{},f{};QueryPerformanceCounter(&q);QueryPerformanceFrequency(&f);return int64_t(static_cast<long double>(q.QuadPart)*10000000/f.QuadPart);}
+void check(HRESULT hr,const char* op){if(FAILED(hr)){log::error("screen",std::format("{} hr=0x{:08X}",op,uint32_t(hr)));winrt::check_hresult(hr);}}
+struct NativeHandle {HANDLE value=nullptr;~NativeHandle(){if(value)CloseHandle(value);}};
+// A window on a hidden virtual desktop is still composed and captured, but many
+// programs stop drawing while their desktop is not shown (Chromium browsers treat it
+// as occluded), so a long pause is explained instead of looking like a hang.
+constexpr wchar_t otherDesktopNotice[]=L"窗口在其他虚拟桌面上，暂时没有新画面：部分程序（如 Chrome、Edge）在所在桌面不显示时会暂停绘制";
+constexpr int64_t otherDesktopQuiet100ns=20000000;
+// The list is shared with the GUI thread, which excludes windows shown during a
+// capture. This thread never calls a window function while holding the lock, so it
+// can never wait on a GUI thread that waits on the lock.
+std::mutex exclusionMutex;
+unsigned exclusionUsers=0;
+std::vector<std::pair<HWND,DWORD>> excludedWindows;
+bool qtWindow(HWND w){wchar_t name[8]{};return GetClassNameW(w,name,8)>=2&&name[0]==L'Q'&&name[1]==L't';}
+bool listed(HWND w){for(const auto& entry:excludedWindows)if(entry.first==w)return true;return false;}
+bool exclude(HWND w,DWORD& previous){
+    if(GetWindowDisplayAffinity(w,&previous)&&SetWindowDisplayAffinity(w,WDA_EXCLUDEFROMCAPTURE))return true;
+    log::warn("screen",std::format("window exclusion failed hwnd={} error={}",uint64_t(w),GetLastError()));return false;
+}
+void excludeOwnWindows(){
+    {std::lock_guard lock(exclusionMutex);if(exclusionUsers++!=0)return;}
+    // Every visible window, and every Qt window even while hidden: the control
+    // pill is shown just after the capture opens and was captured into the
+    // picture. A window created later is excluded when it is shown.
+    std::vector<HWND> own;
+    EnumWindows([](HWND w,LPARAM list)->BOOL{
+        DWORD pid=0;GetWindowThreadProcessId(w,&pid);
+        if(pid==GetCurrentProcessId()&&(IsWindowVisible(w)||qtWindow(w)))reinterpret_cast<std::vector<HWND>*>(list)->push_back(w);
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&own));
+    size_t count=0;
+    for(HWND w:own){
+        DWORD previous=0;if(!exclude(w,previous))continue;
+        std::lock_guard lock(exclusionMutex);
+        if(!listed(w)){excludedWindows.emplace_back(w,previous);++count;}
+    }
+    log::info("screen",std::format("own windows excluded from capture: {} of {}",count,own.size()));
+}
+void restoreOwnWindows(){
+    std::vector<std::pair<HWND,DWORD>> restore;
+    {std::lock_guard lock(exclusionMutex);if(!exclusionUsers||--exclusionUsers)return;restore.swap(excludedWindows);}
+    for(auto [window,affinity]:restore)if(IsWindow(window)&&!SetWindowDisplayAffinity(window,affinity))log::warn("screen","window exclusion restore failed");
+}
+struct Surface {
+    ComPtr<ID3D11Texture2D> producer;
+    ComPtr<ID3D12Resource> consumer;
+    ComPtr<ID3D12Fence> fence;
+    unsigned width=0,height=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
+};
+DXGI_RATIONAL monitorRate(HMONITOR monitor){
+    MONITORINFOEXW mi{};mi.cbSize=sizeof(mi);
+    if(!GetMonitorInfoW(monitor,&mi))return {};
+    // DisplayConfig retains fractional modes such as 60000/1001 Hz.
+    for(unsigned attempt=0;attempt<3;++attempt){
+        UINT32 pathCount=0,modeCount=0;
+        if(GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,&pathCount,&modeCount)!=ERROR_SUCCESS)break;
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+        const auto result=QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,&pathCount,paths.data(),&modeCount,modes.data(),nullptr);
+        if(result==ERROR_INSUFFICIENT_BUFFER)continue;
+        if(result!=ERROR_SUCCESS)break;
+        for(UINT32 i=0;i<pathCount;++i){
+            const auto& path=paths[i];DISPLAYCONFIG_SOURCE_DEVICE_NAME name{};
+            name.header.type=DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;name.header.size=sizeof(name);
+            name.header.adapterId=path.sourceInfo.adapterId;name.header.id=path.sourceInfo.id;
+            if(DisplayConfigGetDeviceInfo(&name.header)!=ERROR_SUCCESS||wcscmp(name.viewGdiDeviceName,mi.szDevice))continue;
+            const auto r=path.targetInfo.refreshRate;
+            if(r.Denominator&&r.Numerator<=INT_MAX&&r.Denominator<=INT_MAX&&double(r.Numerator)/r.Denominator>1&&double(r.Numerator)/r.Denominator<=1000)
+                return {r.Numerator,r.Denominator};
+        }
+        break;
+    }
+    DEVMODEW mode{};mode.dmSize=sizeof(mode);
+    if(EnumDisplaySettingsW(mi.szDevice,ENUM_CURRENT_SETTINGS,&mode)&&mode.dmDisplayFrequency>1&&mode.dmDisplayFrequency<=1000)return {mode.dmDisplayFrequency,1};
+    return {};
+}
+bool hdrMonitor(IDXGIFactory1* factory,HMONITOR monitor){
+    if(!factory)return false;
+    for(UINT a=0;;++a){ComPtr<IDXGIAdapter1> adapter;if(factory->EnumAdapters1(a,&adapter)==DXGI_ERROR_NOT_FOUND)break;
+        for(UINT o=0;;++o){ComPtr<IDXGIOutput> output;if(adapter->EnumOutputs(o,&output)==DXGI_ERROR_NOT_FOUND)break;
+            DXGI_OUTPUT_DESC d{};if(FAILED(output->GetDesc(&d))||d.Monitor!=monitor)continue;
+            ComPtr<IDXGIOutput6> six;DXGI_OUTPUT_DESC1 one{};
+            return SUCCEEDED(output.As(&six))&&SUCCEEDED(six->GetDesc1(&one))&&one.ColorSpace==DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        }
+    }return false;
+}
+}
+void excludeWindowFromScreenCapture(void* handle){
+    const auto window=static_cast<HWND>(handle);
+    if(!window||(GetWindowLongPtrW(window,GWL_STYLE)&WS_CHILD))return;
+    // GUI thread, on its own window: holding the lock across the call is safe here.
+    std::lock_guard lock(exclusionMutex);
+    if(!exclusionUsers||listed(window))return;
+    DWORD previous=0;
+    if(exclude(window,previous)){excludedWindows.emplace_back(window,previous);log::info("screen",std::format("late window excluded from capture hwnd={}",uint64_t(window)));}
+}
+uint64_t displayAdapterLuid(void* handle){
+    MONITORINFOEXW mi{};mi.cbSize=sizeof(mi);
+    if(!handle||!GetMonitorInfoW(static_cast<HMONITOR>(handle),&mi))return 0;
+    for(unsigned attempt=0;attempt<3;++attempt){
+        UINT32 pathCount=0,modeCount=0;
+        if(GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,&pathCount,&modeCount)!=ERROR_SUCCESS)return 0;
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+        const auto result=QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,&pathCount,paths.data(),&modeCount,modes.data(),nullptr);
+        if(result==ERROR_INSUFFICIENT_BUFFER)continue;
+        if(result!=ERROR_SUCCESS)return 0;
+        for(UINT32 i=0;i<pathCount;++i){
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME name{};
+            name.header.type=DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;name.header.size=sizeof(name);
+            name.header.adapterId=paths[i].sourceInfo.adapterId;name.header.id=paths[i].sourceInfo.id;
+            if(DisplayConfigGetDeviceInfo(&name.header)!=ERROR_SUCCESS||wcscmp(name.viewGdiDeviceName,mi.szDevice))continue;
+            const auto& id=paths[i].sourceInfo.adapterId;
+            return uint64_t(uint32_t(id.HighPart))<<32|id.LowPart;
+        }
+        return 0;
+    }
+    return 0;
+}
+std::wstring ScreenCaptureOptions::uri()const{
+    return std::format(L"screen:{}:{}:{}:{}:{}:{}:{}:{}:{}",unsigned(kind),target,unsigned(method),fps,unsigned(cursor)|(borderless?2u:0u),left,top,right,bottom);
+}
+bool ScreenCaptureOptions::parse(const std::wstring& uri,ScreenCaptureOptions& out){
+    if(!uri.starts_with(L"screen:"))return false;
+    auto body=uri.substr(7);std::replace(body.begin(),body.end(),L':',L' ');
+    std::wistringstream in(body);unsigned kind=0,method=0,cursor=0;ScreenCaptureOptions v;
+    if(!(in>>kind>>v.target>>method>>v.fps>>cursor>>v.left>>v.top>>v.right>>v.bottom))return false;
+    in>>std::ws;if(!in.eof()||kind>1||method>1||cursor>3||!v.target||v.fps>240||
+        v.left>16384||v.top>16384||v.right>16384||v.bottom>16384||(!kind&&method))return false;
+    v.kind=ScreenTargetKind(kind);v.method=ScreenCaptureMethod(method);v.cursor=(cursor&1)!=0;v.borderless=(cursor&2)!=0;out=v;return true;
+}
+std::vector<ScreenCaptureTarget> ScreenCaptureSource::targets(ScreenTargetKind kind){
+    std::vector<ScreenCaptureTarget> result;
+    if(kind==ScreenTargetKind::Window){
+        struct Walk {std::vector<ScreenCaptureTarget>& list;vdesk::Lookup desktops;size_t other=0;
+            // One display-path query per monitor, not per window.
+            std::vector<std::pair<HMONITOR,uint64_t>> adapters;
+            uint64_t adapter(HMONITOR monitor){
+                for(const auto& [m,luid]:adapters)if(m==monitor)return luid;
+                return adapters.emplace_back(monitor,displayAdapterLuid(monitor)).second;
+            }
+        } walk{result};
+        EnumWindows([](HWND window,LPARAM param)->BOOL{
+            auto& walk=*reinterpret_cast<Walk*>(param);
+            DWORD pid=0;GetWindowThreadProcessId(window,&pid);
+            if(pid==GetCurrentProcessId()||!IsWindowVisible(window)||GetWindow(window,GW_OWNER)||GetWindowTextLengthW(window)==0)return TRUE;
+            // A cloaked window is not on screen and is left out, except one the shell
+            // cloaked because it is on another virtual desktop: WGC still captures it.
+            DWORD cloaked=0;DwmGetWindowAttribute(window,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));
+            vdesk::Placement desktop;if(cloaked&&!walk.desktops.otherDesktop(window,desktop))return TRUE;
+            wchar_t title[1024]{};GetWindowTextW(window,title,1024);RECT r{};GetClientRect(window,&r);
+            if(r.right<=0||r.bottom<=0)return TRUE;
+            ScreenCaptureTarget target{ScreenTargetKind::Window,uint64_t(window),pid,title,unsigned(r.right),unsigned(r.bottom),0};
+            target.otherDesktop=desktop.other;target.desktopNumber=desktop.number;target.desktopName=std::move(desktop.name);
+            target.displayAdapter=walk.adapter(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST));
+            if(desktop.other)++walk.other;
+            walk.list.push_back(std::move(target));return TRUE;
+        },reinterpret_cast<LPARAM>(&walk));
+        // Windows on the shown desktop keep their Z order and come first (the default
+        // pick stays one of them); each other desktop follows in Task View order.
+        std::stable_sort(result.begin(),result.end(),[](const ScreenCaptureTarget& a,const ScreenCaptureTarget& b){
+            return std::pair{a.otherDesktop,a.desktopNumber}<std::pair{b.otherDesktop,b.desktopNumber};
+        });
+        if(walk.other||!walk.desktops.available())
+            log::info("screen",std::format("windows listed={} onOtherVirtualDesktops={} desktopManager={}",result.size(),walk.other,walk.desktops.available()));
+    }else{
+        EnumDisplayMonitors(nullptr,nullptr,[](HMONITOR monitor,HDC,LPRECT,LPARAM param)->BOOL{
+            MONITORINFOEXW info{};info.cbSize=sizeof(info);if(!GetMonitorInfoW(monitor,&info))return TRUE;
+            DEVMODEW mode{};mode.dmSize=sizeof(mode);EnumDisplaySettingsW(info.szDevice,ENUM_CURRENT_SETTINGS,&mode);
+            auto& list=*reinterpret_cast<std::vector<ScreenCaptureTarget>*>(param);
+            list.push_back({ScreenTargetKind::Monitor,uint64_t(monitor),0,std::format(L"{}  {} x {}  {} Hz",info.szDevice,mode.dmPelsWidth,mode.dmPelsHeight,mode.dmDisplayFrequency),mode.dmPelsWidth,mode.dmPelsHeight,mode.dmDisplayFrequency});
+            list.back().displayAdapter=displayAdapterLuid(monitor);return TRUE;
+        },reinterpret_cast<LPARAM>(&result));
+    }return result;
+}
+struct ScreenCaptureSource::Impl {
+    ScreenCaptureOptions options;SourceInfo info;ScreenCaptureMetrics metrics;
+    ComPtr<ID3D11Device5> device;ComPtr<ID3D11DeviceContext4> context;
+    ComPtr<ID3D12Device> consumer;ComPtr<ID3D11Fence> producerFence;ComPtr<ID3D12Fence> fence;
+    ComPtr<IDXGIOutputDuplication> duplication;
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice wrapped{nullptr};
+    GraphicsCaptureItem item{nullptr};Direct3D11CaptureFramePool pool{nullptr};GraphicsCaptureSession session{nullptr};
+    winrt::Windows::Graphics::SizeInt32 poolSize{};
+    // A window being resized reports a new content size on almost every frame.
+    // Each new size used to recreate the pool and rebuild the whole effect graph
+    // (about 0.6 s with NR + frame generation, audit 2026-10-15 B2), so the video
+    // stood still for as long as the drag lasted. Frames keep the current size
+    // (the new content clipped or padded) until the size has held for settle100ns.
+    winrt::Windows::Graphics::SizeInt32 pendingSize{};
+    int64_t pendingSince=0;
+    int64_t resizedAt=0;
+    bool resizeNeedsFrame=false,borderDisabled=false;
+    static constexpr int64_t settle100ns=3000000;
+    bool resizeSettled(winrt::Windows::Graphics::SizeInt32 size,int64_t now){
+        if(size.Width!=pendingSize.Width||size.Height!=pendingSize.Height){pendingSize=size;pendingSince=now;}
+        return now-pendingSince>=settle100ns;
+    }
+    void applyPendingSize(){
+        poolSize=pendingSize;pendingSize={};pool.Recreate(wrapped,DirectXPixelFormat(format),2,poolSize);wasWaiting=true;
+        resizedAt=host100ns();resizeNeedsFrame=true;
+        log::info("screen",std::format("capture size {}x{} after resizing settled",poolSize.Width,poolSize.Height));
+    }
+    void recoverStaticResize(int64_t now){
+        if(!resizeNeedsFrame||now-resizedAt<settle100ns)return;
+        // Recreate discards pending frames and WGC need not issue another for a
+        // static window. Restart this session once, after a grace period, to
+        // obtain a real new-size frame. Never repaint the target or fabricate
+        // pixels/timestamps; moving sources keep their existing session.
+        resizeNeedsFrame=false;
+        session.Close();pool.Close();
+        pool=Direct3D11CaptureFramePool::CreateFreeThreaded(wrapped,DirectXPixelFormat(format),2,poolSize);
+        session=pool.CreateCaptureSession(item);
+        session.IsCursorCaptureEnabled(options.cursor);
+        if(borderDisabled)session.IsBorderRequired(false);
+        applyMinUpdateInterval();
+        session.StartCapture();wasWaiting=true;
+        log::info("screen","restarted WGC session once for a static resized target");
+    }
+    std::array<std::shared_ptr<Surface>,6> slots;
+    AVFrame* frame=nullptr;
+    uint64_t signal=0,sequence=0;int64_t lastPts=0,nextPts=0,clockOffset=0,lastColorCheck=0;
+    DWORD targetPid=0;bool hdr=false,wasWaiting=false,exclusion=false;
+    // The captured window is on a virtual desktop that is not shown (checked once a
+    // second, without COM) and the host time of the last delivered frame.
+    bool otherDesktop=false;int64_t lastFrameHost=0;
+    // An output's color space changes only with the display configuration, which
+    // invalidates the DXGI factory. Walking the outputs with a new factory every
+    // second cost about 0.4 ms on the engine thread (one 20 ms spike, bench
+    // 2026-10-27), so it is repeated only when the factory or the monitor changed.
+    ComPtr<IDXGIFactory1> displayFactory;HMONITOR displayMonitor=nullptr;
+    bool displayHdr(HMONITOR monitor,bool& value){
+        if(displayFactory&&displayFactory->IsCurrent()&&monitor==displayMonitor)return false;
+        displayFactory.Reset();displayMonitor=monitor;
+        if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&displayFactory))))displayFactory.Reset();
+        value=hdrMonitor(displayFactory.Get(),monitor);return true;
+    }
+    std::wstring message;DXGI_FORMAT format=DXGI_FORMAT_B8G8R8A8_UNORM;
+    ~Impl(){av_frame_free(&frame);}
+    // The GPU that drives the target's display against the one Veyra processes on
+    // (issue #107, two-GPU setups). When they differ, Windows copies every captured
+    // frame between the two; recorded when the capture opens and when the target
+    // moves to a display driven by another adapter. Only the display-path query
+    // (about 0.1 ms) runs, and only when the monitor changed.
+    HMONITOR pathMonitor=nullptr;uint64_t displayAdapter=~0ull;
+    void logGpuPath(HMONITOR monitor){
+        if(!consumer||monitor==pathMonitor)return;
+        pathMonitor=monitor;
+        const auto display=displayAdapterLuid(monitor);
+        if(display==displayAdapter)return;
+        displayAdapter=display;
+        const auto own=consumer->GetAdapterLuid();
+        const uint64_t processing=uint64_t(uint32_t(own.HighPart))<<32|own.LowPart;
+        ComPtr<IDXGIFactory4> names;
+        const auto name=[&](uint64_t luid){
+            ComPtr<IDXGIAdapter1> adapter;DXGI_ADAPTER_DESC1 d{};
+            if(!luid||!names||FAILED(names->EnumAdapterByLuid(LUID{DWORD(luid&0xFFFFFFFFu),LONG(luid>>32)},IID_PPV_ARGS(&adapter)))||FAILED(adapter->GetDesc1(&d)))return std::string("unknown");
+            return winrt::to_string(std::wstring_view(d.Description));
+        };
+        if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&names))))names.Reset();
+        const bool cross=display&&display!=processing;
+        (cross?log::warn:log::info)("screen",std::format("gpu path display adapter={} luid={:016X} processing adapter={} luid={:016X} crossGpu={}{}",
+            name(display),display,name(processing),processing,display?(cross?"true":"false"):"unknown",
+            cross?" (Windows copies every captured frame between the two GPUs; a display connected to the processing GPU avoids the copy)":""));
+    }
+    int64_t interval()const{return 10000000LL*info.nominalRateDen/info.nominalRateNum;}
+    void updateRate(HMONITOR monitor){
+        auto rate=options.fps?DXGI_RATIONAL{options.fps,1}:monitorRate(monitor);
+        if(!rate.Numerator||!rate.Denominator){
+            if(info.nominalRateNum)return; // Retain the last known rate on a transient query failure.
+            rate={60,1};log::warn("screen","display refresh query failed; using 60 FPS limit");
+        }
+        if(info.nominalRateNum==int(rate.Numerator)&&info.nominalRateDen==int(rate.Denominator))return;
+        info.nominalRateNum=int(rate.Numerator);info.nominalRateDen=int(rate.Denominator);
+        info.averageFps=double(rate.Numerator)/rate.Denominator;nextPts=0;
+        if(sequence)wasWaiting=true;
+        log::info("screen-rate",std::format("followDisplay={} limit={}/{} ({:.3f} Hz) monitor={}",options.fps==0,rate.Numerator,rate.Denominator,info.averageFps,uint64_t(monitor)));
+        applyMinUpdateInterval();
+    }
+    // WGC's default MinUpdateInterval (16 ms on Windows 11 24H2) skips a frame that
+    // composes sooner than that after the last one: a 60 FPS window on a 165 Hz
+    // display arrived at 55 FPS (every third refresh) and no limit above 60 was
+    // reachable. On any refresh grid, composed frames of a source at or below the
+    // limit are at least half a limit interval apart, so ask for that less 1 ms of
+    // timestamp jitter; the deadline accumulator in read() still enforces the limit.
+    void applyMinUpdateInterval(){
+        if(!session||!info.nominalRateNum)return;
+        try{
+            if(!winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",L"MinUpdateInterval"))return;
+            const int64_t value=std::max<int64_t>(10000,interval()/2-10000);
+            const auto previous=session.MinUpdateInterval().count();
+            if(previous==value)return;
+            session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{value});
+            log::info("screen-rate",std::format("WGC minUpdateInterval={:.3f} ms (was {:.3f} ms)",value/1e4,previous/1e4));
+        }catch(const winrt::hresult_error& e){
+            log::warn("screen-rate",std::format("WGC minUpdateInterval kept hr=0x{:08X}",uint32_t(e.code())));
+        }
+    }
+    void color(){
+        auto& c=info.color;c={};c.pixelFormat=hdr?pipeline::SourcePixelFormat::Rgba16F:pipeline::SourcePixelFormat::Bgra8;
+        c.range=pipeline::ColorRange::Full;c.matrix=pipeline::YuvMatrix::BT709;
+        c.transfer=hdr?pipeline::TransferFunction::Linear:pipeline::TransferFunction::SRGB;
+        c.primaries=pipeline::ColorPrimaries::BT709;c.scRgb=hdr;
+    }
+    std::shared_ptr<Surface> acquire(unsigned width,unsigned height){
+        for(auto& slot:slots){if(slot&&slot.use_count()!=1)continue;
+            if(!slot||slot->width!=width||slot->height!=height||slot->format!=format){
+                auto next=std::make_shared<Surface>();next->width=width;next->height=height;next->format=format;next->fence=fence;
+                D3D11_TEXTURE2D_DESC td{};td.Width=width;td.Height=height;td.MipLevels=td.ArraySize=1;td.Format=format;td.SampleDesc.Count=1;
+                td.Usage=D3D11_USAGE_DEFAULT;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;td.MiscFlags=D3D11_RESOURCE_MISC_SHARED_NTHANDLE|D3D11_RESOURCE_MISC_SHARED;
+                check(device->CreateTexture2D(&td,nullptr,&next->producer),"Create shared texture");
+                ComPtr<IDXGIResource1> resource;check(next->producer.As(&resource),"shared IDXGIResource1");NativeHandle handle;
+                check(resource->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,nullptr,&handle.value),"texture NT handle");
+                check(consumer->OpenSharedHandle(handle.value,IID_PPV_ARGS(&next->consumer)),"Open texture D3D12");slot=std::move(next);
+            }return slot;
+        }return {};
+    }
+    // Windows 11 lets a desktop app turn the yellow capture border off after asking
+    // for borderless access (granted without a prompt outside the app store). Older
+    // systems keep the border; the capture itself is unaffected either way.
+    void dropBorder(){
+        try{
+            if(!winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",L"IsBorderRequired")){
+                log::info("screen","capture border: kept (this Windows has no IsBorderRequired)");return;
+            }
+            const auto access=GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).get();
+            session.IsBorderRequired(false);
+            borderDisabled=!session.IsBorderRequired();
+            log::info("screen",std::format("capture border: off access={} required={}",int(access),session.IsBorderRequired()));
+        }catch(const winrt::hresult_error& e){
+            log::warn("screen",std::format("capture border kept hr=0x{:08X} {}",uint32_t(e.code()),winrt::to_string(e.message())));
+        }
+    }
+    void startDuplication(){
+        ComPtr<IDXGIDevice> dxgi;check(device.As(&dxgi),"DXGI device");ComPtr<IDXGIAdapter> adapter;check(dxgi->GetAdapter(&adapter),"adapter");
+        for(UINT i=0;;++i){ComPtr<IDXGIOutput> output;const auto hr=adapter->EnumOutputs(i,&output);if(hr==DXGI_ERROR_NOT_FOUND)break;check(hr,"EnumOutputs");
+            DXGI_OUTPUT_DESC d{};check(output->GetDesc(&d),"output description");if(uint64_t(d.Monitor)!=options.target)continue;
+            if(d.Rotation!=DXGI_MODE_ROTATION_IDENTITY)throw winrt::hresult_error(E_NOTIMPL,L"旋转显示器请使用 Windows 采集方式");
+            ComPtr<IDXGIOutput5> five;check(output.As(&five),"IDXGIOutput5");
+            const DXGI_FORMAT formats[]={format};check(five->DuplicateOutput1(device.Get(),0,1,formats,&duplication),"DuplicateOutput1");return;
+        }throw winrt::hresult_error(DXGI_ERROR_NOT_FOUND,L"兼容方式要求显示器连接在处理显卡上；请选择 Windows 采集");
+    }
+};
+ScreenCaptureSource::ScreenCaptureSource():p_(std::make_unique<Impl>()){}
+ScreenCaptureSource::~ScreenCaptureSource(){close();}
+bool ScreenCaptureSource::open(const SourceOpenDesc& desc){
+    close();p_=std::make_unique<Impl>();auto& p=*p_;
+    try{
+        if(!ScreenCaptureOptions::parse(desc.path,p.options)||!desc.d3d12Device)throw winrt::hresult_error(E_INVALIDARG,L"屏幕采集参数无效");
+        const auto& o=p.options;HWND window=o.kind==ScreenTargetKind::Window?reinterpret_cast<HWND>(o.target):nullptr;
+        if(window){GetWindowThreadProcessId(window,&p.targetPid);if(!IsWindow(window)||p.targetPid==GetCurrentProcessId())throw winrt::hresult_error(E_INVALIDARG,L"窗口已关闭或属于 Veyra");}
+        HMONITOR monitor=window?MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST):reinterpret_cast<HMONITOR>(o.target);
+        p.otherDesktop=window&&vdesk::shellCloaked(window);
+        if(p.otherDesktop)log::info("screen","target window is on another virtual desktop; WGC captures it while that desktop is hidden");
+        p.displayHdr(monitor,p.hdr);p.format=p.hdr?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_B8G8R8A8_UNORM;
+        p.consumer=static_cast<ID3D12Device*>(desc.d3d12Device);
+        p.logGpuPath(monitor);
+        ComPtr<IDXGIFactory4> factory;check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"factory");ComPtr<IDXGIAdapter> adapter;
+        check(factory->EnumAdapterByLuid(p.consumer->GetAdapterLuid(),IID_PPV_ARGS(&adapter)),"processing adapter");
+        ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
+        check(D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context),"D3D11CreateDevice");
+        check(device.As(&p.device),"D3D11 device5");check(context.As(&p.context),"D3D11 context4");
+        check(p.device->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&p.producerFence)),"producer fence");NativeHandle handle;
+        check(p.producerFence->CreateSharedHandle(nullptr,GENERIC_ALL,nullptr,&handle.value),"fence NT handle");
+        check(p.consumer->OpenSharedHandle(handle.value,IID_PPV_ARGS(&p.fence)),"Open fence D3D12");
+        if(o.kind==ScreenTargetKind::Monitor){excludeOwnWindows();p.exclusion=true;}
+        if(o.method==ScreenCaptureMethod::Duplication){
+            if(o.cursor)throw winrt::hresult_error(E_NOTIMPL,L"兼容方式请关闭鼠标指针，或改用 Windows 采集");
+            p.startDuplication();DXGI_OUTDUPL_DESC d{};p.duplication->GetDesc(&d);p.poolSize={int(d.ModeDesc.Width),int(d.ModeDesc.Height)};
+        }else{
+            if(!GraphicsCaptureSession::IsSupported())throw winrt::hresult_error(E_NOTIMPL,L"系统不支持 Windows Graphics Capture");
+            auto interop=winrt::get_activation_factory<GraphicsCaptureItem,IGraphicsCaptureItemInterop>();
+            if(window)check(interop->CreateForWindow(window,winrt::guid_of<GraphicsCaptureItem>(),winrt::put_abi(p.item)),"CreateForWindow");
+            else check(interop->CreateForMonitor(monitor,winrt::guid_of<GraphicsCaptureItem>(),winrt::put_abi(p.item)),"CreateForMonitor");
+            ComPtr<IDXGIDevice> dxgi;check(device.As(&dxgi),"DXGI device");winrt::com_ptr<IInspectable> inspectable;
+            check(CreateDirect3D11DeviceFromDXGIDevice(dxgi.Get(),inspectable.put()),"WinRT device");p.wrapped=inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+            p.poolSize=p.item.Size();p.pool=Direct3D11CaptureFramePool::CreateFreeThreaded(p.wrapped,DirectXPixelFormat(p.format),2,p.poolSize);
+            p.session=p.pool.CreateCaptureSession(p.item);p.session.IsCursorCaptureEnabled(o.cursor);
+            if(o.borderless||o.kind==ScreenTargetKind::Monitor)p.dropBorder();
+            p.updateRate(monitor);p.applyMinUpdateInterval();
+            p.session.StartCapture();
+        }
+        if(p.poolSize.Width<=int(o.left+o.right)||p.poolSize.Height<=int(o.top+o.bottom))throw winrt::hresult_error(E_INVALIDARG,L"裁剪范围超出画面");
+        p.info.opened=true;p.info.kind=pipeline::SourceKind::ScreenCapture;p.info.width=p.poolSize.Width-o.left-o.right;p.info.height=p.poolSize.Height-o.top-o.bottom;p.info.displayAspect=(p.poolSize.Height-o.top-o.bottom)>0?double(p.poolSize.Width-o.left-o.right)/(p.poolSize.Height-o.top-o.bottom):0.0;
+        p.updateRate(monitor);p.info.hardwareDecodeActive=true;
+        p.info.videoDecodePath=o.method==ScreenCaptureMethod::Wgc?"WGC shared GPU":"DXGI duplication shared GPU";
+        p.info.containerName="screen";p.info.videoCodecName="GPU RGB";p.info.videoPixelFormatName=p.hdr?"scRGB FP16":"BGRA8 sRGB";p.color();
+        p.clockOffset=host100ns()-qpc100ns();p.lastFrameHost=host100ns();p.frame=av_frame_alloc();if(!p.frame)throw std::bad_alloc();
+        log::info("screen",std::format("opened method={} target={} size={}x{} hdr={} fpsLimit={:.3f} followDisplay={} cursor={} borderless={} otherVirtualDesktop={} pool=6 cpuReadback=0 audioCapture=0",unsigned(o.method),o.target,p.info.width,p.info.height,p.hdr,p.info.averageFps,o.fps==0,o.cursor,o.borderless||o.kind==ScreenTargetKind::Monitor,p.otherDesktop));
+        return true;
+    }catch(const winrt::hresult_error& e){p.message=std::format(L"屏幕采集失败 0x{:08X}：{}",uint32_t(e.code()),e.message().c_str());log::error("screen",winrt::to_string(p.message));}
+    catch(const std::exception& e){p.message=L"屏幕采集资源分配失败";log::error("screen",e.what());}
+    auto error=p.message;close();p.message=error;return false;
+}
+SourceReadStatus ScreenCaptureSource::read(pipeline::FramePacket& packet,const AVFrame** output){
+    auto& p=*p_;*output=nullptr;if(!p.info.opened)return SourceReadStatus::Error;
+    try{
+        HWND window=p.options.kind==ScreenTargetKind::Window?reinterpret_cast<HWND>(p.options.target):nullptr;
+        if(window){DWORD pid=0;GetWindowThreadProcessId(window,&pid);if(!IsWindow(window)||pid!=p.targetPid){p.message=L"采集窗口已关闭，请重新选择窗口";return SourceReadStatus::Error;}
+            if(IsIconic(window)){p.message=L"窗口已最小化，等待恢复";p.wasWaiting=true;return SourceReadStatus::Waiting;}}
+        const auto now=host100ns();
+        if(now-p.lastColorCheck>10000000){
+            p.lastColorCheck=now;
+            const auto monitor=window?MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST):reinterpret_cast<HMONITOR>(p.options.target);
+            MONITORINFO mi{sizeof(mi)};
+            if(!GetMonitorInfoW(monitor,&mi)){p.message=L"显示器已断开，请重新选择目标";return SourceReadStatus::Error;}
+            if(window){
+                // Switching virtual desktops (or moving the window to another one)
+                // keeps the session; only the explanation for a quiet window changes.
+                const bool other=vdesk::shellCloaked(window);
+                if(other!=p.otherDesktop){p.otherDesktop=other;log::info("screen",std::format("target window virtual desktop shown={}",!other));}
+                if(!other&&p.message==otherDesktopNotice)p.message.clear();
+            }
+            if(!p.options.fps)p.updateRate(monitor);
+            p.logGpuPath(monitor);
+            bool hdr=p.hdr;
+            if(p.displayHdr(monitor,hdr)&&hdr!=p.hdr){
+                p.hdr=hdr;p.format=hdr?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_B8G8R8A8_UNORM;p.color();p.wasWaiting=true;
+                p.info.videoPixelFormatName=hdr?"scRGB FP16":"BGRA8 sRGB";
+                if(p.duplication){p.duplication.Reset();p.startDuplication();}
+                else p.pool.Recreate(p.wrapped,DirectXPixelFormat(p.format),2,p.poolSize);
+                log::info("screen",std::format("source color changed scRgb={}",hdr));return SourceReadStatus::Waiting;
+            }
+        }
+        ComPtr<ID3D11Texture2D> texture;Direct3D11CaptureFrame captured{nullptr};int64_t pts=0;
+        struct FrameLease {Direct3D11CaptureFrame& frame;~FrameLease(){if(frame)try{frame.Close();}catch(...){}}} frameLease{captured};
+        struct DupLease {IDXGIOutputDuplication* value=nullptr;~DupLease(){if(value)value->ReleaseFrame();}} lease;
+        if(p.duplication){DXGI_OUTDUPL_FRAME_INFO fi{};ComPtr<IDXGIResource> resource;const auto hr=p.duplication->AcquireNextFrame(0,&fi,&resource);
+            if(hr==DXGI_ERROR_WAIT_TIMEOUT)return SourceReadStatus::Waiting;
+            if(hr==DXGI_ERROR_ACCESS_LOST){p.duplication.Reset();p.startDuplication();p.wasWaiting=true;return SourceReadStatus::Waiting;}
+            check(hr,"AcquireNextFrame");lease.value=p.duplication.Get();check(resource.As(&texture),"duplication texture");
+            if(!fi.LastPresentTime.QuadPart)return SourceReadStatus::Waiting;
+            LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);pts=int64_t(static_cast<long double>(fi.LastPresentTime.QuadPart)*10000000/freq.QuadPart)+p.clockOffset;++p.metrics.received;
+        }else{
+            for(unsigned i=0;i<2;++i){auto next=p.pool.TryGetNextFrame();if(!next)break;if(captured){captured.Close();++p.metrics.dropped;}captured=std::move(next);++p.metrics.received;}
+            if(!captured){
+                // Apply a settled size even when no further frame arrives.
+                if(p.pendingSize.Width>0&&p.pendingSize.Height>0&&p.resizeSettled(p.pendingSize,now))p.applyPendingSize();
+                else p.recoverStaticResize(now);
+                if(p.otherDesktop&&p.message.empty()&&now-p.lastFrameHost>otherDesktopQuiet100ns)p.message=otherDesktopNotice;
+                return SourceReadStatus::Waiting;
+            }
+            const auto size=captured.ContentSize();
+            if(size.Width!=p.poolSize.Width||size.Height!=p.poolSize.Height){
+                if(size.Width<=0||size.Height<=0){captured.Close();captured=nullptr;p.wasWaiting=true;return SourceReadStatus::Waiting;}
+                if(p.resizeSettled(size,now)){captured.Close();captured=nullptr;p.applyPendingSize();return SourceReadStatus::Waiting;}
+                // Still resizing: deliver this frame at the current size below.
+            }else p.pendingSize={};
+            p.resizeNeedsFrame=false;
+            auto access=captured.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();check(access->GetInterface(IID_PPV_ARGS(&texture)),"capture surface");
+            pts=captured.SystemRelativeTime().count()+p.clockOffset;
+        }
+        // Accumulate deadlines: comparing each jittery interval to an exact
+        // 1/60 would accidentally discard nearly half of a 60 Hz stream. The
+        // compositor timestamp of a busy desktop also lands a refresh or two late
+        // and the next one on time, so a frame may come a quarter interval early:
+        // with 0.5 ms a 60 FPS window lost about 2 FPS at the 60 limit (58.1,
+        // 2026-10-27). The accumulated deadline still holds the average to the limit.
+        if(pts<=p.lastPts||pts<p.nextPts-p.interval()/4){++p.metrics.dropped;return SourceReadStatus::Waiting;}
+        D3D11_TEXTURE2D_DESC td{};texture->GetDesc(&td);
+        if(td.Format!=p.format)throw winrt::hresult_error(E_UNEXPECTED,L"采集颜色格式发生变化，请重新连接");
+        const auto& o=p.options;unsigned w=std::min(td.Width,unsigned(p.poolSize.Width)),h=std::min(td.Height,unsigned(p.poolSize.Height));
+        if(w<=o.left+o.right||h<=o.top+o.bottom){p.message=L"窗口小于裁剪范围，等待尺寸恢复";p.wasWaiting=true;return SourceReadStatus::Waiting;}
+        w-=o.left+o.right;h-=o.top+o.bottom;
+        av_frame_unref(p.frame);auto slot=p.acquire(w,h);if(!slot){++p.metrics.dropped;return SourceReadStatus::Waiting;}
+        D3D11_BOX box{o.left,o.top,0,o.left+w,o.top+h,1};p.context->CopySubresourceRegion(slot->producer.Get(),0,0,0,0,texture.Get(),0,&box);
+        check(p.context->Signal(p.producerFence.Get(),++p.signal),"producer Signal");p.context->Flush();
+        auto* owner=new std::shared_ptr<Surface>(slot);
+        p.frame->buf[0]=av_buffer_create(reinterpret_cast<uint8_t*>(owner),sizeof(*owner),[](void*,uint8_t* bytes){delete reinterpret_cast<std::shared_ptr<Surface>*>(bytes);},nullptr,0);
+        if(!p.frame->buf[0]){delete owner;throw std::bad_alloc();}
+        p.frame->data[0]=reinterpret_cast<uint8_t*>(slot->producer.Get());p.frame->format=AV_PIX_FMT_D3D11;p.frame->width=int(w);p.frame->height=int(h);p.frame->pts=pts;
+        packet={};packet.sequence=++p.sequence;packet.pts={pts,10000000};packet.duration=p.lastPts?pipeline::Rational{pts-p.lastPts,10000000}:pipeline::Rational{p.info.nominalRateDen,p.info.nominalRateNum};
+        packet.sourceKind=pipeline::SourceKind::ScreenCapture;packet.colorInfo=p.info.color;
+        packet.arrivalHost100ns=host100ns();packet.decodedHost100ns=packet.arrivalHost100ns;
+        if(p.sequence==1)packet.flags|=uint32_t(pipeline::FrameFlagBits::Open);
+        if(w!=p.info.width||h!=p.info.height){
+            packet.flags|=uint32_t(pipeline::FrameFlagBits::Resize);
+            p.info.width=w;p.info.height=h;p.info.displayAspect=double(w)/h;
+        }
+        if(p.wasWaiting||p.lastPts&&pts-p.lastPts>std::max<int64_t>(p.interval()*2,1000000))packet.flags|=uint32_t(pipeline::FrameFlagBits::Discontinuity);
+        packet.hardwareSurface={slot->consumer.Get(),0,p.fence.Get(),p.signal,w,h};
+        p.nextPts=std::max(p.nextPts+p.interval(),pts+p.interval()/2);
+        p.lastPts=pts;p.wasWaiting=false;p.message.clear();p.lastFrameHost=packet.arrivalHost100ns;++p.metrics.delivered;
+        // WGC's compositor timestamp can be ahead of the CPU callback. Keep
+        // that signed delta in diagnostics, not in the ingress CPU duration.
+        p.metrics.ageMs=double(packet.arrivalHost100ns-now)/10000;
+        if(p.metrics.delivered==1||p.metrics.delivered%300==0)log::info("screen-timing",std::format("readCpuMs={:.3f} compositorToReadMs={:.3f} delivered={} received={} dropped={}",p.metrics.ageMs,double(packet.arrivalHost100ns-pts)/10000,p.metrics.delivered,p.metrics.received,p.metrics.dropped));
+        *output=p.frame;return SourceReadStatus::Frame;
+    }catch(const winrt::hresult_error& e){p.message=std::format(L"屏幕采集错误 0x{:08X}：{}",uint32_t(e.code()),e.message().c_str());log::error("screen",winrt::to_string(p.message));return SourceReadStatus::Error;}
+    catch(const std::exception& e){p.message=L"屏幕采集资源分配失败";log::error("screen",e.what());return SourceReadStatus::Error;}
+}
+void ScreenCaptureSource::close()noexcept{
+    if(!p_)return;
+    try{if(p_->session)p_->session.Close();}catch(...){}
+    try{if(p_->pool)p_->pool.Close();}catch(...){}
+    p_->session=nullptr;p_->pool=nullptr;p_->item=nullptr;p_->wrapped=nullptr;p_->duplication.Reset();
+    if(p_->exclusion){restoreOwnWindows();p_->exclusion=false;}
+    av_frame_free(&p_->frame);p_->slots={};p_->fence.Reset();p_->producerFence.Reset();p_->context.Reset();p_->device.Reset();p_->consumer.Reset();p_->info.opened=false;
+}
+const SourceInfo& ScreenCaptureSource::info()const{return p_->info;}
+std::wstring ScreenCaptureSource::status()const{return p_->message;}
+ScreenCaptureMetrics ScreenCaptureSource::metrics()const{return p_->metrics;}
+}

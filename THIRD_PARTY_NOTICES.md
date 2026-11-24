@@ -1,0 +1,1237 @@
+# Third-party dependencies
+
+## Live subtitle translation (2026-11-20)
+
+Veyra's native subtitle translation adapts the Live Captions integration and
+translation workflow proposed by jjjxxxttt in [PR #203](https://github.com/Likely7/Veyra-NRVideo/pull/203)
+at `fb08b6cd87afcc2942eca2201958da4fbabfabaf` under the project's GPL-3.0 license.
+Windows speech recognition comes from Windows Live Captions.
+
+The optional in-app downloads are [llama.cpp b12240 Windows x64 CPU](https://github.com/ggml-org/llama.cpp/releases/tag/b12240)
+(MIT and the included LLVM OpenMP license) and [Qwen2.5-1.5B-Instruct Q4_K_M](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/tree/91cad51170dc346986eccefdc2dd33a9da36ead9)
+(Apache-2.0). The pinned URLs, byte counts and SHA-256 values are in
+`src/ui/TranslationAssets.cpp`. Both downloads live in the selected user's Veyra
+data directory and are independent of the application installer.
+
+## PushFPS frame generation and recording features (2026-11-19)
+
+The Spanish, French, German, Brazilian Portuguese and Russian columns of
+`i18n/catalog.json` also reuse matching entries from the PushFPS catalog
+at the revision below under the same license. Veyra fills additional strings
+locally, preserves format arguments and adapts terminology for its player UI.
+
+Ported from PushFPS (https://github.com/DosukaSOL/PushFPS), a modified version of
+Veyra, at commit `3be641ca70f8179838cef4a8ff6cc3117664d185`. Copyright (C) 2026
+DosukaSOL and the PushFPS contributors. License: `GPL-3.0-or-later`, used here
+under GPL-3.0. Each ported file keeps their copyright line and says what was
+changed (renamed, wired into Veyra's settings, engine and interface):
+
+- Live HUD Lock: `include/veyra/pipeline/HudLock.h`, `src/pipeline/HudLock.cpp`,
+  `shaders/HudLockUpdate.hlsl`, `shaders/HudLockCompose.hlsl` (from `PushHudLock*`, a0b76239).
+- Frame pacing repair: `include/veyra/engine/FramePacingRepair.h` and its unit test
+  (from `PushPacingRepair`, a0b76239 and ebbde37d).
+- Adaptive multiplier: `include/veyra/engine/AdaptiveFgMultiplier.h` and its unit test
+  (from `PushAdaptiveFg`, 9d4e61a2).
+- Fixes and smaller pieces re-implemented in existing Veyra files: the output-cap
+  multiplier uses the de-duplicated content rate (9d4e61a2); the CUDA compute cache is
+  raised to 4 GiB for VFG kernels (9e9a4340); NVENC two-pass and adaptive
+  quantization for recordings (e6d3e5c8).
+
+## Remote Play adaptive trigger request (2026-11-19)
+
+`scripts/remoteplay/patches/0004-chiaki-pad-proc-no.patch` backports chiaki-ng
+`27ab96fd000bd0904f8ea3953c81f3ddb75b188b` ("Ask a PS5 for trigger effects the
+controller can apply", chiaki-ng issue #759) onto the unchanged
+`0e16950165f06e5c3291537c2eeba6e852be7120` pin after patches 0001-0003. The PS5 ctrl
+request now carries `RP-PadProcNo: 3`; without it the console sends some adaptive
+trigger effects in a form the DualSense does not apply, so L2/R2 have no resistance.
+
+Source: https://github.com/chiaki-ng/chiaki-ng . License remains
+`LicenseRef-AGPL-3.0-only-OpenSSL`; see `licenses/remoteplay` and the upstream
+`COPYING`. The patch is an otherwise unchanged backport of the upstream change.
+
+## Remote Play feedback history backport (2026-11-17)
+
+`scripts/remoteplay/patches/0003-chiaki-feedback-history.patch` backports four
+chiaki-ng changes onto Veyra's unchanged `0e16950165f06e5c3291537c2eeba6e852be7120`
+dependency pin, including the upstream regression tests:
+
+- `4382c1c718271c0e2427196d13863a28d57c2038`: one packet per history event.
+- `bfbb2968a01238c4ee1611ceb79ee0025ca31267`: bounded tail resends and larger history.
+- `c938844a2fa7bbb9052656d83837cf98baff9ba5`: history event count in the Takion header.
+- `bc397a728bb430f28666129ef006f7a8ac0e6081`: count-minus-one header and event
+  sequence numbers; retransmits retain the same sequence.
+
+Source: https://github.com/chiaki-ng/chiaki-ng . License remains
+`LicenseRef-AGPL-3.0-only-OpenSSL`; see `licenses/remoteplay` and the upstream
+`COPYING`. The patch is a consolidated, otherwise unchanged backport. Local
+sender regression tests additionally exercise strike/modifier combinations,
+16-bit sequence wrap and a lost final release packet. Offline test results do
+not establish behavior on a physical PS5.
+
+## RX 7000 experimental NR provider (2026-10-30, development branch)
+
+RedDukeDev/dlss5-nr-amd-custom, fixed commit `ab455d179922adc11f65675d399e1d553bf423f0`: MIT network layer and NR kernels; ZLUDA at `b135e233bb7a6ff7f8690e49701f87f4944adcee`, MIT OR Apache-2.0. Original notices, exact file selection, modifications and proprietary component boundaries are in [third_party/redduke/VEYRA_ORIGIN.md](third_party/redduke/VEYRA_ORIGIN.md) and its LICENSE. The five external source files are fetched and Git-blob verified by `scripts/amd-nr/prepare-rdna3-source.py`; no SDK, runtime DLL, model or translation cache enters source Git.
+
+Veyra adds a per-layer isolated network host with D3D12 shared textures/fences, adapter-LUID selection, bounded queues, same-frame GPU validity markers and failure teardown. Small/Original model selection uses the existing AMD runtime ID and settings. No OptiScaler/ReShade/game wrapper or SR/RR/FG kernels are used. Private ZLUDA compatibility DLLs are not system driver replacements and never load in the player process. NVIDIA's original 310.9.16.0 DLL and translation cache retain their separate rights; local staging and manifest audit do not confer redistribution rights or change the formal Release whitelist. Existing RX 9000 lmxxf integration retains its own notices and ABI.
+
+2026-11-03 local multi-GPU repair: the same pinned ZLUDA `nvapi/src/lib.rs` is patched by [zluda-current-device-luid.patch](third_party/redduke/zluda-current-device-luid.patch) to obtain the adapter LUID from the current CUDA context's device. A context-free fallback is allowed only for one device; ambiguous mappings and LUID failures report errors. This fixes the stand-in reporting ordinal-zero integrated GPU identity while Veyra runs NR on a discrete GPU. `scripts/amd-nr/build-rdna3-nvapi.py` rebuilds only the open-source NVAPI crate; its output is installed as `runtime/amd-nr-rdna3/zluda/zluda_nvapi.dll` behind the original forwarder. No NVIDIA binary, GPU driver or translation cache is modified. Full upstream MIT and Apache-2.0 notices are retained in [licenses/rdna3-nvapi](licenses/rdna3-nvapi). CPU fixture validation is not Radeon inference validation. See [evidence and limits](docs/RDNA3_NVAPI_LUID_2026-11-03.md).
+
+## Beauty node: face restore and skin smoothing (2026-10-18)
+
+| Source | License | Veyra use |
+|---|---|---|
+| YuNet face detector, OpenCV Zoo `models/face_detection_yunet` at `47534e27`: `face_detection_yunet_2023mar.onnx` (232,589 bytes, SHA256 `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`) and `face_detection_yunet_2026may.onnx` (229,738 bytes, SHA256 `ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0`); hashes match the Git LFS pointer oids | MIT, Copyright (c) 2020 Shiqi Yu | Weights only, loaded at run time from `runtime/models`, `runtime_local/models` or `models` next to the program; never in source Git. The network runs as Veyra's own D3D12 compute shaders (`shaders/BeautyYuNet*.hlsl`, `src/beauty/YuNetGpu.cpp`); `src/beauty/OnnxLite.cpp` reads the ONNX file. |
+| MediaPipe face landmark model, google-ai-edge/mediapipe tag `v0.8.9`, `mediapipe/modules/face_landmark/face_landmark.tflite` (1,241,896 bytes, SHA256 `c603fa6149219a3e9487dc9abd7a0c24474c77263273d24868378cdf40aa26d1`, committed in the repository at that tag), and the outline index lists of `mediapipe/python/solutions/face_mesh_connections.py` | Apache-2.0 (the repository's license, LICENSE SHA256 `c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4`) | 468 face points per tracked face: weights only, loaded at run time from the same model folders as YuNet, never in source Git; read by `src/beauty/TfliteLite.cpp` and run as Veyra's own D3D12 compute shaders (`shaders/BeautyMesh*.hlsl`, `src/beauty/FaceMeshGpu.cpp`). The contour, eye, brow and lip index lists are copied into `shaders/BeautyMeshDecode.hlsl` and the tests |
+| SkinSoft, yasunari01/obs-filters `fd5690f`, `skinsoft-filter/data/effects/skinsoft.effect` | GPL-2.0-or-later | Skin selection (HSV hue distance, saturation / luma windows, shared softness), detail protection and texture restore, ported to `shaders/Beauty.hlsli` and `shaders/BeautyApply.hlsl` |
+| GPUPixel, pixpark/gpupixel `ef552bf`, `BeautyFaceUnitFilter` | Apache-2.0 | The variance-adaptive skin blend, re-implemented as a fast guided filter (He & Sun 2015) in `shaders/BeautyStats.hlsl` / `BeautyBlur.hlsl`; no GPUPixel source or binary is included |
+| OpenCV 5.0.0 `FaceDetectorYN`, `dnn.readNetFromTFLite` | Apache-2.0 | Test references only (`scripts/beauty/yunet-reference.py` and `facemesh-reference.py` write the expected detector and face mesh outputs); `shaders/BeautyTrack.hlsl` follows its non-maximum suppression rules (whole-pixel boxes, score order, IoU). OpenCV is neither linked nor shipped |
+
+Veyra changes: the detector, the face mesh crop / network / outlines, the GPU face
+tracking (stable ids, One Euro smoothing, grace and fade), the same-frame original restore, the region pass with
+indirect dispatch and every UI / preset / export connection are Veyra's own.
+Smoothing works on a perceptual copy relative to the SDR or 203-nit HDR white
+and blends back in linear light; SkinSoft's sparse 9-tap blur is replaced by the
+guided filter, and its saturation / luma floors are lowered for dim skin. The
+test pictures (OpenCV samples, the OpenCV Zoo example, scikit-image's astronaut)
+are used by local tests only and are not part of the source tree. No inference
+runtime (ONNX Runtime, DirectML, WinML) is added.
+
+## Spatial anti-aliasing: FXAA / SMAA / MLAA (#53, 2026-10-18)
+
+Ported from SAOG0721/Magpie (experimental branch), commit
+`d687997780ac8d6e54d8b21a0c6b2be70f5eb401`, GPL-3.0. Every Veyra shader file
+names its sources and changes in its header and keeps the upstream notice.
+
+| Magpie source | Upstream origin and license | Veyra file |
+|---|---|---|
+| `src/Effects/FXAA/FXAA.hlsli`, `FXAA_{Medium,High,Ultra}.hlsl` (presets 3/4/5) | libretro/slang-shaders `anti-aliasing/shaders/fxaa.slang`, Copyright (c) 2011 NVIDIA Corporation notice | `shaders/AaFxaa.hlsl` (built as `AaFxaa3/4/5.dxil`) |
+| `src/Effects/SMAA/SMAA.hlsli`, `SMAA_{Low,Medium,High,Ultra}.hlsl` | iryoku/smaa, MIT, Copyright (C) 2013 Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro, Diego Gutierrez | `shaders/Smaa.hlsli`, `AaSmaaEdges.hlsl`, `AaSmaaWeights.hlsl` (built as `AaSmaaWeights{Low,Medium,High,Ultra}.dxil`), `AaSmaaBlend.hlsl` |
+| `src/Effects/SMAA/SMAA_T2x_NoJitter_Experimental.hlsl`, `SMAA_4x_NoJitter_Experimental.hlsl` | Magpie fork addition on top of SMAA (same MIT notice) | `shaders/AaTemporalResolve.hlsl`; subsample-index sets in `src/pipeline/AntiAliasPass.cpp` |
+| `src/Effects/MLAA/MLAA.hlsl` | adapted there from GPUOpen-LibrariesAndSDKs/MLAA11, MIT, Copyright (c) 2016 Advanced Micro Devices, Inc. | `shaders/AaMlaa.hlsli`, `AaMlaaEdges.hlsl`, `AaMlaaCounts.hlsl`, `AaMlaaBlend.hlsl` |
+| `src/Effects/SMAA/AreaTex.dds` (SHA256 `16e6cd520c2d885cb142b98334b2516804cbb1f44dcda2922be1d68f0766208c`), `SearchTex.dds` (SHA256 `891e444b6dde7dd98f6902c805cd04e3469892aa1667c92f764d94789477ef3a`) | SMAA precomputed textures, iryoku/smaa, MIT | `src/pipeline/SmaaLookupTables.cpp`, generated by `scripts/generate-smaa-lookup-tables.py` (AreaTex R/G payload SHA256 `35065cef2a02cabcad711d6bf430239ae64e27d71c4e4fa06f29cce2c992f0d2`, SearchTex payload SHA256 `3694eae5e9d44b8ebb4415a13f8c7b94dc08a2fc86658434d771c4610fe5744d`) |
+
+Magpie's copy of the FXAA code had dropped the NVIDIA notice carried by the
+libretro source; `shaders/AaFxaa.hlsl` restores it verbatim.
+
+Veyra changes: the passes are compute shaders on the graph's linear FP16
+working textures (one pixel per thread); edges are detected on a perceptual
+luma pass (`shaders/AntiAlias.hlsli`, `AaLuma.hlsl`: sRGB transfer relative to
+the SDR white or the 203-nit HDR reference white, continued logarithmically
+above it) and every blend is done in linear light, which keeps HDR highlights
+and out-of-709 colours; SMAA neighbourhood blending passes pixels without
+weights through exactly; MLAA's `sqrt(lerp(c*c, a*a, w))` became a linear lerp;
+the temporal resolve measures its rejection distance on the perceptual
+transfer and takes history validity from the pass (reset on seek, scene cut,
+timeline discontinuity and rebuild) instead of the history alpha. The
+`AntiAliasPass` executor, the graph slots and every UI / preset / export
+connection are Veyra's own. Not ported: jittered SMAA T2x / 4x (captured
+frames cannot be jittered), Anime4K 3D AA upscale, SGSR, and the MagpieFX
+effect runtime. No Magpie binary or runtime is used.
+
+## User-provided ShortFuse NR 310.9.16 (2026-10-17, local testing)
+
+The user supplied `nvngx_dlssnr.dll` and authorized replacement of the SF-v2
+compatibility slot in a separate local branch. It exactly matches the DLL in
+ShortFuse's RenoDX announcement, tag `compat-fp16-310.9.16-cuda13.4.3`:
+https://discord.com/channels/1408098019194310818/1543976771920330884/1560685677816057856
+
+Identity: 310.9.16.0, 276162560 bytes, SHA256
+`CDFA6C1EC784867182164C7836F324F087B5C9F374D0C9FE46F54999FEABF3ED`,
+Authenticode `NotSigned`. This is a community-modified NVIDIA NR runtime,
+not a validly NVIDIA-signed original, open-source model, or certification of
+all RTX hardware. ShortFuse describes SM75/86/89 compatibility kernels;
+Veyra preserves the actual architecture for this explicitly selected profile.
+Source-archive SHA256 is
+`623C9B12755B58E6F84C1FD131AA6C57F11565D8EF3F831665358CB6132976AB`.
+
+No DLL, CUDA kernel, model, SDK, or ReShade add-on enters source Git. Veyra
+copies the supplied DLL without modifying its disk bytes; existing NVIDIA
+licenses/notices are retained, and this local authorization grants no new
+public redistribution permission. See `docs/NR_SF_310916_PLAN_2026-10-17.md`
+and the corresponding report for measured conditions and untested hardware.
+
+## Capture format capability discovery (2026-10-17)
+
+The format compatibility review used OBS Studio 32.2.2 at
+`ba2f32bdf791005443988a4955e963663e16b1ed` and its libdshowcapture submodule
+at `8878638324393815512f802640b0d5ce940161f1`, especially
+`src/dshow-enum.cpp` and `src/dshow-base.cpp` (LGPL-2.1-or-later).
+Veyra independently implements the capability fallback, range candidates,
+pin selection and exact media-type validation in
+`include/veyra/source/DirectShowFormatDiscovery.h` and
+`CaptureCapabilityRange.h`. No OBS runtime, capture loop, buffering,
+decoder or renderer is imported by this change. This is separate from the
+existing attributed libdshowcapture adaptations below.
+
+## Compressed Matroska subtitles (2026-10-09)
+
+The subtitle candidate rebuilds the existing LGPL FFmpeg n9.0.1 with zlib
+enabled, retaining the Veyra PS5 H.264 slices256 patch and dav1d 1.5.4.
+It statically links zlib 1.3.2 (zlib license; Jean-loup Gailly, Mark Adler and
+contributors), using the existing external dependency built with the dynamic
+MSVC CRT. FFmpeg handles compressed Matroska PGS/DVD and text subtitle packets;
+Veyra does not implement another decompressor. The original runtime files are
+preserved. Candidate DLL hashes, actual configuration, LGPL/zlib notices and
+the matching FFmpeg/dav1d/zlib source archive accompany the local candidate.
+No dependency source, model, SDK, library or DLL is added to Veyra source Git.
+
+NVIDIA SDKs and runtimes are excluded from source control. The publisher-authorized experimental Release package contains only selected runtime DLLs and applicable notices, as documented in `docs/RUNTIME_COMPONENTS_0.0.2.md`. This is not vendor endorsement or a general redistribution grant. ReShade/RenoDX add-ons are not loaded or distributed by the product.
+
+## NVIDIA Video Frame Generation (local integration, 2026-10-03)
+
+`src/pipeline/VfgBackend.cpp` and `include/veyra/pipeline/VfgBackend.h` implement
+the public native Video Effects SDK 1.3.0 and NvCVImage C APIs. Effect setup,
+`VideoFrameGeneration` selectors, multiplier/frame-index sequencing and quality
+modes were cross-checked against [NVIDIA-Maxine/VFX-SDK-Samples](https://github.com/NVIDIA-Maxine/VFX-SDK-Samples/tree/52011f89c1741d06b40ea312af1f20be8be9ec62),
+fixed commit `52011f89c1741d06b40ea312af1f20be8be9ec62`,
+`apps/VideoFrameGenerationEffectApp/VideoFrameGenerationEffectApp.cpp` and its README (MIT,
+Copyright NVIDIA Corporation). The sample remains in external dependencies;
+its CLI, OpenCV/CPU image transfer and implementation are not vendored.
+Veyra adds its own D3D12/CUDA external-buffer/fence bridge, opaque descriptors
+allocated by NvCVImage, exact adapter-LUID selection, asynchronous native calls,
+bounded output leases, shared preview/export integration, reset and diagnostics.
+The public NvCVImage documentation is authoritative for void destruction and
+borrowed pixel ownership; no proprietary SDK struct or header is copied into Git.
+
+The local runtime is the unmodified official `nvidia-vfx` 0.2.0.0 Windows wheel,
+`nvidia_vfx-0.2.0.0-cp311-cp311-win_amd64.whl`, 435809365 bytes, SHA-256
+`5aaf6a42bc6b6dbbf52fcb714194c994a6893cbbf7ada38bc2165a1f83e4a6fc`.
+The existing VFG path uses five native dependencies; nine unrelated NPP libraries are omitted; Python and its extension
+are not a product dependency. This proprietary runtime is **not MIT**.
+The 2.1.3 local NVIDIA test package also includes the unmodified wheel's
+`nvVFXVideoSuperRes.dll` (42608 bytes, SHA-256
+`93601175949d0f5b5c033d6c9e58ca465a45ef1dd961eaea34d4ffb979f72850`)
+and its `nvngx_vsr.dll` (1.8.3.0, 59120752 bytes, SHA-256
+`0cc98643a76c05ca6d73ec81a898d545b18e5c080667d72854a1bfaebd56e1ed`)
+for the high-bitrate and streaming VideoSuperRes modes. Both retain valid
+NVIDIA signatures; the existing NGX 1.6.0.0 VSR stays in its separate directory.
+`VfxSrBackend` is Veyra's adapter for this public C API. The NVIDIA software,
+AI-product, model terms and third-party notices remain under `licenses/nvidia-vfg`.
+The local test packaging manifest records these separately and does not imply
+a new public release. No SDK, Python extension or model is added to source Git.
+The 2.0.3 NVIDIA package carries its NVIDIA software/AI/model terms and third-party
+notices with a separate `vfg-runtime-manifest.json`. The user explicitly authorized
+this experimental Release distribution; this is not vendor certification or a general
+redistribution grant, and the integration is not an independent legal audit. CUDA driver headers
+are an external build dependency only; the system `nvcuda.dll` is never bundled.
+DLLs remain unmodified, separately identified and outside source control;
+manifest identity does not lock user replacements. Hardware/format support and
+initialization failures are reported by the native backend.
+
+Shared graph/pool, presenter, worker, settings/preset/session and QML modifications
+are Veyra code. The SDK provides frame inference; the local RTX 5070 tests do
+not establish RTX 40 hardware results, physical display latency, universal HDR
+color accuracy or official NVIDIA certification. Provenance and measurements:
+`docs/VFG_RESEARCH_AND_INTEGRATION_PLAN_2026-10-03.md` and
+`docs/VFG_INTEGRATION_ACCEPTANCE_2026-10-03.md`.
+
+## AVerMedia capture HDR-to-SDR control
+
+The WDM upstream crossbar helpers in `include/veyra/source/DirectShowCaptureSetup.h`
+are adapted from OBS `libdshowcapture` at the same fixed commit
+`c13d4b7b0c66979396ba0a9060c9aafc15bb7b22`: `source/device.cpp`
+(`FindCrossbar`, `ConnectPins`) and `source/dshow-base.cpp` (`GetPinMedium`,
+`GetFilterByMedium`, `DirectConnectFilters`). Copyright (C) 2023 Lain Bailey,
+LGPL-2.1-or-later; see `licenses/capture/LIBDSHOWCAPTURE_LGPL.txt`.
+Veyra adds medium bounds and direction validation, multiple-medium matching,
+existing-connection protection and HRESULT reporting. It connects the upstream
+graph edge without changing the user's physical input routing. HDYC recognition
+also follows the format contract in that commit's `source/dshow-formats.cpp`;
+Veyra reuses its existing UYVY GPU ingress and retains explicit color metadata.
+These adaptations do not constitute Blackmagic hardware certification.
+
+The Blackmagic-specific allocator negotiation and terminal renderer flag in
+`src/source/NativeCaptureSink.cpp`, and output-selected direct connection in
+`src/source/CaptureCardSource.cpp`, additionally adapt `CapturePin::GetAllocator`,
+`GetAllocatorRequirements`, `MiscFlagsHandler::GetMiscFlags` and
+`HDevice::ConnectPins` from that same commit (`source/capture-filter.cpp`,
+`source/device.cpp`, Copyright (C) 2023 Lain Bailey, LGPL-2.1-or-later).
+Veyra limits this compatibility policy to Blackmagic/DeckLink video, retains
+the upstream-selected allocator for diagnostics, and preserves its own
+blocking, stop/flush, sample-size and negotiated media-contract checks.
+
+The AVerMedia hardware HDR-to-SDR property request in
+`src/source/CaptureCardSource.cpp` is adapted from `source/device-vendor.cpp`
+(`SetTonemapperAvermedia`) in [obsproject/libdshowcapture](https://github.com/obsproject/libdshowcapture/tree/c13d4b7b0c66979396ba0a9060c9aafc15bb7b22),
+fixed commit `c13d4b7b0c66979396ba0a9060c9aafc15bb7b22`, Copyright (C) 2023
+Lain Bailey, LGPL-2.1-or-later (see `licenses/capture/LIBDSHOWCAPTURE_LGPL.txt`). Veyra restricts
+the protocol to the selected AVerMedia filter, logs Set/Get results, and applies
+the wide/narrow format policy at each connection before SetFormat. Unsupported
+properties remain an explicit warning. This does not prove the GC573 15 FPS
+cause or provide unsupported Elgato 4K X HID control.
+
+## Elgato MK.2 capture control
+
+MIT adaptations in `src/source/ElgatoHdrControl.cpp` and its header:
+
+- https://github.com/elgatosf/capture-device-support at
+  `fe9630974d47f51bf54826e72fb8b654e620aa93`, `SampleCode/DriverInterface.cpp`
+  and `Library/HDMIInfoFramesAPI.h`: private property GUID, IDs 720/721/722,
+  two-part HDR packet and hardware HDR-to-SDR control protocol. Copyright
+  (c) 2022 Corsair Memory, Inc.
+- https://github.com/nitlink-dev/nitlink at
+  `4f8a723406f63c6e92832488a6022fcf25233871`,
+  `src/capture/elgato_hdr_control.cpp` and `elgato_device_identity.h`:
+  exact MK.2 aliases, packet read size checks and hardware/native HDR pairing;
+  `IsElgatoDevice` identity rule; `src/renderer/dx11_renderer.cpp`
+  `yuv2020ToRgb_Limited`: limited-range luma with full-range chroma for HDR
+  P010 from Elgato cards other than the MK.2 (MK.2 keeps 64..960 chroma).
+  Copyright (c) 2026 NitLink Contributors.
+
+Veyra changes: use the already selected DirectShow filter instead of opening
+another device; validate packet length/type/checksum; retain manual overrides;
+log HRESULT/readback and restore a readable initial tonemap value on close.
+2026-10-11: the vendor tonemap control covers every Elgato filter name (strict
+only for MK.2 P010; other models may lack the property set); 8-bit formats
+request the card's hardware tonemapper as OBS libdshowcapture
+(`SetVendorTonemapperUsage`, behaviour only, no code copied) does; the
+non-MK.2 P010 chroma rule is a per-source flag (`fullRangeChroma`) honoured by
+`YuvToLinearRgb.hlsl`, applied only when the user leaves range on auto. No
+vendor shader, SDK header or binary is vendored.
+2026-11-16: `readElgato4kxHdrPacket` adapts the Elgato 4K X source-HDR query
+from Nitlink at `f39b909517f95791d97e64463fc65e5be7a17fcc`,
+`src/capture/elgato_hdr_control.cpp` (`ReadXuBlocks`) and
+`elgato_4kx_source.h`: UVC extension unit GUID, selector 2/1 length and
+request/reply mailbox, readiness and HDR InfoFrame requests (Nitlink credits
+13bm/elgato4k-linux for the protocol; no code from that project is used).
+Veyra changes: uses the selected filter, sends one query per connection
+instead of polling, stops after a rejected first write, checks the reply
+framing and checksum, and validates the InfoFrame with the existing parser. Full license:
+`licenses/capture/ELGATO_NITLINK_MIT.txt`.
+
+## NVENC API declarations
+
+Source: https://github.com/FFmpeg/nv-codec-headers ; encoder ABI baseline `e844e5b26f46bb77479f063029595293aa8f812d` (tag `n13.0.19.0`, SDK 13.0 declarations), stored only under ignored `third_party_local/nvidia/nv-codec-headers-13.0`. Stage with `git clone --depth 1 --branch n13.0.19.0 https://github.com/FFmpeg/nv-codec-headers.git third_party_local/nvidia/nv-codec-headers-13.0`. CMake accepts `VEYRA_NVENC_HEADERS_ROOT`; compilation checks major/minor 13.0. The previous 13.1 checkout `eddcea9e27f6b772057c9b3f87de2cc1737faffc` remains unmodified for other local tools. Veyra now queries the driver's maximum API before creating the 13.0 function table/session and uses the same ABI for every structure, without pretending that a version-number-only downgrade changes structure layouts. No header or runtime is copied into source control.
+
+The nvEncodeAPI.h header itself has NVIDIA's permissive MIT-style notice (Copyright 2010–2024 NVIDIA Corporation in the pinned 13.0 header). Its full notice is retained unmodified in that header. This permits using the declarations without retrieving the full developer-portal sample package; it does not grant rights to distribute NVIDIA driver/runtime binaries. Veyra uses the system NVENC library, never copies it into a package. Implementation is independently authored against these declarations; no competitor/sample implementation copied.
+
+FFmpeg: dynamically linked 9.0.1#1 vcpkg build. The portable package carries five FFmpeg DLLs, the complete copyright/license notices and SPDX provenance. Corresponding upstream source and the vcpkg patch/build recipe are listed in `docs/BUILD.md`. No FFmpeg command-line executable or test-media toolchain is shipped.
+
+The PS5 H.264 repair build additionally applies `scripts/ffmpeg/ps5-h264-slices.patch` to FFmpeg's LGPL `libavcodec/h264dec.h`, increasing the bounded slice capacity from 32 to 256. This is a Veyra modification, not an upstream release claim. Its corresponding source, patch, configuration and DLL identity record must accompany any future binary release; the previously published 0.0.5 package is unchanged by this local repair.
+
+## Intel XeSS / XeLL
+
+Official XeSS SDK 3.0.2. Veyra loads `libxess_fg.dll` and `libxell.dll` for experimental preview frame generation. Unmodified binaries may be redistributed under the Intel Simplified Software License; the complete license and `third-party-programs.txt` accompany the package. User DLL replacement is allowed by Veyra without fixed identity locks; compatibility is not guaranteed.
+
+### XeSS multi-frame unlock (ported, process-memory only)
+
+Source: https://github.com/Coldwood1026/OptiScaler , commit `70676c5f037c8c26f1ec355b250a72303cd268da`, files `OptiScaler/proxies/XeFGUnlock.h` and `XeFGPacing.h` (GPL-3.0). The five byte patches that raise the provider's generated-frame ceiling on non-Intel GPUs are ported into `include/veyra/gfx/XessMfgUnlock.h` / `src/gfx/XessMfgUnlock.cpp`; the structural design (module identity checks, transactional install, rollback after the contexts exit) follows `SAOG0721/Magpie` (`experimental` branch, GPL-3.0, `XeSSFGCompatibility.h` / `XeSSFGPatchTransaction.h`). Veyra adds size + SHA-256 + PE identity checks and refuses unaudited provider builds.
+
+The provider DLL on disk is never modified, re-signed or renamed; only the mapped image of the process is patched, and every patched byte is restored when the XeFG/XeLL contexts are destroyed. Because Veyra itself is GPLv3, the ported GPL-3.0 code is compatible; the upstream authorship above is attributed here. Locked provider identity: `libxess_fg.dll` 1.3.1.78, 22,957,432 bytes, SHA-256 `EC5E0C65E075570C6EDE72618BB666D0BE0C2E10B2EA9762C0FE8CB8E375AB27`, PE TimeDateStamp `0x69CB0F4D`, SizeOfImage `0x015ED000`.
+
+2026-09-30 changes: `src/gfx/XessMfgUnlock.cpp` now stores the actual byte
+string before forming the mismatch diagnostic, avoiding iterators into two
+different temporaries; `src/gfx/XessPresenter.cpp` logs the unlock result detail.
+The five patch locations and transaction remain unchanged. They were compared
+with the renamed upstream [OptiScalerDp4aUnlock](https://github.com/Coldwood1026/OptiScalerDp4aUnlock),
+commit `9eea95bba9fda7121f214d2eba358423be598d7e` (GPL-3.0).
+The QML selector exposes experimental 3X/4X only for an audited provider and
+uses the running SDK capacity when available. This is not official Intel
+support for non-Intel multi-frame generation or proof for every AMD adapter.
+
+XeSS pacing adaptation (2026-09-19): `include/veyra/gfx/XessPacing.h` and `src/gfx/XessPacing.cpp` also adapt the above pinned OptiScaler `XeFGPacing.h` NoteFrame/PaceFrame/WaitUntil logic: a bounded 15-period median, generated-frame deadlines, and the provider-owned tail limiter condition. Veyra retains its audited call-site hooks, adds synchronized statistics and complete hooked-present-return gap measurements, and does not port upstream timestamp hooks. Provider scheduling remains preferred; wall-clock pacing is used only when its scheduler is unavailable. No on-disk runtime changes.
+
+XeSS read-only timing diagnostics (2026-09-21): the timestamp callback ABI and
+pinned provider locations (0x3430 / 0x224B30) were cross-checked against
+SAOG0721/Magpie commit `3841698348bfb246623d4acf791984c8b68a577b`,
+`src/Magpie.Core/XeSSFGPacing.h` (GPL-3.0). Veyra's trace-only hook records
+the native deadline without modifying it. The upstream deadline rewrite is
+not ported. The audited DLL remains unchanged on disk.
+
+Read-only fence attribution additionally checks the same pinned provider's
+scheduler at 0x21EE30: context+0x328 is the ID3D12Fence queried at 0x21EECF,
+and timestamp lookup+0x18 holds the target tested at 0x21EEEB. Veyra samples
+GetCompletedValue around its synchronous scheduler call only when tracing;
+no fence value, event, deadline or queue submission is modified.
+
+### Magpie NR temporal residual route (2026-09-20)
+
+Veyra's optional `src/pipeline/NrTemporalPass.cpp` and
+`shaders/NrTemporal.hlsl` adapt the motion-guided residual-history design from
+SAOG0721/Magpie, commit
+`3841698348bfb246623d4acf791984c8b68a577b`,
+`src/Magpie.Core/DLSSNRTemporalShader.h` (GPL-3.0). The Veyra version keeps
+the existing D3D12 graph, uses its source motion extent and signed HDR working
+space, and adds its own resource/reset plumbing; it is not a binary or runtime
+copy. The 2026-09-21 adaptation distinguishes explicit protection masks from
+valid zero residual observations, excludes protected/feathered history, and
+rejects invalid source time intervals. A Veyra groupshared tile reuses the
+upstream-derived neighborhood observations without changing their tap order.
+Product D3D12 regression coverage is in
+`tests/integration/NrTemporalGpuTests.cpp`. The switch is default-off until affected RTX hardware and motion-scene
+quality tests reject ghosting and flicker regressions.
+
+## DLSS NR default runtime: community Lecram 310.8.3 (2026-09-29)
+
+The default NR slot (`runtime/experimental/nvngx_dlssnr.dll`) holds a community-modified build of
+NVIDIA's `nvngx_dlssnr.dll`, file version 310.8.3.0, SHA-256
+`F95FEB54137EA11979F9B4EC4F00AFD84B5C98A5624D3388FBF6A87714A39FCC`, 165840496 bytes, obtained by the user
+from https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.8.Lecram (archive SHA-256
+`ddb64e5545ba3f217c32555d2eb8fdfe76b9510d2256f13e8a5ecb1a9650ca54`). Compared with NVIDIA 310.8.0.0 it differs
+in the `.data` section that holds the GPU kernels (and 25 bytes of `.text`); the model weights are unchanged.
+Its Authenticode status is HashMismatch: NVIDIA's certificate over modified content, so it is not an
+NVIDIA-signed original and is not endorsed by NVIDIA. Veyra loads it unmodified by absolute path; it is
+never committed to source control. On an RTX 5070 its NR output was byte-identical to 310.8.0.0 on matched
+frames and about 2% cheaper. NVIDIA's rights in the runtime and the model are unaffected by Veyra's license.
+
+## DLSS NR RTX30 runtime: community SF-v2 310.8.2 (2026-09-29)
+
+The RTX30 NR slot (`runtime/experimental/nr-ampere/nvngx_dlssnr.dll`) holds ShortFuse's community-modified
+build of NVIDIA's `nvngx_dlssnr.dll`, version string 310.8.SF.0 (numeric 310.8.2.0), SHA-256
+`6EB209E764F39872625DEBD6ABAF45E2BB6322F6F270F781F70C059AE30B3927`, 165830144 bytes, unsigned, obtained by the user
+from https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.8.SF-v2 (archive SHA-256
+`1da35941894994eb087e017577829e492454e9bae3a6a9397027069ceb74955c`). It changes the kernel and model-weight
+sections to provide an FP16 route for RTX 20/30. On an RTX 5070 its NR output was byte-identical to NVIDIA's 310.8.0.0 on matched
+frames; the RTX 20/30 route has not been measured locally. Veyra
+loads it unmodified by absolute path and does not rewrite the reported GPU architecture for this build. It is
+never committed to source control and is not endorsed by NVIDIA.
+
+## AMD FidelityFX Optical Flow
+
+FidelityFX SDK 1.1.4, upstream commit `c6efa6bf7f2027b3ec94f28578bb5965eabb9e55`, https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK . The optical-flow and DX12 backend libraries are statically linked. Copyright (C) 2024 Advanced Micro Devices, Inc.; MIT license, reproduced in the package's `licenses/AMD_FIDELITYFX_LICENSE.txt`. This is optical flow, not AMD NR or AMD super resolution.
+
+## Microsoft Visual C++ Runtime
+
+The package includes unmodified x64 `vcruntime140.dll`, `vcruntime140_1.dll`, and `msvcp140.dll` from the Visual Studio 2022 C++ Redistributables directory for FFmpeg and XeSS. These are Microsoft Distributable Code under the [Visual Studio software terms](https://visualstudio.microsoft.com/license-terms/vs2022-ga-diagnosticbuildtools/); Windows system and GPU driver DLLs are not copied. Veyra itself uses the static MSVC runtime.
+
+## Lucide UI icons
+
+Source: https://github.com/lucide-icons/lucide/tree/a537cb6eb323b885f4c60baf3cec1a995982d167
+
+24 native icon mappings use 23 Lucide SVGs, retained under `assets/icons/lucide/`. Lucide is ISC-licensed (Copyright 2026 Lucide Icons and Contributors); its Feather-derived subset is MIT-licensed (Copyright 2013-present Cole Bemis). The complete upstream notices are preserved in `assets/icons/lucide/LICENSE` and must accompany any distribution containing these icons.
+
+`assets/icons/lucide/manifest.json` records the pinned revision and per-file SHA256. `scripts/generate-lucide-icons.py` converts the SVG geometry to GDI+ paths in `apps/veyra/ui/LucideIcons.h`, using development-only fonttools 4.64.0. Veyra requires no fonttools, network request, icon font or external icon runtime.
+
+The Qt/QML interface (2026-09-26) draws the Lucide geometry that the approved prototype carries in `prototypes/ui-redesign-2026-09-25/icons.js`. `tools/qt_probe/make-icons.py` converts those SVG elements to path data in `qml/Veyra/IconData.js`, rendered by `qml/Veyra/VIcon.qml`; the same Lucide ISC / Feather MIT notices in `assets/icons/lucide/LICENSE` apply. `back10`, `fwd10`, `playfill` and `pausefill` in that file are the prototype's own inline SVGs, not Lucide.
+
+The sponsor page (2026-10-19) adds Lucide `coffee` and `external-link` (as `external`) from lucide-static 1.51.0 to the same
+`icons.js`, under the same ISC notice.
+
+## Simple Icons brand glyphs (sponsor page, 2026-10-19)
+
+设置 → 赞助作者 draws the TikTok (Douyin uses the same mark), X, GitHub, YouTube, Ko-fi, WeChat and Alipay
+glyphs from [Simple Icons](https://github.com/simple-icons/simple-icons) 16.34.0 (npm `simple-icons`, CC0-1.0).
+`tools/qt_probe/make-sponsor-icons.py` places the unmodified path data on coloured tiles in `qml/Veyra/sponsor/*.svg`;
+the Ko-fi glyph is split into its subpaths to colour the cup the way Ko-fi's own button does. CC0 covers the
+drawings only: the logos remain trademarks of their owners and are used solely to link to the author's own
+pages; no endorsement is implied.
+
+The Patreon glyph used by the sponsor page and documentation buttons (2026-11-11) is from
+[Simple Icons at cd796c98565fc466923fc1128b962e133fa3c612](https://github.com/simple-icons/simple-icons/blob/cd796c98565fc466923fc1128b962e133fa3c612/icons/patreon.svg),
+under CC0 1.0. Its original path is retained in the SVG files with source metadata.
+
+## RTX Video SDK 1.1 local VSR adapter
+
+User-provided official SDK from https://developer.nvidia.com/rtx-video-sdk/getting-started, kept under ignored third_party_local/nvidia/RTX_Video_SDK_1.1.0. Its NVIDIA RTX SDK license remains applicable. VideoSrBackend is independently authored against the documented VSR parameter ABI; no SDK sample implementation or proprietary header is copied into the repository. Local nvngx_vsr.dll remains excluded from Git. Under the user-authorized 2026-09-09 Release Runtime Pack policy, its pinned signed release copy may be included only as a Release asset alongside the applicable SDK license and manifest; it is never committed to source control.
+
+## NVIDIA FRUC
+
+FRUC was evaluated during development and has been removed from the product. No FRUC runtime, worker, SDK headers, or binaries are built or packaged.
+
+## PS5 Remote Play / chiaki-ng (0.0.5)
+
+The optional `VEYRA_ENABLE_REMOTEPLAY` build compiles chiaki-ng at
+`0e16950165f06e5c3291537c2eeba6e852be7120` from https://github.com/streetpea/chiaki-ng,
+with the two reviewed patches in `scripts/remoteplay/patches/`. Chiaki code and
+these derived patches retain AGPL-3.0-only with the upstream OpenSSL exception;
+see `licenses/remoteplay/CHIAKI_AGPL3_OPENSSL.txt`. The metadata patch was adapted
+from the user-supplied Code 01 change description and checked against this pin.
+No Chiaki binary or third-party SDK is committed. The 0.0.5 distribution provides its corresponding complete source,
+these patches, dependency pins, build instructions and upstream notices; the
+existing Veyra GPL file alone is not the combined program's license record.
+
+Gamepad input uses SDL 3.4.14 (https://github.com/libsdl-org/SDL/tree/release-3.4.14),
+statically built using vcpkg. SDL provides DualSense and other controller device
+support; Veyra maps its public gamepad API to Chiaki semantic input. SDL also routes DualSense haptic audio; media playback remains in the shared Veyra engine. Retained notices: `licenses/remoteplay/SDL3_NOTICES.txt`.
+The 0.0.5 Release contains the combined executable. Its application source is the release tag; the RemotePlay-source asset supplies pinned upstream sources and build recipes.
+# Remote Play controller additions (2026-09-12)
+
+Veyra calls the pinned Chiaki orientation tracker API (AGPL-3.0-only with OpenSSL exception). DualSense SDL report offsets and 3 kHz stereo to four-channel haptic routing were checked against chiaki-ng gui/src/controllermanager.cpp and streamsession.cpp. Existing Chiaki and SDL license notices apply. No third-party binary was added.
+
+### PSN browser authorization adapter (2026-09-12)
+
+Historical attribution: this adapter was removed on 2026-11-11. Current Veyra opens the user-selected PSNTools website for manual Account ID lookup; it does not implement the old OAuth/token flow. Existing Chiaki protocol and dependency notices below still apply.
+
+`src/remoteplay/PsnAuth.cpp` adapts the OAuth request contract and public client identifiers from chiaki-ng, commit `0e16950165f06e5c3291537c2eeba6e852be7120`, `gui/src/psnaccountid.cpp`, `gui/include/psnaccountid.h`, and `gui/src/psntoken.cpp`. Upstream credits the Account ID script to grill2010. License: AGPL-3.0-only with the upstream OpenSSL exception. The Windows HTTP, protected storage and UI integration are Veyra code. This is an unofficial client, not Sony endorsement. json-c remains an existing Chiaki dependency; its license/notice must remain in binary distributions.
+
+Static dependency notices and installed SPDX records: licenses/remoteplay/{json-c,libevent,miniupnpc,openssl,opus,sdl3}/. Upstream curl, nanopb, Jerasure and gf-complete notices are in the same directory. Their corresponding sources and port recipes accompany the RemotePlay-source release asset.
+
+## GPU DIS optical flow (experimental)
+
+Source: https://github.com/gggz114514-oss/XeSS-GPU-Motion , commit
+`cb7523b5104fc914dc501767c3139b43c2067af7` (public R4.2 snapshot).
+The DIS provider and its shader closure are included under `third_party/gpu-dis/`.
+Owned additions use Apache-2.0; OpenCV-derived portions retain their BSD/Apache
+terms and Intel/Willow Garage/other upstream attribution. See that directory's
+LICENSE, NOTICE, PROVENANCE.md, VEYRA_INTEGRATION.md, and licenses/.
+Veyra adds GPU input/consumer adapters and descriptor staging; no Intel SDK,
+worker dependencies or proprietary runtime is included in this source subset.
+This is a motion-estimation option, not Intel XeSS frame generation itself.
+
+## Acknowledgments and Project Sources
+
+Thank you to these projects and their contributors. Integrated code, dependencies, and development references are identified separately below. Pinned versions, modifications, and licenses are recorded in the component sections above.
+
+### Integrated Code and Dependencies
+
+| Project | Contribution to Veyra |
+| --- | --- |
+| [chiaki-ng](https://github.com/streetpea/chiaki-ng) | PS5 Remote Play protocol, pairing and sessions; controller and haptics integration; historical PSN authorization adapter. Also credit to grill2010 for the upstream Account ID approach. |
+| [XeSS-GPU-Motion](https://github.com/gggz114514-oss/XeSS-GPU-Motion) / [OpenCV](https://github.com/opencv/opencv) | Ported GPU DIS provider and shaders, retaining attribution and licenses for the OpenCV DIS-derived portions. |
+| [FFmpeg](https://github.com/FFmpeg/FFmpeg) / [nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) | Media demuxing, decoding, muxing and NVENC API declarations. Releases provide the actual FFmpeg patches and corresponding source. |
+| [SDL](https://github.com/libsdl-org/SDL) | PC controller input, DualSense support and haptic audio output. |
+| [AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) | Optical flow and its D3D12 backend. |
+| [Lucide](https://github.com/lucide-icons/lucide) | UI icons, retaining Lucide and Feather-derived license notices. |
+| [Simple Icons](https://github.com/simple-icons/simple-icons) | Brand glyphs on the sponsor page (CC0; the logos stay their owners' trademarks). |
+| [Intel XeSS / XeLL](https://github.com/intel/xess) | Experimental XeSS frame generation and related runtime interfaces. |
+| [NVIDIA DLSS](https://github.com/NVIDIA/DLSS), [RTX Video SDK](https://developer.nvidia.com/rtx-video-sdk), [Optical Flow SDK](https://developer.nvidia.com/opticalflow-sdk), [Video Codec SDK](https://developer.nvidia.com/video-codec-sdk) | Upscaling, optical flow, encoding and enhancement interfaces. Experimental NR components have separate identities and boundaries in [Runtime Components](docs/history/reports/RUNTIME_COMPONENTS_1.1.0.md); this is not vendor certification. |
+| [vcpkg](https://github.com/microsoft/vcpkg) | Dependency builds, version records and license provenance. |
+
+Remote Play also depends on **OpenSSL, Opus, json-c, libevent, miniupnpc, curl, nanopb, Jerasure and gf-complete**. Their attribution and license notices are retained in [licenses/remoteplay](licenses/remoteplay), with corresponding source supplied in Releases.
+
+### Architecture, Implementation Ideas and Comparisons
+
+| Project | Reference areas |
+| --- | --- |
+| [Magpie Experimental](https://github.com/SAOG0721/Magpie/tree/experimental) | NR / SR / FG combinations, configurable processing order, motion guidance, residual composition, resource synchronization and presentation pacing; an important practical comparison during development. |
+| [OBS Studio](https://github.com/obsproject/obs-studio) | DirectShow capture, pixel formats, color metadata, buffering and window-capture behavior. |
+| [DLSS5-NeuralScreen](https://github.com/perseval-BLR/DLSS5-NeuralScreen/tree/8098ccf261bedc16e4b5fe7887c51a07eb41720e) | RTX30 NR compatibility research and architecture-query behavior reference. Veyra's scoped adapter is independently implemented; the user-provided modified runtime has a separate identity and is not covered by the application's MIT license. See [local integration record](docs/history/reports/RTX30_NR_AND_SAFE_DEFAULTS_2026-09-14.md). |
+| [NVEnc](https://github.com/rigaya/NVEnc) / [RTXVideoProcessor](https://github.com/DrC0ns0le/RTXVideoProcessor) | Video upscaling, GPU frame resources, codecs and scheduling. FRUC was also researched; it has since been removed from Veyra. |
+| [mpv](https://github.com/mpv-player/mpv) | RTX upscaling integration and video-processing approaches in a media player. |
+| [video2dlssnr](https://github.com/DaniilSokolyuk/video2dlssnr) / [dlss5-nr-player](https://github.com/Zonnery/dlss5-nr-player) | Research comparisons for NR pipelines, stage order and data transfers; their code was not copied. |
+| [dlss5-video-player](https://github.com/2600th/dlss5-video-player) / [dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer) / [dlss5-infinity-studio](https://github.com/SamG-Coder/dlss5-infinity-studio) | Playback, offline enhancement, export and caching workflow references. |
+| [DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder) / [DLSS5-Reshade-AIO](https://github.com/kibblerz/DLSS5-Reshade-AIO) / [Assassin’s Creed Odyssey DLAA](https://github.com/SAOG0721/Assassins-Creed-Odyssey-DLAA) | Research into motion/depth inputs, color transfer, NR protection regions and temporal contracts. Veyra does not load or distribute ReShade / RenoDX add-ons. |
+| [Video2X](https://github.com/k4yt3x/video2x) / [RIFE](https://github.com/hzwer/ECCV2022-RIFE) | Research into video upscaling and interpolation approaches; these algorithms are not integrated. |
+
+<details>
+<summary>Deferred AMD NR research references</summary>
+
+[DLSS-NR-on-AMD](https://github.com/danielblnc/DLSS-NR-on-AMD), [dlss5-on-amd-9070xt-porting](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting), [dlss5-image-enhancer-zluda](https://github.com/RedDukeDev/dlss5-image-enhancer-zluda) and its [ZLUDA fork](https://github.com/RedDukeDev/ZLUDA), [dlss5-neural-amd](https://github.com/zmodelerlover/dlss5-neural-amd), and [DLSS5-AMD-Video](https://github.com/eikkapine/DLSS5-AMD-Video). These informed feasibility and performance research. The 2.0.3 AMD package includes the lmxxf runtime and user-supplied 0.39 assets; actual RX9000 inference remains unverified.
+
+</details>
+
+## AMD FidelityFX SDK 2.3.0 (experimental FSR frame generation and FSR upscaling)
+
+The player's AMD FSR backends (independent frame generation and upscaling in
+the enhancement graph) are written against the public FidelityFX
+API documented and shipped in the AMD FidelityFX SDK 2.3.0 (MIT licensed). The
+SDK itself is **not** vendored into this source repository: it stays in the
+gitignored `third_party_local/amd/FidelityFX-SDK-2.3.0` tree, and the signed
+provider/loader DLLs are used from the local
+`runtime_local/amd/fidelityfx/` folder like the other experimental runtimes.
+Integration code (`src/gfx/FsrFgPresenter.cpp`, `src/gfx/FsrSrBackend.cpp`) is an
+independent implementation of the documented API sequence and was written
+against these references:
+
+- Fixed SDK source: [GPUOpen-LibrariesAndSDKs/FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/60f4ea81909200d8542eca14dccb2628b763a9a3),
+  commit `60f4ea81909200d8542eca14dccb2628b763a9a3` (SDK 2.3.0).
+- `Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h` and
+  `Kits/FidelityFX/framegeneration/fsr3/internal/ffx_provider_fsr3framegeneration.cpp`
+- `Kits/FidelityFX/docs/techniques/frame-interpolation-ml.md`
+- `Kits/FidelityFX/docs/techniques/frame-interpolation-swap-chain.md`
+- `Kits/FidelityFX/docs/techniques/frame-interpolation-api.md`
+- `Kits/FidelityFX/upscalers/include/ffx_upscale.h` and the FSR3 upscaler
+  shader contract (`ffx_fsr3upscaler_reproject.h` for the motion convention)
+- `Samples/Upscalers/FidelityFX_FSR/dx12/fsrapirendermodule.cpp`
+
+Historical negative finding: a FidelityFX
+frame-generation swapchain context keeps the real DXGI swapchain alive after
+`ffxDestroyContext` (measured locally). The 2026-09-30 repair removes this proxy
+path from the player. `include/veyra/gfx/FsrFgPresenter.h` and
+`src/gfx/FsrFgPresenter.cpp` use the documented
+`FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY` flag and the
+Configure → PrepareV2 → Generate sequence, with caller-owned command lists and
+output textures. `EnhanceGraph`, `VideoPresenter` and `PresentSink` share the
+existing bounded batch, GPU fences and native presentation path; no dummy
+display or second hidden video window is created. The adapter selects a
+provider version explicitly and verifies the version returned by the created
+context. FSR 3.1 and FSR 4 ML are separate requests, with no implicit version
+fallback. Modules retain one process reference per absolute path, while each
+effect context is destroyed after its GPU consumers finish.
+
+Version selection and API ordering were also compared with OptiScaler commit
+`45a2001303ddff632e279f77aef85ceede5832cb`,
+`FSRFG_Dx12.cpp` (GPL-3.0); no source code from that file was
+copied. AMD algorithm source, SDK files and runtime binaries are not added to
+the Veyra source repository. Changes and actual hardware evidence are in
+[FSR / XeSS repair execution](docs/history/reports/FG_FSR_XESS_EXECUTION_2026-09-30.md).
+
+The FidelityFX upscale dispatch also does
+not complete under D3D12 GPU-based validation (the standalone probe stalls
+before its dispatch), so that validation mode is skipped for the FSR SR
+configuration with an explicit log line. See
+[AMD FSR frame generation integration record](docs/history/reports/FSR_FRAMEGEN_INTEGRATION_2026-09-16.md).
+
+## DLSS-G 310.9.16 performance-mode runtime (2026-10-14)
+
+`runtime/experimental/dlssg-lite/nvngx_dlssg.dll` is NVIDIA's DLSS Frame
+Generation 310.9.16.0 (7,506,544 bytes, SHA-256
+`CADEE1AA6DB3907BABDC3285DA2AEBC4553D92B89C38BA3EAE8ABD8BBA1BEA72`, Authenticode
+valid, signer NVIDIA Corporation), unmodified. NVIDIA App 11.0.9 delivers it over
+the air as an `nvapp_override` model for the "DLSS Frame Generation performance
+mode (beta)" setting; it was taken from that model store
+(`%ProgramData%\NVIDIA\NGX\models\dlssg\versions\20318480\files\160_E658700.bin`)
+with the user's explicit approval on 2026-10-14, as a named exception to the
+project's rule against driver-cache binaries. It ships only as a Release runtime
+asset (never in Git), listed in `release-runtime-manifest.json` by
+`scripts/package-portable.ps1` from 2.0.8.
+
+Veyra's "DLSS 性能模式" switch adds this directory ahead of
+`runtime/experimental` in the NGX feature path and creates DLSS-G with NVIDIA's
+create-time parameter `DLSSG.LiteCandidateBlendingEnabled = 1`. The switch is
+off by default, export keeps the standard model, and RTX 40/30 (whose
+multi-frame unlock patches are keyed to 310.9.1) are refused. This is not an
+NVIDIA partnership, certification or support; the runtime remains NVIDIA
+proprietary software under NVIDIA's terms.
+
+## DLSS-G 310.9.1 provider patches: DLSSG-Transfusion (2026-09-30)
+
+SilyNoMeta/DLSSG-Transfusion, tag `v1.4.5.3-rtx20-30-40`, commit
+`b56bd2deed114507ad2c88f986d90ed50ffb4639` (MIT; fork of
+TonyJoaca/DLSSG-Transfusion, MIT, Copyright (c) 2026 Michael Robles), ported
+into `include/veyra/ngx/DlssgTransfusion.h`, `src/ngx/DlssgTransfusion.cpp` and
+`src/ngx/transfusion/` (which keeps the upstream MIT text in
+`src/ngx/transfusion/LICENSE.txt`).
+
+Ported pieces, with upstream file names:
+
+- `patcher.cpp`: `SafeScanDlssgArchSites` / `PatchDlssgArchGates` (Blackwell
+  `cmp r32, 0x1b0` gates lowered to the architecture actually present),
+  `SafeFindUniqueImmediate` / `PatchDlssgMinimumArchitecture` (the unique Ada
+  immediate `0x190` inside `NVSDK_NGX_GetGPUArchitecture` and the three
+  `*_GetFeatureRequirements` exports), and `kNgxPatch` — the provider
+  count/index validator branch (`84 d2 0f 84 03 01 00 00 be 05 00 00 00`) whose
+  jz is removed, gate discovery by `PatchUniqueExecutablePattern`.
+- `midpoint_fix.cpp`: `PatchProvider`. With Blackwell kernels enabled it
+  rebuilds the `Kernel_EstimateIntermMvecsScatter` and
+  `Kernel_BlendCandidatesFused` fatbins from their sm_120 PTX (uncompressed,
+  relabelled for the target SM, so the driver JITs them instead of loading
+  NVIDIA's SASS), redirects the descriptor slots that point at them, and
+  retargets every remaining kernel container in place
+  (`RetargetContainers`, same-length `.target` rewrite inside the LZ4 literal
+  run, other images parked at arch 122). With Blackwell kernels disabled it
+  applies the Ada temporal midpoint fix instead (`BuildTemporalFatbin`: the
+  temporal parameter is injected and the 104 compiled-in `0f3F000000` midpoint
+  multiplies become the kernel's own temporal parameter).
+- `cu_module_hook.h`: interception of `NvAPI_D3D12_CreateCuModule` (id
+  `0xAD1A677D`) so image kernels can be replaced before the driver compiles them.
+- `network_optimizer.h`: the DL1/DL2 launch substitution (kernel ids, grids,
+  blocks and fusions of the dlssg_for_sm86 0.3.5 backend, whose output is
+  bit-identical to NVIDIA's; NVIDIA's weights and parameters are passed
+  unchanged), plus `image_kernels.h` (Blend `st.global.v2.u32` store merge and
+  the exact `Kernel_OutputPull` / `Kernel_OutputPushFine` replacements, matched
+  by an FNV-1a fingerprint of NVIDIA's 310.9.1 sm_120 PTX with the `.target`
+  line excluded) and `quality_fix.h` + `quality_explained_warp.h` (the
+  valid-warp anti-tearing/anti-ghosting protection: Transfusion's V4 policy or,
+  by default in Veyra, dlssg_for_sm86's `explained-warp` tuning).
+
+Veyra adaptations: the module is compiled into `veyra_ngx` and applies its edits
+through a recorded-write helper, so every patched byte is restored on release
+with read-back verification (`memProtectionUncertain` is raised when
+restoration cannot be proved); NvAPI is reached by redirecting only the
+provider's own `GetProcAddress` import slot, so no Detours, trampoline or
+global hook is installed; the optimized kernels are separate runtime files
+under `runtime/experimental/dlssg-kernels/` (gitignored authoring copy in
+`third_party_local/nvidia/dlssg-transfusion-kernels-1.4.5.3/`, extracted
+read-only from the upstream release DLL), never linked in, and a missing file
+set only disables the optimization; Turing, Vulkan, Streamline, the UI-assist
+capture and the scatter/input-motion experiments are **not** ported.
+
+### Optimized kernel files (`runtime/experimental/dlssg-kernels`)
+
+29 PTX files extracted, read-only, from the upstream release binary
+`DLSSG-Transfusion.dll` (release `v1.4.5.3-rtx20-30-40`, SHA256
+`3C0621BE577E56D03945ACCA48C2DFC5935A8A5759C432044E4E561B16DBBAD8`): 27 RCDATA
+resources 4000–4062 (the DL1/DL2 sm_86 network kernels) and the two embedded
+image kernels. Upstream's `docs/PUBLIC-SOURCE.md` and `docs/OPTIMIZED-KERNELS.md`
+state their provenance: they come from the `dlssg_for_sm86` 0.3.5 backend,
+which publishes no source and no license for them, and they derive from
+NVIDIA's DLSS-G network kernels; SilyNoMeta publishes them only as compiled
+resources and explicitly disclaims the right to license them. **No license is
+granted for these files by either author.** The 2026-09-30 user decision
+accepts that risk and ships them the same way as the other experimental runtime
+binaries: as separate runtime files, listed by name, size and SHA-256 in the
+package manifest and in `release-runtime-manifest.json`, never committed to
+source control. Each file is verified by FNV-1a fingerprint and per-launch
+shape checks before use; the provider fingerprint guard (the
+`Kernel_OutputPull` 310.9.1 match) is what enables the substitution at all, so
+a different provider build leaves the kernels unused. Removing the folder
+disables the optimization without affecting playback.
+
+Machine evidence (RTX 5070, 2026-09-30): the patched provider applies and rolls
+back cleanly, the harness reports `exact=true` and `networkReady=true`, the FG
+truth harness (translation, direction, scene cut) passes with the patches
+installed, and the product smoke path reports 2400+ generated frames with
+`failed=false`. RTX 40 and RTX 30 hardware behaviour is unverified; the valid
+warp and the optimized kernels only change output when both are active
+together, which is recorded as an open question in
+`docs/NR_FG_OPTIMIZATION_PLAN_2026-09-29.md`.
+
+## RTX 40 series DLSS multi-frame unlock (ported)
+
+Two upstream projects are ported into `include/veyra/ngx/AdaMfgUnlock.h` /
+`src/ngx/AdaMfgUnlock.cpp`; both are MIT-licensed and are attributed separately.
+
+### ImDreamt/MFGAdaUnlock-RenoDx (initial port)
+
+https://github.com/ImDreamt/MFGAdaUnlock-RenoDx , commit
+`a8aa0d9289471facc1e32013d17fd9c1195bc2cd` (MIT). The initial port brought:
+
+- the two architecture compares (`0x1b0` → `0x190`);
+- the kernel PTX midpoint correction (inject the temporal parameter, replace the
+  104 compiled-in `0.5` multiplies, truncate the fatbin so the driver JITs the
+  corrected code instead of loading the precompiled cubin);
+- the `dlfg_kernel` descriptor redirect, all process-memory only.
+
+### dashdogy/RTX40MFG-Unlock v1.3.3 (completion port, 2026-09-16)
+
+https://github.com/dashdogy/RTX40MFG-Unlock , commit
+`33b41835dc39c5d8ab1ef93efb2449be31139c09` (v1.3.3, MIT; source tree studied in
+the gitignored `third_party_local/community/RTX40MFG-Unlock`). Ported pieces:
+
+- the provider count/index validator patch from `source/native/ngx_mfg_gate.h`
+  (pattern `84 d2 0f 84 03 01 00 00 be 05 00 00 00`, near-jz head `0f 84` →
+  `eb 04`, whose entry condition gates the accepted generated-frame ceiling on
+  the runtime-detected architecture). This is the documented mechanism behind
+  upstream's v1.3.3 fix for "MFG getting stuck at 2x"; every count, index and
+  profile-limit check after the branch is retained;
+- the three-stage SHA-256 identity chain from `source/native/midpoint_fix.cpp`
+  legacy profile: source fatbin (98408 B) `5A8E0284…`, decompressed PTX
+  (99362 B) `46C05996…`, rebuilt fatbin (127200 B) `19FB3CD5…`, plus the
+  sm_120/sm_89 entry field checks (28024/28017/90490 and 30384/30379/99362).
+  Veyra reproduced the rebuilt-fatbin digest byte-for-byte from its own
+  `runtime_local/nvidia/nvngx_dlssg.dll` 310.7 before porting; the digest is now
+  a publication gate, so a build that does not reproduce the upstream-verified
+  byte stream is refused and fully rolled back.
+
+Veyra adaptations and additions: hard architecture gating (never applied on
+Blackwell, so RTX 50 keeps its native path); the count/index site must match
+uniquely, sit at an even address and branch to the audited `cmp r8d, 1` target
+before any write; all edits happen in the mapped image only (disk file is never
+touched, re-signed or renamed); read-back verification and full rollback when
+the session ends. The rollback path re-opens page protection before restoring
+bytes — negative testing during this port caught that the original Veyra
+rollback path wrote into read-only pages and would have crashed the process on
+a refused kernel fix. The upstream Streamline-side hardware flip-metering /
+pacing workaround and per-title `nvidia_mfg_policy` ceilings are **not
+applicable**: Veyra calls NGX directly and does not load Streamline, ReShade or
+any RenoDX add-on.
+
+Evidence on this machine (RTX 5070, structure and patch mechanics only):
+`logs/fsr/dlssg-unlock-scan.log`, `logs/fsr/dlssg-unlock-applytest.log`;
+delivery gate `logs/delivery/d0a266a1e549402ca26c2c8ec8d27022/result.json`.
+Ada behaviour still has to be verified on RTX 40 hardware.
+
+### dashdogy/RTX40MFG-Unlock v1.3.3 — RTX 30 (sm_86) Ampere path (2026-09-16)
+
+Same upstream (MIT, commit `33b41835dc39c5d8ab1ef93efb2449be31139c09`),
+`source/native/ampere_gpu.cpp` (`FindUniqueSm89Ptx`, `BuildAmpereSm86Fatbin`),
+`ampere_cuda_program.cpp` (driver preflight intent) and `ampere_policy.h`
+(sm_86 adapter contract), ported into
+`include/veyra/ngx/AmpereMfgUnlock.h` / `src/ngx/AmpereMfgUnlock.cpp`.
+
+2026-09-18 correction: the current port rebuilds only the 25 registered DLFG
+programs and the hash-identified auxiliary font, matching upstream's scope.
+It preserves the 38 network and other five auxiliary fatbins. The previous
+all-69 rewrite and global Blackwell architecture spoof are superseded.
+Real NVAPI architecture is preserved for provider hardware selection; scoped
+capability policies and two ceiling comparisons are adapted separately.
+Both registration pointer and supplied length are published. The temporal
+program retains the upstream midpoint correction and unsupported PTX checks.
+
+Additional source from the same MIT commit: `ampere_font_program.inl`
+(`PrepareFont`, `FontPageProtectionMatches`, `RestoreFontPage`, `WriteFont`)
+and `ampere_cuda_program.cpp` (adapter LUID matching and function preflight).
+Veyra adapts these into `src/ngx/AmpereMfgUnlock.cpp`: rebuild font PTX from
+the mapped provider, preserve its address, save/restore page bytes and actual
+protection, accept privatized WRITECOPY pages only with working-set proof.
+No upstream native font payload is embedded. The 26 rebuilt programs must
+pass `cuModuleLoadData`, `cuModuleGetFunction` and available `cuFuncLoad` on
+the D3D12 adapter's CUDA device, with the caller's context restored.
+`src/pipeline/EnhanceGraph.cpp` passes that LUID and defaults to no spoof.
+All modifications are in process memory; the provider DLL on disk is untouched.
+
+Current evidence: `out/logs/3060-r4-real-arch-lifecycle-final.stdout.log`
+passes 2X through 6X and repeated patch restoration on RTX5070, with 26/26
+preflight and actual NGX Evaluate. RTX3060 execution remains unverified;
+CUDA preflight on RTX5070 is not proof of target hardware support.
+
+Historical evidence for the superseded all-69 implementation (RTX5070 only):
+`veyra_dlssg_ampere_probe` — scan (runs=8, 200 slots, 25+38+6 fatbins, 44 lea,
+2 gates, temporal unique), apply (applied=1, preflight=69/69, readBack=1,
+restored=1), delivery gate
+`logs/delivery/548a606d92484286806f272d4744d2a7/result.json`.
+
+## NGX compatibility session port (2026-09-17)
+
+Source: dashdogy/RTX40MFG-Unlock, fixed commit
+`33b41835dc39c5d8ab1ef93efb2449be31139c09`, MIT, copyright 2026 Michael Robles.
+Full permission notice: `src/ngx/compat/RTX40MFG_LICENSE.txt`.
+
+- `source/native/ampere_backend.cpp` discovery and scoped startup/Create logic:
+  adapted into `src/ngx/compat/NgxDiscovery.h`, `src/ngx/FgCompatibilitySession.cpp`
+  and `include/veyra/ngx/FgCompatibilitySession.h`. Veyra substitutes its direct
+  NGX calls and owned D3D12 resources for upstream wrapper/swapchain hooks;
+  adds an exclusive session lease, absolute-path/module ownership, adapter
+  and texture identity, and restoration before releasing module references.
+  Follow-up on 2026-09-18: extend the verified Ampere metadata scope to the
+  direct NGX Init call in `src/pipeline/EnhanceGraph.cpp`, matching upstream's
+  startup coverage before capability results can be cached. Restore on both
+  successful and failed Init; reject capabilities before successful Init.
+- `source/native/ampere_patterns.h`: metadata/Create patterns only, extracted
+  into `src/ngx/compat/NgxPatterns.h`; Streamline patterns omitted.
+- `source/native/protected_pointer.h`: retained implementation in
+  `src/ngx/compat/protected_pointer.h`, attribution comment added.
+- `src/ngx/compat/RestoreMemory.h`: Veyra helper using the above page-query
+  and restoration routines; accepts Windows image-page copy-on-write protection,
+  verifies writes/cache flush/protection and retains a process failure latch.
+  Ada/Ampere program publications now retain rollback records before each
+  checked write. Unproven rollback blocks later NGX sessions.
+- Upstream MinHook HDE64 decoder: `src/ngx/compat/hde/{hde64.c,hde64.h,table64.h,pstdint.h}`.
+  BSD copyright/terms retained in `src/ngx/compat/HDE_LICENSE.txt` and source
+  headers. Compiled as C++; local `c` initialized to zero for MSVC /WX.
+
+The session is used only for the requested Ada/Ampere compatibility path.
+Native RTX50 does not install these patches. Forced-path RTX5070 diagnostics
+are not evidence of RTX30/40 hardware compatibility.
+`src/engine/FgCompatibilityProbe.cpp` is Veyra's own bounded child-process
+Create/Evaluate preflight, with inherited mapping, process job, exact adapter
+selection and cancellation; it is not upstream wrapper code or a quality gate.
+
+
+## Media Foundation encoder（系统硬件编码路径，移植自 FFmpeg mfenc.c）
+
+Source: FFmpeg n9.0.1 `libavcodec/mfenc.c` 与 `libavcodec/mf_utils.c`
+（LGPL-2.1-or-later；本地源码 `C:\veyra-deps\ffmpeg-ps5-slices-source`）。
+`src/sink/MfVideoEncoder.cpp` 移植了其中被证明可用的部分：`MFTEnumEx` 硬件枚举与激活、
+`MF_TRANSFORM_ASYNC_UNLOCK` 异步解锁、输入/输出媒体类型协商、`ICodecAPI`
+（码率/低延迟/GOP/B 帧/质量）设置、事件驱动的 `ProcessInput`/`ProcessOutput` 循环、
+`MFT_MESSAGE_COMMAND_DRAIN` 收尾，以及 `MF_MT_MPEG_SEQUENCE_HEADER`（SPS/PPS）
+作为封装 extradata。
+
+Veyra 的差异（非上游代码）：输入不是 AVFrame，而是 Veyra 自己 D3D12 图渲染出的 NV12
+经 readback 打包；枚举结果按当前显卡厂商优选并对每个候选做完整契约协商（一台机器上可能
+同时装着多家驱动的编码 MFT）；首个样本与 GOP 边界强制关键帧；码流直接交给 Veyra 的
+MP4 封装路径。MFT 本身属于 Windows 与显卡驱动，不随包分发。FFmpeg 采用
+LGPL-2.1-or-later，与 Veyra 的 GPLv3 兼容；上游作者归属见上。
+
+## RTX Video HDR (local integration, 2026-09-18)
+
+`src/ngx/TrueHdrBackend.cpp` independently implements the NVIDIA RTX Video SDK
+1.1.0 D3D12 parameter contract. Parameter defaults and behavior were compared with
+rigaya/NVEnc, MIT, commit `4cb3101f451e3f932334c994323e743808502995`:
+https://github.com/rigaya/NVEnc/tree/4cb3101f451e3f932334c994323e743808502995 .
+No NVEnc CUDA implementation or NVIDIA SDK source is vendored here.
+
+Local runtime: `nvngx_truehdr.dll`, 1.1.0.0, 3955752 bytes, NVIDIA Authenticode
+Valid, SHA256 `9A80575F247190C05FE80EAC0C4BAA1D0D4D932348F26808310B5EC4BF9EEB4B`.
+This runtime retains the NVIDIA RTX Video SDK license; it is not relicensed under
+Veyra's GPL. SDK/license and runtime remain external. This change does not publish
+or grant redistribution of a new runtime pack.
+
+## NVAPI Reflex ABI reference (2026-09-18)
+
+Source: https://github.com/NVIDIA/nvapi/tree/87dca625e83fd89a983e19b904e5f3a580da90d2
+(`nvapi.h`, `nvapi_interface.h`, `nvapi_lite_common.h`), MIT.
+`include/veyra/gfx/ReflexSession.h` contains minimal renamed ABI declarations for
+SetSleepMode v1 and SetLatencyMarker v1, and QueryInterface IDs for initialization,
+sleep and markers. Adaptations: independent RAII device lifetime,
+absolute system-driver loading, return-code logging, successful call counts and
+explicit disable. No complete SDK header or NVIDIA runtime is committed or bundled.
+The driver is supplied by Windows/NVIDIA. Frame markers delimit Veyra enhancement
+and presentation, not game input or physical display latency. Generated-frame
+Reflex integration was initially disabled with generated frames. The 2026-10-28
+extension adds Boost, out-of-band marker types and the public
+NotifyOutOfBandCommandQueue ID from the same fixed NVAPI source. Source-frame Sleep/markers and out-of-band presentation are separated;
+generated frames never create another simulation or Sleep. XeSS keeps its own
+presentation owner. NVIDIA Streamline's public `sl.chi/d3d12.cpp` is an API-use
+reference only; Streamline is not linked, loaded or bundled.
+
+`include/veyra/gfx/NvidiaVrr.h` (2026-10-14) adds, from the same interface
+files, the QueryInterface IDs of NvAPI_DISP_GetDisplayIdByDisplayName,
+NvAPI_Disp_GetVRRInfo and NvAPI_DISP_GetMonitorCapabilities and renamed
+NV_GET_VRR_INFO_V1 and NV_MONITOR_CAPABILITIES_V1 (generic capability bits)
+layouts (checked against the commit above). It only reads the monitor's
+variable-refresh support and state, for diagnostics and to enable the 可变刷新
+switch; this monitor query never changes driver settings. Same loading rules and the same
+license as above.
+
+`src/gfx/NvidiaVrrProfile.cpp` (2026-11-14) adds minimal renamed DRS v1
+application/profile/setting layouts, QueryInterface IDs and G-SYNC scope enums,
+checked against NVIDIA/nvapi commit
+`51e5aae4bc40c3ccd3fb7d4dfd94256e7bfc496e` (`nvapi.h`,
+`nvapi_interface.h`, `NvApiDriverSettings.h`, MIT). The independently authored
+controller exposes explicit check/repair/restore actions for the current
+application's full-path, isolated driver profile. Unlike the monitor query
+above, this user-invoked operation can save the two application scope values.
+It never enables global G-SYNC, edits another application's profile, or copies
+Profile Inspector implementation code. Original local/inherited values are
+saved before mutation; restoration preserves unrelated settings. No complete
+SDK header or driver DLL is committed or distributed. The same NVIDIA MIT
+notice below applies to the minimal ABI reference declarations.
+
+Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Win32CaptureSample (screen capture)
+
+Source: https://github.com/robmikh/Win32CaptureSample
+Fixed commit: `49fefe79fd9b11025f0b5eb91783a98888516070`.
+License: MIT, Copyright (c) 2019 Robert Mikhayelyan.
+Full license: `licenses/WIN32_CAPTURE_SAMPLE_MIT.txt`.
+`src/source/ScreenCaptureSource.cpp` adapts `SimpleCapture.cpp/.h` free-threaded
+WGC session/frame-pool creation and resize lifecycle. Veyra replaces the
+upstream swapchain with bounded leased D3D11/D3D12 shared textures and fences,
+latest-frame polling, crop, explicit scRGB color, timestamps and shared graph
+ingress. DXGI duplication is a Veyra addition. Screen capture is video-only.
+
+## dav1d (1.3.0 AV1 playback)
+
+FFmpeg dynamically links dav1d 1.5.4 from the pinned local vcpkg build. The portable package includes its complete aggregated copyright/license text in `licenses/DAV1D-COPYRIGHT.txt` and provenance in `licenses/DAV1D-SPDX.json`. The FFmpeg corresponding-source ZIP includes dav1d source and its vcpkg port. Upstream: https://code.videolan.org/videolan/dav1d . License set recorded by the build: Apache-2.0, BSD-2-Clause, ISC and MIT; retain all notices supplied with the source.
+
+## Moonlight / GameStream streaming core (2026-10-01)
+
+The optional `VEYRA_ENABLE_MOONLIGHT` build compiles **moonlight-common-c** (GPL-3.0,
+https://github.com/moonlight-stream/moonlight-common-c) at commit
+`f900dd4767759c7b9d0e93bcea666b55c69ea62f` (2026-09-26) together with its two pinned submodules:
+ENet (MIT, https://github.com/cgutman/enet, `aca87840b57f045a1f7f9299e4b1b9b8e2a5e2f1`) and
+nanors (MIT, https://github.com/sleepybishop/nanors, `b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a`).
+The build refuses any other checkout (`scripts/moonlight/verify-moonlight-stage.py`, pins in
+`scripts/moonlight/dependency-lock.json`). No Moonlight or Sunshine binary is committed or bundled.
+
+The host HTTP(S) client, the pairing handshake and the serverinfo / applist / launch handling in
+`src/moonlight/` and `include/veyra/moonlight/` are a port of **moonlight-qt** (GPL-3.0,
+https://github.com/moonlight-stream/moonlight-qt, commit `8369d1a0e11b999d4d1598f62ca5f6dea49602fb`):
+`app/backend/nvhttp.cpp`, `nvpairingmanager.cpp`, `identitymanager.cpp`, `nvcomputer.cpp` and the default
+bitrate table of `app/streaming/session.cpp`, with the Qt types replaced by standard C++, OpenSSL and Winsock.
+Nothing from the moonlight-qt tree is compiled. The OpenSSL (Apache-2.0) and Opus (BSD-3-Clause) libraries come
+from the same vcpkg tree as the PS5 build. Veyra is GPL-3.0, which is compatible with all of the above.
+License texts: `licenses/moonlight/ENET_MIT.txt`, `licenses/moonlight/NANORS_MIT.txt`; the GPL-3.0 text is Veyra's own `LICENSE`.
+
+The streamed machine runs **Sunshine** (GPL-3.0, https://github.com/LizardByte/Sunshine), which users install
+themselves; Veyra neither ships nor downloads it.
+
+## Portable ZIP updates
+
+The updater verifies the Ed25519 release manifest using OpenSSL Crypto (Apache-2.0), from the same vcpkg build used by the streaming clients. Downloads use Qt Network. The updater uses the host Windows installation's Attachment Services and `tar.exe` to check and unpack the verified ZIP.
+
+## Xbox home streaming (unofficial, 2026-10-01)
+
+The optional `VEYRA_ENABLE_XBOX` build streams from the user's own Xbox console. It is **not affiliated with or
+endorsed by Microsoft**; it signs in with the client identity of xbox.com's web player, as the open-source clients do.
+
+The sign-in sequence (`src/xbox/Account.cpp`), the session API (`src/xbox/StreamApi.cpp`) and the data-channel
+protocol (`src/xbox/WebRtcSession.cpp`, `include/veyra/xbox/Protocol.h`) are ports of **Greenlight**
+(MIT, https://github.com/unknownskl/greenlight, commit `58e832a1b1e4bf6b5119a2c84df06ae5e5534993`,
+`packages/player` and `packages/desktop/main/helpers`) and of **xal-node** (MIT, https://github.com/unknownskl/xal-node,
+commit `a17a526b1d00e8456251908324ad51c9b24faa1a`, `src/msal.ts`). Nothing from either tree is compiled.
+
+Linked from the vcpkg tree (pins in `scripts/xbox/dependency-lock.json`):
+**libdatachannel** 0.24.5 (MPL-2.0, https://github.com/paullouisageneau/libdatachannel),
+**libjuice** 1.7.2 (MPL-2.0, https://github.com/paullouisageneau/libjuice; built with the one-line patch
+`scripts/xbox/vcpkg-overlay/libjuice/ipv4-interrupt.diff`, whose source is published there),
+**usrsctp** 0.9.5.0 (BSD-3-Clause), **libsrtp** 2.8.0 (BSD-3-Clause), **plog** 1.1.11 (MIT) and
+**nlohmann/json** 3.12.0 (MIT). MPL-2.0 is file-level copyleft and compatible with GPL-3.0; the MPL sources used are
+the published upstream releases plus the patch above. License texts: `licenses/xbox/`.
+
+## Magewell MWCapture SDK (Pro Capture low-latency capture, 2026-10-01)
+
+- Component: Magewell MWCapture SDK for Windows 3.3.1.1596 (Nanjing Magewell Electronics Co., Ltd.).
+- Use: `src/source/MagewellCapture.cpp` is compiled against the SDK header files (kept outside the
+  source tree, CMake `VEYRA_MAGEWELL_SDK_DIR`) and loads `LibMWCapture.dll` at run time; the call
+  sequence follows the SDK example `Examples/Applications/LowLatency`. Test packages carry the
+  unmodified `LibMWCapture.dll` in `runtime/magewell/`.
+- Licence: the header files and library are licensed for use, modification and redistribution with
+  Magewell's copyright notice and disclaimer retained; the full text is in
+  `licenses/magewell/MWCapture-SDK-NOTICE.txt`. The SDK as a whole (examples, tools) is under
+  Magewell's EULA and is not redistributed.
+
+
+## SoundTouch playback tempo (2026-10-03)
+
+Movie preview uses SoundTouch 2.4.1, LGPL-2.1, upstream
+https://codeberg.org/soundtouch/soundtouch commit
+`0047e0b1ecfceb041348579119bf79b73a322a3a` (tag 2.4.1).
+Unmodified headers and SoundTouch processing sources are under
+`third_party/soundtouch/`; Veyra supplies only its build definition and origin
+note. Copyright and COPYING.TXT are preserved. It is statically linked from
+these sources; the Veyra corresponding-source archive includes them and the
+build integration. Portable releases include the LGPL text and origin note.
+No separately downloaded SoundTouch binary is used.
+
+Xbox video feedback extends the existing Greenlight port at the same pinned
+commit `58e832a1b1e4bf6b5119a2c84df06ae5e5534993` (MIT), specifically
+`packages/player/src/client/lib/channel/input/packet.ts::_writeMetadataData`
+and `render/video.ts::processVideoMetadata`. `Protocol.h` encodes the original
+seven u32 fields and RTP key; `XboxSessionSource.cpp` records actual arrival,
+decode submission/completion and presentation-return times.
+`WebRtcSession.cpp` sends one bounded report per presented source frame, without
+an unbounded metadata queue. These CPU timestamps do not claim physical scanout.
+
+## NVIDIA original NR restored in 2.0.2
+
+The user-approved, unmodified NVIDIA-signed 310.8.0.0 NR (SHA256 E16BCF15E16E13F527491CDF7845B2FE6521A738D8F7C9C721866A8496E1FC8E) is distributed only as a release runtime at runtime/experimental/nr-original/nvngx_dlssnr.dll. Existing community Lecram/SF-v2 choices and notices remain. See docs/RUNTIME_COMPONENTS_2.0.2.md and the publisher manifest. This experimental integration is not NVIDIA certification or complete official DLSS 5 support. No proprietary binary has been added to source Git.
+
+## lmxxf AMD NR local integration (2026-10-03)
+
+2026-10-18 local upgrade: fixed MIT source `4764e4f1a24f5234b8e29952dc41f493b2d77c90`
+(0.44 F9 hotfix). User-provided archive SHA256
+`cf812fe7909fbd53b38f54da8abd584698525f81f7ea71cab19ba14bab48e030`.
+The public C ABI header is unchanged. `third_party/lmxxf/veyra-model-isolation.patch`
+adapts `src/native_model_mode.h` and `src/native_hot_flags.h` to select Small or
+Original per independently built module and disable add-on hotkeys/config polling.
+Veyra's model-query/asset-preflight exports use upstream's actual selector and
+Small asset validator. Inference/codec math and weights/kernels are unchanged.
+Build/staging recipes, changed host files and limits are documented in
+`third_party/lmxxf/VEYRA_ORIGIN.md` and `docs/AMD_NR_044_PLAN_2026-10-18.md`.
+NVIDIA-derived weights and HIP modules remain external binary assets, not MIT
+source. No AMD inference, quality or performance claim follows from host tests.
+The following 0.39 identity is preserved as historical provenance.
+
+Veyra calls the independent MIT C ABI from
+[lmxxf/dlss5-on-amd-9070xt-porting](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting),
+fixed commit `78f548749e74824327b8458c57be31a1df78376a`, Copyright (c) 2026 Kien.
+The unchanged public header, original MIT license and adaptation details are in
+`third_party/lmxxf/`. The runtime build uses upstream codec/network code directly;
+Veyra's GPL host adapter records producers/consumers on the existing D3D12 queue.
+It does not load a ReShade add-on or copy Magpie's player/loop.
+
+The user supplied `Magpie-DLSS5-AMD-0.39.zip` (SHA256
+`9ea84c665d270cd45e24184729b8272c152485df462a1528539ed778d41849f5`).
+Its NVIDIA-derived model weights are **not** MIT-licensed code. All weights,
+compiled HIP modules and runtime DLLs stay outside source Git; their use in this
+2.0.3 AMD package follows the user's explicit experimental distribution authorization; open-source code does not relicense these models. HIP API license and the
+runtime MIT notice accompany the local asset directory. No AMD driver DLL is
+copied from that package; an RX 9000 driver must provide `amdhip64_7.dll`.
+Hardware inference, image quality and stability remain unverified on RX 9000.
+# Performance experiments (2026-10-04)
+
+`tests/perf/DuplicateFrameCS.hlsl` adapts `src/Magpie.Core/shaders/DuplicateFrameCS.hlsl` from [SAOG0721/Magpie](https://github.com/SAOG0721/Magpie/tree/27c5df91177a29b33be612e98274169f3d2fca49), fixed commit `27c5df91177a29b33be612e98274169f3d2fca49` / `v0.6.9-experimental`, GPL-3.0. Original shader SHA256 `39fe0acfcf499083c1380aa4a5dc0ad8e0b6632537efda61342e068d9eac2275` matches the local research copy byte-for-byte. Adaptations retain group reduction and atomic publication, replace sampler Gather with four bounded texture loads for D3D12/odd extents, add typed textures and provenance. This is an isolated measurement fixture; no production duplicate-skip behavior is implied.
+
+## libass ASS/SSA subtitle renderer (2026-10-05)
+
+Full ASS/SSA effect subtitles (karaoke, `\move`, `\fad`, `\t`, `\clip`, blur,
+vector drawings, Matroska font attachments) are rendered with
+[libass](https://github.com/libass/libass) 0.17.5 (ISC), statically linked into
+`veyra_qml_ui.exe` together with its dependencies, all built unmodified by vcpkg
+(`C:/veyra-deps/vcpkg`, commit `30ef65cad9`, triplet `x64-windows-static`):
+FreeType 2.14.3 (used under the FreeType License, FTL), FriBidi 1.0.16
+(LGPL-2.1-or-later; Veyra's complete corresponding source is published, so the
+library can be relinked), HarfBuzz 14.4.0 (MIT), libpng (libpng license), zlib
+(zlib license), bzip2 (bzip2 license) and Brotli (MIT). The license texts are the
+`share/<port>/copyright` files of that vcpkg install and must accompany every
+package that contains this build. No source of these libraries is committed to
+Veyra's Git. Builds without `VEYRA_LIBASS_ROOT` keep the built-in styled renderer.
+
+## Optional NR image correction (2026-10-05)
+
+`shaders/NrCorrection.hlsli` ports the Oklab transforms, gray-axis-continuous
+hue projection, residual soft knee and fixed-lightness/hue gamut-ray mapping
+from [SAOG0721/Magpie](https://github.com/SAOG0721/Magpie), commit
+`27c5df91177a29b33be612e98274169f3d2fca49` (GPL-3.0),
+`src/Magpie.Core/DLSSNRColorShader.h` and `DLSSNRDetailShader.h`.
+The Oklab matrices by Bjorn Ottosson are public domain:
+<https://bottosson.github.io/posts/oklab/> (2021-01-25 matrices).
+
+Veyra changes: operate directly on linear FP16 instead of stored SDR/sRGB;
+retain the existing residual controls and opt-out path; extend total gain to 5;
+add a chroma-delta budget, a source-anchored highlight shoulder, a 16-iteration
+FP16-oriented gamut search, signed scRGB/BT.2020 HDR bounds and final temporal
+safety. `NrResidualComposite.hlsl` and `NrTemporal.hlsl` call that shared helper.
+Automatic/manual UI, settings persistence and graph controls are Veyra code.
+Temporal filtering reuses Veyra's already attributed Magpie motion route;
+no additional neural model or proprietary runtime is copied or modified here.
+
+The style-protection follow-up adds Veyra's source-chromaticity retention,
+quantization-aware neutral-tint guard, source-color gamut-ray lightness bound,
+independent lightness/shadow controls, style-specific automatic coefficients
+and an automatic amount slider. These additions are Veyra code; the upstream
+port and public-domain matrix attribution above remain unchanged.
+
+## Blackmagic native capture (2026-10-09)
+
+The DeckLink capture lifecycle in `src/source/DeckLinkDriver.cpp` and
+`src/source/DeckLinkCapture.cpp` follows OBS Studio's
+`plugins/decklink/decklink-device-instance.cpp`,
+`decklink-device.cpp` and `win/platform.cpp`, pinned to
+[e7f0b0d43c538f5d108aa4cbea473d57b3012a1a](https://github.com/obsproject/obs-studio/tree/e7f0b0d43c538f5d108aa4cbea473d57b3012a1a/plugins/decklink)
+(OBS Project contributors, GPL-2.0-or-later; Veyra uses GPLv3).
+Veyra moves Pause/Enable/Flush/Start to the owner thread, validates the first
+real frame, distinguishes no-input frames from valid black pixels, preserves
+source timestamps and HDR metadata, and reuses its bounded upload mailbox and
+audio session. Device selection uses persistent/topological IDs plus subdevice
+identity. No OBS binary, driver, EDID writes or VideoProcessor code is included.
+
+The 2026-10-13 follow-up also follows OBS's explicit input-connection selection
+(`IDeckLinkConfiguration::SetInt` before enabling capture). Veyra exposes only
+driver-reported connectors as stable saved identities, verifies the selected
+connector, and restores its temporary selection on close when still owned.
+It does not call `WriteConfigurationToPreferences` or scan physical inputs.
+
+Build-time COM declarations come from the unmodified Blackmagic DeckLink SDK
+12.0 Win IDL files supplied by OBS 31.0.3, pinned to
+[fcd1910bf5116b69404a6ecdda6efedd1d00ebdf](https://github.com/obsproject/obs-studio/tree/fcd1910bf5116b69404a6ecdda6efedd1d00ebdf/plugins/decklink/win/decklink-sdk).
+Copyright (c) 2021 Blackmagic Design; the permissive license is retained in
+those external SDK files. They and generated headers remain outside the source
+repository. Build with `VEYRA_DECKLINK_SDK_DIR` pointing at the Win IDL directory;
+without it, the native backend is unavailable and DirectShow remains usable.
+The runtime uses the user's installed Desktop Video COM server; no driver DLL
+or SDK is bundled. `PackedCaptureToLinear.hlsl` implements the documented v210
+and R10l layouts using Veyra's existing HDR color functions and GPU ingress.
+
+## HDR display controls — PR #44 (2026-10-16)
+
+The five HDR control cards, composed content/ambient presets, plain-language
+dials, luminance graph, source metadata recommendations, and film/display
+memory incorporate [georgeg911's PR #44](https://github.com/Likely7/Veyra-NRVideo/pull/44),
+from `georgeg911/Veyra-NRVideo`, pinned to
+`3ee17b62f00154fd3efef2d91f6053ce12470f06` (GPL-3.0, the Veyra repository license).
+The original ten contribution commits and authorship are preserved in the merge.
+
+Adapted files: `include/veyra/engine/HdrOutputTuning.h`,
+`include/veyra/ui/QmlPlayerBridge.h`, `src/ui/QmlPlayerBridge.cpp`,
+`qml/Veyra/ProPage.qml`, `src/engine/EngineController.cpp`,
+`src/engine/VideoPresenter.cpp`, their headers, translations and HDR tests.
+Veyra replaces the pixel readback with a visibility-gated GPU statistics pass
+(`shaders/HdrCurveCoverage.hlsl`), supports both HDR10/scRGB and SDR converted
+through RTX Video HDR, resolves metadata from the actual output curve, and
+repairs persistence, failure reporting, translation and custom-preset states.
+The source contribution adds no SDK, model or runtime binary. Implementation
+and local validation details are in `docs/PR44_HDR_DISPLAY_REPORT_2026-10-16.md`.
+
+## User-provided fan contribution — subtitles / game passthrough (2026-10-16)
+
+The user supplied `veyra-2.0.8-local-changes.patch` (16,129 bytes, SHA256
+`f0c74f69c37c82f3efeb4e7d89d972352fad12258328dc01d0e09237e7612b1c`)
+and `Veyra-2.0.8-源码改动说明.md` (SHA256
+`a06ee46d6df240b2380ee08283b23088577c0ac28f4d313e236c0166aca53c16`),
+based on Veyra `33b22b9138a00ffc9a5e5077215d997ce328a2d1` (GPL-3.0).
+The supplied files contain no author name; none is invented here. Originals and
+identities are retained in the task archive. No binary accompanies this adaptation.
+
+`SubtitleCacheBudget.h` / `Subtitles.cpp` adapt the raised on-demand cache limit
+with strict parsing and 64-bit arithmetic. `GameHotkeys.h` / `GamePassthrough.h`
+adapt the low-level-hook approach with a dedicated message thread, queued UI
+actions, paired releases and configurable bindings. The global top-left-video
+change is replaced by native window/monitor alignment only in game mode, using
+actual screen bounds and Qt DPI conversion; ordinary movie layout is preserved.
+See `docs/FAN_SUBTITLE_PASSTHROUGH_PLAN_2026-10-16.md` and the task report for
+scope, provenance and actual tests. Veyra's GPL-3.0 source license is unchanged.
+
+## FFmpeg deinterlacing filter module (2026-10-16)
+
+Source: https://github.com/FFmpeg/FFmpeg/tree/bf1b838f2ab88b4f8fd83443325c782ea0e0f7fa (`n9.0.1`). License: LGPL-2.1-or-later for this minimal non-GPL build. Veyra loads one additional dynamic `avfilter-12.dll` with the `bwdif` software filter and `deinterlace_d3d12` hardware video processor filter. Existing approved codec/demux/util/resample/scale/dav1d binaries remain byte-identical; no proprietary runtime or SDK is added to source control.
+
+Changes to `libavfilter/vf_deinterlace_d3d12.c` are supplied as `scripts/ffmpeg/deinterlace-d3d12-async.patch`: eight submission slots retain reference frames until their GPU fence completes, retain/signal the output pool's own fence, respect visible dimensions instead of padded decode allocation sizes, use declared stream frame rate, correct short-stream/field timestamps and drain final output before EOF. Slots only wait when reused while occupied; normal execution does not wait on every pass. `scripts/ffmpeg/build-deinterlace-module.py` also accommodates the localized MSVC banner during configure without changing its ABI. The caller wraps existing D3D11/D3D12 GPU surfaces, preserves source time/field order, and resets filter history on seek/close/fallback. It does not copy GPU pixels back to the CPU during playback.
+
+Redistribution of this module must include `COPYING.LGPLv2.1`, the FFmpeg license notice, the actual configuration/hash/patch manifest and the complete corresponding-source archive generated by that script. Build/use boundaries and rebuild instructions: `docs/BUILD_DEINTERLACE_2026-10-16.md`. MediaMTX v1.21.2 (MIT, https://github.com/bluenviron/mediamtx/releases/tag/v1.21.2) is used only as a loopback RTSP regression server and is not shipped in the player.
+## AVerMedia vendor audio graph (PR63)
+
+Follow-up: [PR64](https://github.com/Likely7/Veyra-NRVideo/pull/64), fixed commit `a7034d67ab75e16f85a17e123b9b07d391a7c75c`, contributes conditional non-PCM arming, sign-extended format classification, framed decode and nonfatal PCM delivery rejection. Veyra adapts unknown/failed optional SDK queries, verified readback, bounded rejection recovery and complete multi-frame payload tests. ABI reference additionally includes `avt_device_opener/include/AVerMediaVendorSdkLoader.h` at the same fixed AVerMedia public commit below; no vendor implementation or binary is copied. SDK/DeviceOpener test fixtures are independently authored source-only doubles.
+
+- Integration source: [Se7eNHea7eN/Veyra-NRVideo PR63](https://github.com/Likely7/Veyra-NRVideo/pull/63), fixed commit `4db24dada13748364d7e613bc4160224b330a7d2`, Veyra GPL-3.0 repository. The original graph adapter is credited to that contribution.
+- Adapted files: `include/veyra/source/AverMediaVendorAudio.h`, `src/source/AverMediaVendorAudio.cpp`, `src/source/CaptureCardSource.cpp`, and CMake. Veyra additions split bounded carrier handling into `AverMediaAudioCarrier`, add strict identity/public-ABI declarations in `AverMediaVendorProtocol`, format-aware decoding in `BitstreamAudio`, and source-only test doubles/codec tests.
+- ABI reference only: AVerMedia's [obs-MultichannelAudio public headers](https://github.com/AVerMedia-Technologies-Inc/obs-MultichannelAudio/tree/7d1250b42e42f964b4fa3a6bcb7269cc09a1e798/avt_dshow_core/include), fixed commit `7d1250b42e42f964b4fa3a6bcb7269cc09a1e798`. Its repository contains a GPL-2.0 license. No OBS implementation source or proprietary vendor implementation is copied into Veyra; local declarations describe the public x64 call contract (`AudioDevice`, `AudioDealer`, `AUDIO_SAMPLE_INFO`, `DeviceInfo`, and `LogHelper`).
+- Changes include STA ownership, bounded asynchronous startup/recovery, exact device matching, callback lifetime protection, guarded external calls/log formatting, continuously detected IEC 61937, and actual decoded channel-layout changes. The separately installed `avt_dshow_core.dll` and its dependencies are loaded in place by absolute path; they are never modified or included in source or test fixtures. Users must install the official AVerMedia Multichannel Audio component themselves. This does not grant redistribution rights or certify untested card/driver versions.
+
+## Community NR export size patch (2026-10-25)
+
+The NR export-size change was adapted from the user-supplied
+`2_EXPORT_NR_PRESET_SIZE_2026-10-25.code(1).patch` and its accompanying note.
+No author name was supplied. The original patch SHA-256 is
+`E4D92E28A35DFE64AE309D6B238B1061CBCDF85A1D25EA04A797C9F9F2480598`.
+It modifies Veyra's existing source; no third-party runtime or model was added.
+Local adaptations preserve the manual 25%–100% policies, AMD's input budget,
+invalid-value rejection, and shared per-layer export planning. Integration and
+verification are recorded in `docs/EXPORT_NR_SCALE_REPORT_2026-10-25.md`.
+
+## RTX 30 Video Frame Generation compatibility (2026-11-02)
+
+Source: [Xchen991/RTX30-Broadcast-FrameGen](https://github.com/Xchen991/RTX30-Broadcast-FrameGen), fixed commit `07536ab32a508b7daa714a4a9bda5b56f031bbc3`, MIT, Copyright (c) 2026. Full original permission notice: `licenses/RTX30-Broadcast-FrameGen-MIT.txt`.
+
+Ported from `src/dllmain.cpp`: `Hook_cuDeviceGetAttribute`, `Hook_cuModuleLoadData` and the VFG import-redirection part of `InstallHooksOnVFG`. Adapted in `src/pipeline/VfgAmpereCompat.cpp` / `include/veyra/pipeline/VfgAmpereCompat.h` and connected to `VfgBackend.cpp`. Veyra replaces the fixed import offsets with bounded PE import parsing, rewrites the selected SM86 device's queried minor only within VFG calls, and gates private fatbin/ELF metadata copies on the current CUDA context's device. Kernel instructions are not translated. Original kernel storage and files are never modified. Reference-counted leases, retained module handles and checked IAT restoration cover model coexistence and teardown; uncertain restoration disables later VFG initialization while retaining callback storage. The Broadcast UI patch, version.dll proxy and polling thread are not ported.
+
+Only the recognized VFG runtime receives this experimental SM86 adaptation. RTX 40/50 use their native path without installing these hooks. No SDK, model or proprietary runtime bytes are embedded in Veyra's source or executable, and the existing NVIDIA runtime/model set is reused. Source-level and RTX5070 native regression evidence is not a claim of RTX30 hardware inference, image quality or performance validation. NVIDIA's runtime remains proprietary and is governed separately by its supplied terms.
+
+## VB-Audio VB-CABLE (optional capture audio)
+
+Veyra Virtual Speaker uses the original VB-Audio VB-CABLE Pack46 for Windows. Builds configured with `VEYRA_VB_CABLE_PACKAGE` include the unmodified vendor ZIP for offline installation. Veyra opens the vendor setup only after the user confirms installation or removal. VB-CABLE is VB-Audio donationware. Users can support VB-Audio from the vendor site. See [VB-CABLE](https://vb-audio.com/Cable/) and [VB-Audio distribution terms](https://vb-audio.com/Services/licensing.htm).
+
+
+## Apex Neural Rendering FG local experiment (2026-11-12)
+
+External runtime: [apex-compute/ANR](https://github.com/apex-compute/ANR), inspected repository commit `20a5e7731d899eca3a289904929879588448664d`, [FG-V.B15 release](https://github.com/apex-compute/ANR/releases/tag/FG-V.B15). The official `anr-fg-V.B15-addon.zip` used locally has SHA-256 `717e93b3e63cb08dbaf6240cd585bae94d498c2749d8603d800d17ad97ef9e41`; its original `nvngx_dlssg.dll` is ANR's provider, not an NVIDIA-signed replacement. Its 19 original files are held outside this source repository under the task's private runtime directory and recorded in `ANR-RUNTIME.json`. No runtime, model pack, SDK or downloaded archive is vendored in Git.
+
+Veyra independently implements the host in `AnrProvider.h/.cpp` and adapts `DlssFgBackend`, the shared `EnhanceGraph`, backend selection, persistence and export admission. No ANR core algorithm, OptiScaler implementation or installer is copied. The existing external NGX SDK parameter interface/helper is reused for direct D3D12 provider calls; ANR never registers with NVIDIA's NGX core. ANR's own Windows binary internally uses a Vulkan bridge/queue hooks. Veyra's adapter converts its pixel-motion and depth/motion resource-state contract at the provider boundary and reference-counts device initialization across live graphs.
+
+At the inspected commit the ANR core source and a clear integration/redistribution license were not available. The OptiScaler license present in the full download does not establish a license for the ANR core. This is a user-authorized, local experiment; no public binary redistribution is performed or licensed by this notice. ANR SR/RR components were not available and are not exposed as working features. The limits and actual local evidence are recorded in `docs/ANR_FG_EXPERIMENT_2026-11-12.md`.
+
+
+### ANR public release boundary (2026-11-13)
+
+Upstream collaborator selimsandal explicitly states that third-party redistribution is not allowed until a full-release license is issued: https://github.com/apex-compute/ANR/issues/9#issuecomment-6857895225 (2026-11-13T15:49:32Z). Veyra 2.1.6 public packages contain none of ANR's provider DLL, model/program packs, configuration or generated bridge loader. The host adapter remains independently written Veyra source. Existing private local test copies are not public Release assets; no automated download, mirror, repackaged or renamed ANR payload is offered. The previous dated local research/measurements remain historical evidence, not a grant of redistribution rights.
+
+## AMD Advanced Media Framework (AMF) SDK headers
+
+- Source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF, tag v1.5.3 (commit 57ee0cfb0e1a08d9041f77435653794c1b012be0), public headers `amf/public/include` only, used at build time for AMD FRC (frame rate conversion).
+- License: MIT, Copyright (c) Advanced Micro Devices, Inc. (see LICENSE.txt in that tag; each header carries the MIT notice).
+- Nothing from the SDK is redistributed in Veyra packages. The AMF runtime (`amfrt64.dll`) belongs to the user's AMD driver and is loaded from the Windows system directory only.
+
+## Startup music in runnable packages (2026-11-15)
+
+The user supplied BGM.MP3 and confirmed permission to distribute the exact file
+in Veyra runnable packages. The asset is separate from Veyra source code and its
+GPL license; it is excluded from Git and corresponding source archives.
+Runtime path: `media/startup-music.mp3`, 1847011 bytes, SHA256
+`3005aa601f06a97d3968fd9fa171e870fceb4ec47586f1e950c9ed3c7875fb6a`.
+Each runnable package includes its separate notice and manifest. Windows Media
+Foundation provides decoding; no additional codec or audio SDK is bundled.
+
+# Veyra virtual camera / OBS-derived components (2026-11-17)
+
+- OBS Studio: https://github.com/obsproject/obs-studio , pinned `7e3aa99811798255bd1a13a6da7260ada76a4d95`, GPL-2.0-or-later. Adapted `plugins/win-dshow/virtualcam-module/{virtualcam-filter.cpp,virtualcam-filter.hpp,virtualcam-module.cpp,sleepto.c,sleepto.h}`, `shared/obs-shared-memory-queue` and `shared/obs-tiny-nv12-scale` into `third_party/obs_virtualcam`. `libobs/util/threading-windows.h` and `util/windows/WinHandle.hpp` preserve Lain Bailey's ISC notice.
+- libdshowcapture: https://github.com/obsproject/libdshowcapture , pinned `8878638324393815512f802640b0d5ce940161f1`, LGPL-2.1-or-later, copyright Lain Bailey and contributors. The output filter, format/media-type and logging implementation are used; no hardware-vendor SDK is imported. `dshow-error.cpp` is the existing `ConvertHRToEnglish` helper extracted from `dshow-base.cpp` without behavior changes.
+- Original per-file SHA-256 and paths: `third_party/obs_virtualcam/UPSTREAM.json`. Full licenses: `third_party/obs_virtualcam/COPYING.*`, also shipped under `licenses/virtual-camera/`. Veyra's modifications are GPL-3.0-or-later under the application license; original permissions remain.
+- Changes: independent Veyra CLSID and local shared-memory namespace, current-user 32/64-bit registration/uninstall, COM factory interface handling, native/fallback format negotiation and consumer-clock timestamps, idle/stop handling and black placeholder; bounded shared-memory locking, row-stride packing, validated dimensions, multiple readers and producer crash heartbeat. Application GPU capture/SDR conversion/UI are Veyra code and use the existing post-processing capture point. This is not an OBS plugin and does not replace or register under OBS's identity.
+- Protocol-2 adaptation: six-frame ordered transport, sequence/grid/write timestamps, bounded consumer-rate negotiation, stable adaptive delivery delay and optional in-process timing alignment through libobs's exported read-only clock APIs. The application adds its own protected system-component installer and update status. `UPSTREAM.json.veyraAdaptations` lists the seven modified upstream files and the extracted HRESULT helper; original per-file hashes remain unchanged (line-ending normalization alone is not a source modification).
+## libdovi / source-only adoption of PR #136 (2026-11-18)
+
+Dolby Vision parsing uses quietvoid/dovi_tool, MIT, pinned to
+`d1abe0e27ff2c7ab3339614d06db9f8a058af6b2` (dovi_tool 2.3.3 / libdovi 3.4.0).
+Upstream: https://github.com/quietvoid/dovi_tool . Build the `dolby_vision` crate
+with `capi`, generate `libdovi/rpu_parser.h` with cbindgen 0.29.4 and its upstream
+configuration. Keep the upstream MIT LICENSE with the runtime. Dependency
+sources, generated headers and built DLL/import libraries live outside this
+source repository; point `VEYRA_LIBDOVI_ROOT` at that external prefix.
+
+The Bilibili module, browser extension, P5/P7 RPU and EL composition work is
+adopted from georgeg911/Veyra-NRVideo PR #136, head
+`db5a4e53b29be50182988af14ea7d6674a43e798`, under Veyra's GPLv3 license.
+The clean import excludes the contributed DLL/LIB and foreign-machine rules.
+Integration changes remove per-frame absolute-path debug writes, move page
+resolution off the GUI thread, constrain loopback HTTP requests, preserve
+Korean layouts/current audio settings and use the source-built libdovi prefix.
+
+Linux OBS filter work is adopted from andreanjoes PR #96 at
+`719e2d89eaa3ff126d4130a4e3f7c2f48f8021d6`, GPLv3. Integration additionally
+validates malformed cube LUTs, clears failed LUT selections, samples LUT texel
+centres and preserves premultiplied transparency. OBS's public colour-filter
+shader was consulted for the alpha contract; no OBS DLL is bundled here.

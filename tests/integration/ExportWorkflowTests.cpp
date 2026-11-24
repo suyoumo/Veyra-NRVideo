@@ -1,0 +1,273 @@
+#include "veyra/engine/ExportJobManager.h"
+#include "veyra/engine/ExportQueue.h"
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <thread>
+
+using namespace veyra::engine;
+namespace {
+void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
+ExportJobSnapshot finish(ExportJobManager& manager){
+    const auto limit=GetTickCount64()+90000;
+    ExportJobSnapshot s;
+    do{s=manager.poll();if(!s.active())return s;Sleep(10);}while(GetTickCount64()<limit);
+    throw std::runtime_error("export exceeded 90 second deadline");
+}
+void collected(const ExportJobSnapshot& s){
+    HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,s.workerPid);
+    if(process){const auto state=WaitForSingleObject(process,0);CloseHandle(process);require(state==WAIT_OBJECT_0,"terminal published before process exit");}
+}
+}
+int wmain(int argc,wchar_t** argv){
+    const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    if(argc==3&&std::wstring_view(argv[1])==L"--export-worker"){
+        const int result=runExportWorker(reinterpret_cast<HANDLE>(_wcstoui64(argv[2],nullptr,10)));
+        if(SUCCEEDED(com))CoUninitialize();return result;
+    }
+    if(argc<4)return 2;
+    bool passed=false;
+    try{
+        const std::wstring mode=argv[1],input=argv[2],output=argv[3];
+        ExportJobManager manager;EnhancementSettings settings;settings.nr=settings.sr=false;settings.multiplier=1;
+        ExportMediaOptions media;
+        media.container=mode.find(L"mkv")!=std::wstring::npos?ExportContainer::Matroska:ExportContainer::Mp4;
+        media.audio.policy=ExportTrackPolicy::All;media.subtitles.policy=ExportTrackPolicy::All;
+        const bool hevc=mode.find(L"hevc")!=std::wstring::npos;
+        const bool fsr=mode.find(L"fsr-")==0;
+        const bool rejectXess=mode==L"reject-xess";
+        // Supersampling: 1080p -> 8K -> 4K, or 1080p -> 4K -> a non-integer 2K shrink.
+        const bool srStage=mode==L"sr-supersample"||mode==L"sr-supersample-2k";
+        const bool dualSr=mode==L"dual-sr";
+        if(dualSr){
+            settings.sr=true;settings.videoSrQuality=1;settings.srMotion=MotionSource::Zero;
+            settings.srTarget=veyra::pipeline::SrTarget::Uhd4K;
+            settings.dualSrEnabled=true;settings.srPrescale=veyra::pipeline::SrPrescale::P1080;
+            settings.dualSrTarget=veyra::pipeline::SrTarget::Qhd;settings.dualSrQuality=2;
+            media.audio.policy=media.subtitles.policy=ExportTrackPolicy::None;
+        }
+        if(srStage){
+            settings.sr=true;settings.videoSrQuality=1;settings.srMotion=MotionSource::Zero;
+            settings.srPrescale=veyra::pipeline::SrPrescale::P1080; // kept for double SR, unused here
+            settings.srTarget=mode==L"sr-supersample"?veyra::pipeline::SrTarget::Uhd8K:veyra::pipeline::SrTarget::Uhd4K;
+            settings.srOutput=mode==L"sr-supersample"?veyra::pipeline::SrOutput::Uhd4K:veyra::pipeline::SrOutput::Qhd;
+            media.audio.policy=media.subtitles.policy=ExportTrackPolicy::None;
+        }
+        if(fsr||rejectXess){
+            settings.frameGenerationBackend=rejectXess?FrameGenerationBackend::XeSS:FrameGenerationBackend::Fsr;
+            settings.multiplier=2;
+            settings.fgMotion=MotionSource::Zero;
+            if(mode.find(L"-sr")!=std::wstring::npos){settings.sr=true;settings.videoSrQuality=kVideoSrFsr;settings.srTarget=veyra::pipeline::SrTarget::Qhd;}
+            if(mode.find(L"nr")!=std::wstring::npos){settings.nr=true;settings.nrRuntime=NrRuntime::NvidiaOriginal;settings.nrMotion=MotionSource::Zero;}
+        }
+        // The real QML list stores explicit layers with preview resolution and
+        // stale legacy summary fields. Exercise the actual child process, not
+        // just a settings/chain round trip.
+        if(mode.find(L"field-single")!=std::wstring::npos||mode.find(L"field-stack")!=std::wstring::npos){
+            settings.nr=true;settings.nrLayerCount=mode.find(L"field-stack")!=std::wstring::npos?2:1;
+            settings.nrRuntime=NrRuntime::NvidiaOriginal;
+            for(uint32_t i=0;i<settings.nrLayerCount;++i){
+                auto& n=settings.nrLayers[i];n.enabled=true;n.runtime=NrRuntime::NvidiaOriginal;
+                n.model.style=int(i);n.model.intensity=.8f;
+                n.temporal=true;n.antiFlicker=i?NrAntiFlicker::Static:NrAntiFlicker::FlowPlus;
+                n.sizePolicy=i?veyra::pipeline::NrSizePolicy::P720:veyra::pipeline::NrSizePolicy::Realtime;
+                n.residual.total=i?2.f:1.f;
+            }
+            settings.model.style=2;settings.nrPolicy=veyra::pipeline::NrSizePolicy::P480;
+            settings.flow=FlowQuality::Performance;settings.content=ContentRate::Transport;
+        }
+        // Anti-aliasing (#53): the frozen settings cross the worker protocol and the
+        // worker's graph runs the pass (its log names the instance).
+        const bool antiAlias=mode==L"aa"||mode==L"aa-mkv";
+        if(antiAlias){settings.antiAlias.enabled=true;settings.antiAlias.method=AntiAliasMethod::Smaa;settings.antiAlias.quality=2;}
+        // Beauty: the frozen settings cross the worker protocol with the mask view off,
+        // and the worker creates the node and the face tracker (an export refuses to
+        // start without the face model, which the staged app keeps in models/).
+        const bool beauty=mode==L"beauty";
+        if(beauty){
+            settings.beauty.enabled=true;settings.beauty.restore=true;settings.beauty.restoreStrength=.8f;
+            settings.beauty.smooth=true;settings.beauty.showMask=true;settings.beautyDetection.quality=2;
+        }
+        if(mode==L"queue"){
+            std::filesystem::create_directories(output);
+            ExportQueue queue(manager);
+            const auto a=queue.add(input),b=queue.add(input),c=queue.add(input);
+            require(queue.move(c,0),"queue reorder refused");
+            require(!queue.busy()&&manager.poll().workerPid==0,"adding implicitly exported");
+            std::wstring error;require(queue.start(output,settings,false,veyra::sink::ExportRateControl::Cq,error),"batch refused");
+            const auto late=queue.add(input);
+            std::vector<uint64_t> order;
+            uint64_t job=0;
+            const auto deadline=GetTickCount64()+90000;
+            while(queue.needsTick()&&GetTickCount64()<deadline){
+                queue.tick();const auto s=queue.snapshot();
+                if(s.jobId&&s.jobId!=job){job=s.jobId;for(const auto& item:queue.items())if(item.job==job){order.push_back(item.id);require(!queue.remove(item.id),"active row removed");break;}}
+                Sleep(10);
+            }
+            require(!queue.busy(),"batch did not finish");
+            require(order==std::vector<uint64_t>{c,a,b},"actual worker launch order differs from reordered model");
+            require(queue.find(late)->state==ExportItemState::Ready,"late item joined frozen batch");
+            require(queue.successes()==3&&queue.failures()==0&&queue.successEvent()==1,"whole-batch success event wrong");
+            for(int i=0;i<10;++i)queue.tick();require(queue.successEvent()==1,"duplicate completion event");
+            const auto missing=queue.add(input+L".missing");
+            require(queue.start(output,settings,false,veyra::sink::ExportRateControl::Cq,error),"mixed batch refused");
+            while(queue.needsTick()&&GetTickCount64()<deadline){queue.tick();Sleep(10);}
+            require(queue.find(missing)->state==ExportItemState::Failed,"missing file not reported");
+            require(queue.successes()==1&&queue.failures()==1&&queue.successEvent()==1,"mixed batch emitted successful batch event");
+            std::wcout<<L"PASS actual order C/A/B, late membership, stable job IDs, mixed failure, completion de-duplication\n";
+        }else if(mode==L"lifecycle"){
+            // A pre-existing user/legacy partial must survive every cancellation.
+            {std::ofstream legacy(std::filesystem::path(output+L".partial"));legacy<<"protected legacy partial";}
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_EXIT_DELAY_MS",L"1200");
+            uint64_t lastJob=0;
+            for(int round=0;round<3;++round){
+                require(manager.start(input,output,settings,false,0),"start after cancel refused");
+                auto initial=manager.poll();require(initial.jobId!=lastJob,"retry reused job id");lastJob=initial.jobId;
+                if(round>0){
+                    manager.watching(true);if(round==1)manager.pause(true);
+                    const auto deadline=GetTickCount64()+20000;
+                    while(GetTickCount64()<deadline){auto s=manager.poll();require(s.active(),"export finished before requested cancel phase");if(round==1?s.state==ExportState::Paused:s.sourceFrames>=5)break;Sleep(10);}
+                }
+                const auto requested=GetTickCount64();manager.cancel();
+                require(manager.poll().active(),"cancel skipped resource collection state");
+                require(!manager.start(input,output,settings,false),"second worker launched while cancelling");
+                auto s=finish(manager);collected(s);
+                require(s.state==ExportState::Cancelled,"cancel outcome incorrect");
+                require(GetTickCount64()-requested>=1000,"delayed worker result stopped polling early");
+                require(!std::filesystem::exists(s.temporaryPath),"owned partial leaked on cancel");
+                require(!std::filesystem::exists(output),"cancel created final file");
+                require(std::filesystem::file_size(output+L".partial")==24,"foreign partial changed");
+                std::wcout<<L"cancel round="<<round<<L" job="<<s.jobId<<L" collected=true\n";
+            }
+            require(manager.start(input,output,settings,false,20),"same output retry failed");
+            auto s=finish(manager);collected(s);require(s.state==ExportState::Succeeded,"final retry did not succeed");
+            require(s.encoded==20&&std::filesystem::exists(output),"final output incomplete");
+            require(!manager.start(input,output,settings,false),"existing output overwritten");
+            require(manager.poll().message.find(L"已存在")!=std::wstring::npos,"startup reason was hidden");
+        }else if(mode==L"split-rename-conflict"){
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_REMOVE_DEVICE_AT",L"24");
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_SAVE_DELAY_MS",L"1500");
+            require(manager.start(input,output,settings,false,48),"split export start refused");
+            const auto first=manager.poll().temporaryPath;
+            const auto deadline=GetTickCount64()+20000;
+            ExportJobSnapshot s;
+            std::wstring joined;
+            do{
+                s=manager.poll();
+                require(s.active(),"missed split export save boundary");
+                joined=s.temporaryPath+L".joined";
+                if(s.temporaryPath!=first&&std::filesystem::exists(joined)&&
+                    s.message.find(L"正在保存正式文件")!=std::wstring::npos)break;
+                Sleep(5);
+            }while(GetTickCount64()<deadline);
+            require(s.temporaryPath!=first&&std::filesystem::exists(joined),"no complete joined export");
+            {std::ofstream external(std::filesystem::path(output),std::ios::binary);external<<"other file";}
+            s=finish(manager);collected(s);
+            require(s.state==ExportState::Failed&&s.message.find(joined)!=std::wstring::npos&&
+                s.message.find(first)!=std::wstring::npos,"rename failure hid recoverable outputs");
+            require(std::filesystem::exists(first)&&std::filesystem::exists(joined),"rename failure removed recoverable output");
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_REMOVE_DEVICE_AT",nullptr);
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_SAVE_DELAY_MS",nullptr);
+            require(manager.start(input,output+L".retry.mp4",settings,false,8),"next export refused");
+            s=finish(manager);collected(s);
+            require(s.state==ExportState::Succeeded&&std::filesystem::exists(first)&&
+                std::filesystem::exists(joined),"next export deleted previous recoverable output");
+            std::wcout<<L"PASS split save collision preserves the full file and previous segments after retry\n";
+        }else if(mode==L"lifecycle-boundary"){
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_SAVE_DELAY_MS",L"1500");
+            require(manager.start(input,output,settings,false,2),"save-boundary start refused");
+            const auto deadline=GetTickCount64()+15000;
+            ExportJobSnapshot s;
+            do{s=manager.poll();require(s.active(),"missed final-save boundary");if(s.progress>=.999)break;Sleep(5);}while(GetTickCount64()<deadline);
+            require(s.progress>=.999,"final-save boundary never reached");manager.cancel();s=finish(manager);collected(s);
+            require(s.state==ExportState::Cancelled&&!std::filesystem::exists(output)&&!std::filesystem::exists(s.temporaryPath),"final-save cancel left final/temporary output");
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_SAVE_DELAY_MS",nullptr);
+            require(manager.start(input,output,settings,false,2),"cleanup-failure start refused");
+            const auto owned=manager.poll().temporaryPath;
+            HANDLE lock=CreateFileW(owned.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr);
+            require(lock!=INVALID_HANDLE_VALUE,"could not hold deletion-denying handle");
+            manager.cancel();s=finish(manager);collected(s);CloseHandle(lock);
+            require(s.state==ExportState::Cancelled&&std::filesystem::exists(owned)&&s.message.find(owned)!=std::wstring::npos,"cleanup failure hid owned file location");
+            SetEnvironmentVariableW(L"VEYRA_TEST_EXPORT_EXIT_DELAY_MS",L"1200");
+            require(manager.start(input,output,settings,false,2),"old undeletable partial blocked retry");
+            const auto successDeadline=GetTickCount64()+15000;
+            do{s=manager.poll();if(s.active()&&std::filesystem::exists(output))break;Sleep(5);}while(GetTickCount64()<successDeadline);
+            require(s.active()&&s.progress>=.999&&std::filesystem::exists(output),"could not observe saved output before process exit");
+            manager.cancel();s=finish(manager);collected(s);
+            require(s.state==ExportState::Succeeded&&std::filesystem::exists(output),"late cancel invalidated safely saved success");
+            std::wstring reason;require(removeExportTemporaryFile(owned,reason),"released owned partial cleanup failed");
+            std::wcout<<L"PASS final-save cancellation, explicit cleanup failure, retry with old partial, late-success cancel race\n";
+        }else{
+            const double from=mode.find(L"trim")!=std::wstring::npos?0.7:0;
+            const double to=from>0?1.7:0;
+            if(mode.find(L"none")!=std::wstring::npos)media.audio.policy=media.subtitles.policy=ExportTrackPolicy::None;
+            if(mode.find(L"selected")!=std::wstring::npos){media.audio.policy=media.subtitles.policy=ExportTrackPolicy::Selected;media.audio.count=media.subtitles.count=1;media.audio.indices[0]=2;media.subtitles.indices[0]=4;}
+            // "reject": the user picked every subtitle track by hand, so a track
+            // the container cannot hold must fail the export. "skip": the default
+            // "all tracks" policy leaves it out and says so in the result.
+            if(mode.find(L"reject")!=std::wstring::npos&&!rejectXess){
+                std::atomic<bool> stop{false};const auto info=ExportStreams::probe(input,ExportMediaOptions{},0,0,stop);
+                media.subtitles.policy=ExportTrackPolicy::Selected;media.subtitles.count=0;
+                for(const auto& t:info.tracks)if(t.subtitle&&media.subtitles.count<media.subtitles.indices.size())media.subtitles.indices[media.subtitles.count++]=t.index;
+                require(media.subtitles.count>0,"reject source has no subtitle track");
+            }
+            require(manager.start(input,output,settings,hevc,(srStage||dualSr)?4:0,-1,from,to,veyra::sink::ExportRateControl::Cq,media),"start refused");
+            auto s=finish(manager);collected(s);
+            std::wcout<<L"state="<<int(s.state)<<L" encoded="<<s.encoded<<L" message="<<s.message<<L"\n";
+            if(mode.find(L"reject")!=std::wstring::npos){require(s.state==ExportState::Failed,"incompatible source was not rejected");require(!std::filesystem::exists(output),"rejection produced final file");require(!s.message.empty(),"failure reason missing");}
+            else require(s.state==ExportState::Succeeded,"export failed");
+            if(dualSr){
+                require(s.encoded==4&&s.sourceFrames==4,"dual SR export lost source frames");
+                require(s.frozen.dualSrEnabled&&s.frozen.dualSrTarget==settings.dualSrTarget&&
+                        s.frozen.dualSrQuality==2&&s.frozen.videoSrQuality==1&&
+                        s.frozen.srTarget==settings.srTarget&&s.frozen.srPrescale==settings.srPrescale,
+                        "independent SR fields lost crossing the worker protocol");
+                std::ifstream log(s.workerLog);const std::string text((std::istreambuf_iterator<char>(log)),{});
+                require(text.find("passes=2 source=1920x1080 first=3840x2160 shrink=1920x1080 second=2560x1440 output=2560x1440 firstQuality=1 secondQuality=2")!=std::string::npos,
+                        "export worker did not create the requested two SR operations");
+                std::wcout<<L"DUAL_SR_EXPORT source=4 encoded=4 frozenAndEvaluated=1\n";
+            }
+            if(srStage){
+                require(s.encoded==4&&s.sourceFrames==4,"supersample export lost source frames");
+                require(s.frozen.srPrescale==settings.srPrescale&&s.frozen.srOutput==settings.srOutput&&s.frozen.srTarget==settings.srTarget,
+                        "supersample fields lost crossing the worker protocol");
+                std::ifstream log(s.workerLog);const std::string text((std::istreambuf_iterator<char>(log)),{});
+                const auto evaluated=mode==L"sr-supersample"?"supersample evaluate=7680x4320 output=3840x2160":"supersample evaluate=3840x2160 output=2560x1440";
+                require(text.find(evaluated)!=std::string::npos&&text.find("dual reduce=")==std::string::npos,
+                        "supersample was not evaluated and shrunk at the requested dimensions");
+                std::wcout<<L"SUPERSAMPLE_EXPORT encoded="<<s.encoded<<L" frozenAndEvaluated=1\n";
+            }
+            if(rejectXess){
+                require(s.message.find(L"XeSS")!=std::wstring::npos&&s.message.find(L"FSR")!=std::wstring::npos,"XeSS rejection lost its backend-specific reason");
+                require(s.encoded==0,"unsupported XeSS wrote frames");
+            }
+            if(fsr){
+                require(s.sourceFrames==60&&s.encoded==120,"FSR did not encode every source frame at 2X");
+                require(s.generated>0,"FSR never produced a valid generated frame");
+                require(s.frozen.frameGenerationBackend==FrameGenerationBackend::Fsr,"FSR frozen job changed backend");
+                std::wcout<<L"FSR_TEXTURE_EXPORT source="<<s.sourceFrames<<L" encoded="<<s.encoded<<L" validGenerated="<<s.generated<<L" holds="<<s.holds<<L"\n";
+            }
+            if(mode.find(L"skip")!=std::wstring::npos)require(s.message.find(L"未保留")!=std::wstring::npos,"skipped tracks not reported");
+            if(antiAlias){
+                require(s.frozen.antiAlias==settings.antiAlias,"frozen job lost the anti-aliasing settings");
+                std::ifstream log(s.workerLog);const std::string text((std::istreambuf_iterator<char>(log)),{});
+                require(text.find("[anti-alias] instance=0 SMAA high")!=std::string::npos,"export worker did not create the anti-aliasing pass");
+                // The log path may hold non-ASCII folders, which would fail the narrow console stream.
+                std::wcout<<L"ANTI_ALIAS_EXPORT encoded="<<s.encoded<<L" passCreated=1\n";
+            }
+            if(beauty){
+                auto expected=settings.beauty;expected.showMask=false;
+                require(s.frozen.beauty==expected&&s.frozen.beautyDetection==settings.beautyDetection,
+                        "frozen job lost the beauty settings or kept the mask view");
+                std::ifstream log(s.workerLog);const std::string text((std::istreambuf_iterator<char>(log)),{});
+                require(text.find("[beauty] instance=0 ")!=std::string::npos,"export worker did not create the beauty node");
+                require(text.find("face tracker ready")!=std::string::npos,"export worker did not start the face tracker");
+                require(text.find("beauty-detect")==std::string::npos||text.find("unavailable")==std::string::npos,"export worker ran without faces");
+                std::wcout<<L"BEAUTY_EXPORT encoded="<<s.encoded<<L" nodeCreated=1 tracker=1\n";
+            }
+        }
+        passed=true;
+    }catch(const std::exception& e){std::cerr<<"FAILED: "<<e.what()<<'\n';}
+    if(SUCCEEDED(com))CoUninitialize();return passed?0:1;
+}
