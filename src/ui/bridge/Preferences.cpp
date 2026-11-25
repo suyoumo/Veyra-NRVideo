@@ -236,7 +236,7 @@ bool QmlPlayerBridge::setPreference(const QString& key, const QVariant& value) {
         {"recordRegionW", {0, 16384}},
         {"recordRegionH", {0, 16384}}};
     static const QStringList flags{"recordHevc", "recordAudio", "recordUi", "recordFullscreen", "recordRegion", "recordMic", "recordMicTrack", "replayEnabled", "subtitleEnabled", "subtitleBackground", "subtitleFit",
-                                   "subtitleSecondLanguage", "audioForceStereo", "captureAudioMonitor", "holdCompare",
+                                   "subtitleSecondLanguage", "audioForceStereo", "captureAudioMonitor", "captureHdmiPassthrough", "holdCompare",
                                    "magewellLowLatency", "averLowLatency", "blackmagicNativeCapture", "captureShowAllFrameRates", "cinePillHidden", "exportStopsPlayback", "obsGameCapture", "autoResume", "fullscreenMemoryProtection", "prewarmEnhancement", "hdrFgCompatibility", "computeOnMonitorGpu", "deinterlace", "networkAutoReconnect", "ps5CaptureControl", "ps5ControlBackground", "ps5ControlTouchpad",
                                    // 设置 → 外观 → 启动动画 / 启动音乐 / 剔除遮罩（2.1.9）
                                    "introAnimation", "introMusic", "exclusionOverlay", "fullscreenFrameStats"};

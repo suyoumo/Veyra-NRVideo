@@ -316,8 +316,23 @@ void QmlPlayerBridge::refreshHudOverlay() {
     const bool topFlush = corner == 5 || corner == 6;
     const int margin = int(std::round(12 * dpr));
     const int offsetY = int(std::round(i.prefInt("hudOffsetY", 96) * dpr));
+    // 2.2.1's 全屏帧率 readout (FullscreenFrameStats.h) is drawn into the same swap
+    // chain after this blit: a pixel-font box in its own corner
+    // (fullscreenFrameStatsCorner 0-3 = 左上 右上 左下 右下, 7*scale from the top
+    // and 25*scale tall, scale = height/540). When both sit in the same top
+    // corner, this box starts below it: the readout is drawn later and would
+    // cover the HUD's first lines (右上·置顶, or a small 下移量).
+    int clearBelow = 0;
+    if (!bottomSide && i.prefBool("fullscreenFrameStats", false) && i.presentation.fullscreen) {
+        const int statsCorner = i.prefInt("fullscreenFrameStatsCorner", 1);
+        const bool statsRight = (statsCorner & 1) != 0, statsBottom = (statsCorner & 2) != 0;
+        if (!statsBottom && statsRight == rightSide) {
+            const LONG scale = std::clamp<LONG>(client.bottom / 540, 1, std::min<LONG>(6, client.left / 80));
+            clearBelow = int(31 * scale);
+        }
+    }
     overlay.x = int(std::max<LONG>(0, rightSide ? client.right - w - margin : margin));
-    overlay.y = int(std::max<LONG>(0, bottomSide ? client.bottom - h - margin : topFlush ? 0 : LONG(offsetY)));
+    overlay.y = std::max(clearBelow, int(std::max<LONG>(0, bottomSide ? client.bottom - h - margin : topFlush ? 0 : LONG(offsetY))));
     overlay.show = true;
     overlay.bgra.resize(size_t(w) * size_t(h) * 4);
     {

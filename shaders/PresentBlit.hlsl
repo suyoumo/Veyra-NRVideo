@@ -257,7 +257,7 @@ float4 MagnifySample(float2 p,int2 last)
 // domain, so the dither never moves a value by more than half a step either way.
 float DitherOffset(uint2 pixel)
 {
-    float noise = frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711018, 0.00583715))));
+    float noise = frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711056, 0.00583715))));
     return (noise - 0.5) / 1023.0;
 }
 

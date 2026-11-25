@@ -11128,6 +11128,8 @@
    "de": "Oberer Rand des Bereichs",
    "pt-BR": "Borda superior da área",
    "ru": "Верхний край области"
+  },
+  {
    "zh": "区域",
    "src": "qml/ProPage.qml",
    "zh-TW": "區域",
