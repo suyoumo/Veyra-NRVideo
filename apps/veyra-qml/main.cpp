@@ -382,9 +382,13 @@ void collectCovers(QQuickItem* item, QList<Cover>& out) {
         const qreal s = item->width() > 0 ? r.width() / item->width() : 1.0;
         // informational: a readout that is over the picture all the time, not
         // something the pointer reaches for (视频直出 keeps the rectangle whole).
+        // 2.2.1's FullscreenBackground marks itself passiveVideoCover: it sits
+        // behind the picture (ultrawide side art) and takes no click that
+        // belongs to it, so cutting a hole for it would only cost the direct
+        // scanout — the hole spans the window and DWM composes every frame.
         const QString name = item->objectName().isEmpty() ? QString::fromLatin1(item->metaObject()->className()) : item->objectName();
         out << Cover{r, item->property("coverRadius").toReal() * s,
-                     item->objectName() == QLatin1String("video-hud"), name};
+                     item->objectName() == QLatin1String("video-hud") || item->property("passiveVideoCover").toBool(), name};
     }
     for (QQuickItem* child : item->childItems()) collectCovers(child, out);
 }
