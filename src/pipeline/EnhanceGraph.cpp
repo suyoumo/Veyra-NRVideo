@@ -4577,6 +4577,10 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     // (a VFG pair skipped for budget resets history) for same-EXE A/B runs.
     static const bool vfgSkipResetsHistory=GetEnvironmentVariableW(L"VEYRA_TEST_VFG_SKIP_RESETS_HISTORY",nullptr,0)>0;
     auto decision=fgBackendAvailable?(admitFg?admitFg(out.batch,resetFg):FgDecision::Evaluate):FgDecision::Skip;
+    // A repeated picture is a skip to everything below. Remember why, so the
+    // controller's cost observers can leave the pair out.
+    out.fgRepeatSkipped=decision==FgDecision::RepeatSkip;
+    if(out.fgRepeatSkipped)decision=FgDecision::Skip;
     // For VFG a budget seed is a hidden reset Run whose only purpose is to keep
     // history; recording B below keeps it without any Run.
     if(vfgBackend_&&decision==FgDecision::Seed&&historyValid&&!vfgSkipResetsHistory)decision=FgDecision::Skip;

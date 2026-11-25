@@ -1644,8 +1644,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     const bool currentCost=batch.batch.identity.settingsRevision==fgBudgetRevision&&
                         watch.presentationGeneration==presentationGeneration.load();
                     const auto vfgHeldUntil=vfgCostSettling.holdUntil();
+                    // A pair skipped because the source repeated its picture is left out
+                    // altogether: it is neither a skipped evaluation (which fails a probe)
+                    // nor a cost sample. Counted as a skip, every repeated pair after a
+                    // still second failed the chosen model's probe, so VFG never ran a
+                    // complete one in 30 fps content with fgSkipRepeats on.
                     const bool costSettling=currentCost&&isCapture&&!legacyLivePacing&&options.settings.frameGenerationBackend==FrameGenerationBackend::Vfg&&
-                        vfgCostSettling.observe((batch.fgCandidates>0&&batch.fgEvaluated==0)||batch.fgFastForBudget,batch.fgEvaluated>0&&!batch.fgFast,host100ns());
+                        !batch.fgRepeatSkipped&&vfgCostSettling.observe((batch.fgCandidates>0&&batch.fgEvaluated==0)||batch.fgFastForBudget,batch.fgEvaluated>0&&!batch.fgFast,host100ns());
                     // Each model's own time. The steady time is the low envelope: an
                     // evaluation after skips can cost 1.7x (see FgCostSettling).
                     if(currentCost&&watch.fgExecutionMs&&batch.fgEvaluated>0&&!batch.fgReduced&&!batch.historyReset&&!batch.fgRecovery){
@@ -3392,23 +3397,26 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 const auto ready=now+int64_t((std::max(0.0,base+chosen-progress)+blit+1)*10000);
                                 if(now-grid.lastVblank100ns<10000000&&liveFramesShareRefresh(ready,presentAnchorFor(batch.b100ns)+pairDelay,grid.lastVblank100ns,grid.period100ns,grid.latch100ns))decision=pipeline::EnhanceGraph::FgDecision::Fast;
                             }
-                            if(decision==pipeline::EnhanceGraph::FgDecision::Fast)++vfgFastPairs;
-                            else if(decision==pipeline::EnhanceGraph::FgDecision::FastForBudget)++vfgFastBudgetPairs;
-                            if(now>=nextVfgFastLog&&(vfgFastPairs||vfgFastBudgetPairs)){
-                                nextVfgFastLog=now+10000000;
-                                veyra::log::info("vfg-fast",std::format("revision={} refreshPairs={} budgetPairs={} chosenPairs={} chosenFgMs={:.2f} fastFgMs={:.2f} latchMs={:.2f} (session totals: pairs run with the next faster model because the chosen one would miss the refresh or the budget, and pairs run with the chosen one)",options.settings.revision,vfgFastPairs,vfgFastBudgetPairs,vfgChosenPairs,vfgChosenFgMs,vfgFastFgMs,presenter->refreshGrid().latch100ns/10000));
-                            }
                         }
                         if(captureSampleRepeat&&options.settings.fgSkipRepeats){
                             // A repeat of the last picture has no midpoint worth a model run:
                             // the generated frame would duplicate both endpoints. Skip this
                             // pair so the model time and the GPU queue go to real changes.
                             // The pair keeps its admitted timeline, so presentation timing
-                            // and the following pair are unaffected.
-                            decision=pipeline::EnhanceGraph::FgDecision::Skip;
+                            // and the following pair are unaffected. RepeatSkip, not Skip:
+                            // the cost observers below must not read it as a budget rejection.
+                            decision=pipeline::EnhanceGraph::FgDecision::RepeatSkip;
                             ++fgRepeatSkips;
                             if(now>=nextFgRepeatSkipLog){nextFgRepeatSkipLog=now+10000000;
                                 veyra::log::info("fg-repeat-skip",std::format("revision={} source={} skips={} (source repeated the last picture; real frame presented, transport cadence unchanged)",options.settings.revision,batch.identity.sourceFrameId,fgRepeatSkips));}
+                        }
+                        // Counted after the repeat bypass: a repeated pair that was about to
+                        // run the faster model never runs any model, so it is not one.
+                        if(decision==pipeline::EnhanceGraph::FgDecision::Fast)++vfgFastPairs;
+                        else if(decision==pipeline::EnhanceGraph::FgDecision::FastForBudget)++vfgFastBudgetPairs;
+                        if(now>=nextVfgFastLog&&(vfgFastPairs||vfgFastBudgetPairs)){
+                            nextVfgFastLog=now+10000000;
+                            veyra::log::info("vfg-fast",std::format("revision={} refreshPairs={} budgetPairs={} chosenPairs={} chosenFgMs={:.2f} fastFgMs={:.2f} latchMs={:.2f} (session totals: pairs run with the next faster model because the chosen one would miss the refresh or the budget, and pairs run with the chosen one)",options.settings.revision,vfgFastPairs,vfgFastBudgetPairs,vfgChosenPairs,vfgChosenFgMs,vfgFastFgMs,presenter->refreshGrid().latch100ns/10000));
                         }
                         capturePairDecision=decision;
                         return decision;
@@ -3707,8 +3715,8 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         bool fgHeld=false;
                         if(marginPair&&capturePairDecision){
                             const bool wasHeld=fgRejectionHold.held();
-                            const bool admittedPair=*capturePairDecision!=pipeline::EnhanceGraph::FgDecision::Skip;
-                            fgHeld=fgRejectionHold.observe(host100ns(),admittedPair);
+                            const bool admittedPair=*capturePairDecision!=pipeline::EnhanceGraph::FgDecision::Skip&&*capturePairDecision!=pipeline::EnhanceGraph::FgDecision::RepeatSkip;
+                            fgHeld=fgRejectionHold.observe(host100ns(),admittedPair,*capturePairDecision==pipeline::EnhanceGraph::FgDecision::RepeatSkip);
                             fgHeldPairs+=fgHeld;fgHeldProbes+=fgHeld&&admittedPair;
                             if(wasHeld!=fgRejectionHold.held())
                                 veyra::log::info("live-fg-hold",std::format("revision={} held={} source={} heldPairs={} heldProbes={} (FG rejected for {:.0f} s: real frames shown when ready instead of on the FG phase; pairs admitted while held expire their generated frames; {} admitted pairs in a row resume)",

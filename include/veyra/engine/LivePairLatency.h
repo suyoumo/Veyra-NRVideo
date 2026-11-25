@@ -129,15 +129,29 @@ public:
     void reset(){*this=LiveFgRejectionHold{};}
     bool held()const{return held_;}
     // One call per capture pair after its FG decision; true: show this pair's
-    // real frame without the FG phase.
-    bool observe(int64_t now,bool admitted){
+    // real frame without the FG phase. `repeated`: the source repeated its last
+    // picture and the pair was skipped for that reason (fgSkipRepeats), not
+    // because FG was rejected.
+    bool observe(int64_t now,bool admitted,bool repeated=false){
         if(admitted){
             rejectedSince_=0;
             if(held_&&++admittedRun_<kResumePairs)return true;
             held_=false;admittedRun_=0;
             return false;
         }
+        // A repeated pair says nothing about whether FG fits, so while the hold
+        // is on it neither counts towards the resume run nor breaks it.
+        // Counting it as a rejection kept the hold on for the rest of a
+        // session: 30 fps content in a 60 Hz transport alternates new and
+        // repeated pictures, so eight admitted pairs never came in a row once
+        // a still second had set the hold (2026-11-25, VFG 2X at 4K: 3
+        // generated frames in 30 s, 1% low 60).
+        if(repeated&&held_)return true;
         admittedRun_=0;
+        // While the hold is off a repeated pair is still a pair without a
+        // generated frame: it starts the rejection clock like a rejection, so
+        // a still picture lets the real frames go out when ready after the
+        // usual second. An admitted pair in between stops the clock as always.
         if(!rejectedSince_)rejectedSince_=now;
         if(now-rejectedSince_>=kHold100ns)held_=true;
         return held_;

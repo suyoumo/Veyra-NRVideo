@@ -616,6 +616,9 @@ public:
         FrameBatch batch;
         uint32_t fgCandidates=0,fgEvaluated=0,fgSkippedBeforeEval=0,fgSkippedForReset=0;
         bool historyReset=false,fgRecovery=false,fgBudgetSeed=false,fgReduced=false,fgFast=false,fgFastForBudget=false;
+        // The pair was skipped because the source repeated its picture, not
+        // because the budget rejected it: nothing about it says whether FG fits.
+        bool fgRepeatSkipped=false;
         ResetReason detectedReset=ResetReason::None;
         int measuredContentRate=0;
         double ptsMs = 0.0;
@@ -646,7 +649,11 @@ public:
     // number of outputs changes, and it is reported as previewFgMultiplier.
     // Fast: the faster VFG model for this pair, its frame would miss the refresh.
     // FastForBudget: the same because the budget rejected the chosen model.
-    enum class FgDecision { Skip, Evaluate, Seed, Reduced, Fast, FastForBudget };
+    // RepeatSkip: the source repeated its last picture, so the pair wants no
+    // FG at all (EnhancementSettings::fgSkipRepeats). It runs exactly like Skip;
+    // FrameOutputs::fgRepeatSkipped keeps it apart from a budget skip for the
+    // cost observers in the controller.
+    enum class FgDecision { Skip, Evaluate, Seed, Reduced, Fast, FastForBudget, RepeatSkip };
     using FgAdmission=std::function<FgDecision(const FrameBatch&,bool warmingHistory)>;
     // `hardwareSurface` carries the decoded texture for paths whose surface
     // does not travel inside the AVFrame (D3D11VA). It must be provided exactly
