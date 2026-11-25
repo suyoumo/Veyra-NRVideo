@@ -1264,6 +1264,9 @@ include_directories(${FFMPEG_INCLUDE_DIRS})
   add_executable(veyra_amd_nr_graph_tests tests/integration/LmxxfNrGraphTests.cpp src/engine/EffectChain.cpp "${CMAKE_BINARY_DIR}/amd-nr-graph-test/EnhanceGraph.cpp")
   target_compile_features(veyra_amd_nr_graph_tests PRIVATE cxx_std_20)
   target_include_directories(veyra_amd_nr_graph_tests PRIVATE $<TARGET_PROPERTY:veyra_pipeline,INCLUDE_DIRECTORIES>)
+  # The graph copy lives in the build directory, so EnhanceGraph.cpp's own
+  # directory includes (HudProtect.h, NisScaler.h) need the source directory.
+  target_include_directories(veyra_amd_nr_graph_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/pipeline)
   target_compile_definitions(veyra_amd_nr_graph_tests PRIVATE $<TARGET_PROPERTY:veyra_pipeline,COMPILE_DEFINITIONS>)
   target_compile_options(veyra_amd_nr_graph_tests PRIVATE /utf-8 /WX-)
   target_link_libraries(veyra_amd_nr_graph_tests PRIVATE veyra_pipeline veyra_sinks)
@@ -1621,6 +1624,14 @@ if(VEYRA_BUILD_QML_UI AND Qt6_FOUND)
   target_link_libraries(veyra_qml_ui PRIVATE veyra_qml_bridge veyra_engine veyra_startup_music Qt6::CorePrivate dbghelp ole32 rstrtmgr)
 
   add_executable(veyra_qml_data_tests tests/unit/QmlDataDirectoryTests.cpp src/ui/QmlDataDirectory.cpp)
+  # Game mode stays in this tree (2.2.1 retired it together with these tests).
+  add_executable(veyra_game_passthrough_tests tests/integration/GamePassthroughTests.cpp)
+  add_executable(veyra_game_mode_policy_tests tests/unit/GameModePolicyTests.cpp)
+  target_compile_features(veyra_game_mode_policy_tests PRIVATE cxx_std_20)
+  target_include_directories(veyra_game_mode_policy_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(veyra_game_passthrough_tests PRIVATE cxx_std_20)
+  target_compile_options(veyra_game_passthrough_tests PRIVATE /utf-8)
+  target_link_libraries(veyra_game_passthrough_tests PRIVATE veyra_qml_bridge)
   add_executable(veyra_capture_capability_tests tests/unit/CaptureCapabilityTests.cpp)
   add_executable(veyra_dshow_format_discovery_tests tests/unit/DirectShowFormatDiscoveryTests.cpp)
   target_compile_features(veyra_dshow_format_discovery_tests PRIVATE cxx_std_20)
@@ -2057,7 +2068,8 @@ target_link_options(veyra_hdr_tuning_tests PRIVATE /STACK:33554432)
     add_executable(veyra_remoteplay_profile_tests tests/remoteplay/ProfileStoreTests.cpp)
     target_compile_features(veyra_remoteplay_profile_tests PRIVATE cxx_std_20)
     target_compile_definitions(veyra_remoteplay_profile_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(veyra_remoteplay_profile_tests PRIVATE veyra_remoteplay_chiaki)
+    # veyra_base: ChiakiBackend.cpp logs through veyra::log (touchpad button events).
+    target_link_libraries(veyra_remoteplay_profile_tests PRIVATE veyra_remoteplay_chiaki veyra_base)
   endif()
 
   # matrix executes through the shared product libraries only.
