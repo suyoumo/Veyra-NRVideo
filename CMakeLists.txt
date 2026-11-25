@@ -409,7 +409,9 @@ veyra_add_graphics_shader_pair(veyra_shader_present_blit PresentBlit)
 veyra_add_graphics_shader_pair(veyra_shader_fullscreen_frame_stats FullscreenFrameStats)
 # The same blit with the video overlay (the frame-rate HUD drawn into the swap
 # chain so the video window can stay a whole rectangle and be scanned out directly).
-veyra_add_graphics_shader_pair(veyra_shader_present_blit_overlay PresentBlitOverlay)
+# It includes PresentBlit.hlsl, so that file is a dependency too.
+veyra_add_graphics_shader_pair(veyra_shader_present_blit_overlay PresentBlitOverlay
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/PresentBlit.hlsl")
 veyra_add_compute_shader(veyra_shader_present_motion PresentMotion)
 veyra_add_compute_shader(veyra_shader_hdr_coverage HdrCurveCoverage)
 # NvofDensify: SHORT2 S10.5 raw flow -> workingExtent float2 + confidence.

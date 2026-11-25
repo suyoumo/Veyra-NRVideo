@@ -91,18 +91,22 @@ function(veyra_add_graphics_shader_pair target_name shader_name)
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(config_flags -Od -Zi -Qembed_debug)
   endif()
+  # Extra arguments are files this shader includes besides the .hlsli set: a
+  # variant that includes another .hlsl must be rebuilt when that file changes,
+  # or the build keeps running the old shader (see veyra_shader_includes).
+  set(extra_depends ${ARGN})
   add_custom_command(
     OUTPUT "${vs_out}"
     COMMAND "${DXC_EXE}" -T vs_6_0 -E vsMain ${config_flags}
             -Fo "${vs_out}" "${source}"
-    DEPENDS "${source}" ${SHADER_INCLUDES}
+    DEPENDS "${source}" ${SHADER_INCLUDES} ${extra_depends}
     COMMENT "dxc ${shader_name}.hlsl VS (${CMAKE_BUILD_TYPE})"
     VERBATIM)
   add_custom_command(
     OUTPUT "${ps_out}"
     COMMAND "${DXC_EXE}" -T ps_6_0 -E psMain ${config_flags}
             -Fo "${ps_out}" "${source}"
-    DEPENDS "${source}" ${SHADER_INCLUDES}
+    DEPENDS "${source}" ${SHADER_INCLUDES} ${extra_depends}
     COMMENT "dxc ${shader_name}.hlsl PS (${CMAKE_BUILD_TYPE})"
     VERBATIM)
   add_custom_target(${target_name} DEPENDS "${vs_out}" "${ps_out}")
